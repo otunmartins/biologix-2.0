@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pydantic-ai[anthropic]
+rdkit
+biopython
+httpx

@@ -1,0 +1,14 @@
+# SITE_ADDRESS comes from .env via docker-compose.
+#   SITE_ADDRESS=:80                 -> plain HTTP, fine for a bare EC2 IP
+#   SITE_ADDRESS=screen.example.com  -> Caddy gets a Let's Encrypt cert on its own
+{$SITE_ADDRESS::80} {
+	handle /screen* {
+		reverse_proxy api:8000
+	}
+	handle /health {
+		reverse_proxy api:8000
+	}
+	handle {
+		reverse_proxy web:3000
+	}
+}

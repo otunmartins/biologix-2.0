@@ -1,0 +1,30 @@
+services:
+  caddy:
+    image: caddy:2
+    ports: ["80:80", "443:443"]
+    environment:
+      # ":80" for plain HTTP on a bare IP, or your domain for automatic HTTPS.
+      - SITE_ADDRESS=${SITE_ADDRESS:-:80}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - WEB_ORIGIN=${WEB_ORIGIN}
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
