@@ -7,7 +7,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 const GRADE_MEANING = {
-  A: 'Regulatory precedent at this route and level',
+  A: 'Approved-product precedent at this route (FDA Inactive Ingredient Database)',
   B: 'Experimental data',
   C: 'In-domain prediction',
   D: 'Out-of-domain or surrogate prediction',
@@ -148,9 +148,12 @@ export default function Home() {
       <div className="banner">
         <span aria-hidden="true">⚠</span>
         <span>
-          <b>Chemistry-only triage.</b> Structural alerts plus a small liability rule table. No
-          regulatory-precedent database, no compatibility simulation, no solvent-accessibility
-          weighting. A human checkpoint is required before any of this reaches a dossier.
+          <b>Triage, not a safety assessment.</b> Structural alerts, a small liability rule
+          table, solvent-accessibility weighting when you give it a structure, and precedent from
+          the FDA Inactive Ingredient Database. Precedent means an excipient has been in an
+          approved product at a route — not that it is compatible with your protein at your
+          concentration. No compatibility simulation. A human checkpoint is required before any of
+          this reaches a dossier.
         </span>
       </div>
 

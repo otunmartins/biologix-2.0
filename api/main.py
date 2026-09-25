@@ -5,9 +5,12 @@ that the Next.js frontend calls.
 What's real: PubChem identity resolution, RDKit structural alerts, a small
 protein-liability rule table.
 
-What's simplified: no regulatory precedent lookup (FDA IID / GRAS / DailyMed),
-and the protein scan is weighted by solvent accessibility only when a structure
-identifier is supplied. See root README.
+What's also real: regulatory precedent, from the FDA Inactive Ingredient
+Database and openFDA's substance registry, and the protein scan is weighted by
+solvent accessibility when a structure identifier is supplied.
+
+What's simplified: no mutagenicity model, no exposure-margin calculation, and no
+compatibility simulation. See root README.
 
 Run standalone:
   pip install -r requirements.txt
@@ -17,6 +20,7 @@ Run standalone:
 
 import os
 import re
+from dataclasses import dataclass, field
 from typing import Literal
 from urllib.parse import quote
 
@@ -24,11 +28,12 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
-from pydantic_ai import Agent
+from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.exceptions import UserError
 from rdkit import Chem
 
 import accessibility
+import precedent
 
 # ---------------------------------------------------------------------------
 # Output schema
@@ -53,37 +58,78 @@ class LiabilityFlag(BaseModel):
     accessibility: str = "not modelled"
 
 
-# Flip to True only once Stage 1 (FDA IID / GRAS / DailyMed) actually exists.
-# Until then nothing in this system can see regulatory precedent, so nothing may
-# claim it — see the validator below.
-PRECEDENT_LOOKUP_AVAILABLE = False
+# Stage 1 landed: precedent.py reads the FDA Inactive Ingredient Database and
+# openFDA's substance registry. Set this to False to put the system back into
+# the pre-Stage-1 posture — a blanket ban on grade A and "Precedented" — which
+# is what you want if the lookup is ever found to be misreporting.
+PRECEDENT_LOOKUP_AVAILABLE = True
+
+
+@dataclass
+class ScreenDeps:
+    """What the precedent tool actually returned during this one run.
+
+    The evidence gate has to be answerable per request, not per process: "may
+    this dossier claim precedent?" depends entirely on whether the tool was
+    called for THIS excipient and route and came back with a route match. The
+    tool writes here, the output validator reads here, and nothing the model
+    says can reach it.
+    """
+
+    precedent_calls: list[dict] = field(default_factory=list)
+
+    def route_matched(self) -> bool:
+        return any(
+            call.get("precedent_level") == "route_match" for call in self.precedent_calls
+        )
+
+    def summary(self) -> str:
+        if not self.precedent_calls:
+            return "the precedent tool was never called"
+        return "; ".join(
+            f"{c.get('excipient_as_asked', '?')} at "
+            f"{c.get('route_matched', '?')}: {c.get('precedent_level', '?')}"
+            for c in self.precedent_calls
+        )
 
 
 class Dossier(BaseModel):
     excipient: str
     protein: str
     route: str
-    summary: str
+    # Bounded deliberately. Left open, the model writes the entire analysis into
+    # the summary, runs out of output tokens part-way through the JSON, and the
+    # endpoints array never arrives — which surfaces as a schema error about a
+    # missing field rather than as the truncation it actually is. The detail
+    # belongs in each endpoint's rationale, where the reader can act on it.
+    summary: str = Field(max_length=2000)
     endpoints: list[EndpointResult]
     liabilities: list[LiabilityFlag]
     needs_testing: bool
 
+    def overclaims_precedent(self) -> list[str]:
+        """Endpoints asserting precedent, which only a tool result can support."""
+        return [
+            e.endpoint
+            for e in self.endpoints
+            if e.evidence_grade == "A" or e.verdict == "Precedented"
+        ]
+
     @model_validator(mode="after")
     def enforce_evidence_floor(self):
         """Hard guard, not a prompt instruction. A ValueError here is handed back
-        to the model by PydanticAI as a retry, so it corrects itself."""
+        to the model by PydanticAI as a retry, so it corrects itself.
+
+        Since Stage 1 the per-run check lives in the agent's output validator,
+        which can see what the precedent tool returned; this stays as the kill
+        switch for when the lookup is turned off entirely."""
         if not PRECEDENT_LOOKUP_AVAILABLE:
-            overclaimed = [
-                e.endpoint
-                for e in self.endpoints
-                if e.evidence_grade == "A" or e.verdict == "Precedented"
-            ]
+            overclaimed = self.overclaims_precedent()
             if overclaimed:
                 raise ValueError(
-                    f"Endpoints {overclaimed} claim regulatory precedent, but no precedent "
-                    "database is wired up (no FDA IID / GRAS / DailyMed lookup). Precedent "
-                    "cannot come from your own recollection: regrade these as 'Data gap: test' "
-                    "at grade C, D, or E."
+                    f"Endpoints {overclaimed} claim regulatory precedent, but the precedent "
+                    "lookup is disabled on this deployment. Precedent cannot come from your "
+                    "own recollection: regrade these as 'Data gap: test' at grade C, D, or E."
                 )
 
         # Derived, never taken from the model: below grade B, or any high-severity liability.
@@ -405,9 +451,13 @@ DOWNGRADE = {"high": "moderate", "moderate": "low", "low": "low"}
 
 
 def protein_liability_scan(
-    protein_sequence: str, active_alerts: list[str], structure_id: str = ""
+    protein_sequence: str, excipient_smiles: str, structure_id: str = ""
 ) -> dict:
-    """Residue-level liability flags for the excipient's active structural alerts.
+    """Residue-level liability flags for an excipient against a protein.
+
+    Pass the SMILES that resolve_identity returned. The structural alerts are
+    re-derived here rather than handed in, so the reactive groups cannot be lost
+    in transit.
 
     structure_id is optional. Give it a UniProt accession (e.g. P01857) to use the
     AlphaFold model, or a 4-character PDB ID (e.g. 1IGT) for an experimental
@@ -415,6 +465,14 @@ def protein_liability_scan(
     Without it, the scan falls back to counting residue types in the sequence,
     which cannot tell an exposed Met from a buried one.
     """
+    # Derived here, not passed in. This used to take the list of alert names and
+    # trust the model to carry it over from the structural_alerts call, and the
+    # model would occasionally hand back an empty list — which produced a
+    # confident dossier with zero liabilities for an excipient that had just
+    # tripped two alerts. A silently empty scan is the worst failure this tool
+    # has, so the data no longer makes the round trip through the model.
+    active_alerts = [a["alert"] for a in structural_alerts(excipient_smiles) if a["found"]]
+
     sequence = "".join(protein_sequence.split()).upper()
 
     access = None
@@ -472,7 +530,34 @@ def protein_liability_scan(
             }
         )
 
-    return {"structure": structure_note, "flags": flags}
+    return {
+        "structure": structure_note,
+        # Reported so the dossier can say which reactive groups drove the scan,
+        # and so an empty scan is visibly an excipient with no matching alerts
+        # rather than a scan that quietly ran on nothing.
+        "alerts_applied": active_alerts,
+        "flags": flags,
+    }
+
+
+def regulatory_precedent(
+    ctx: RunContext[ScreenDeps], excipient: str, route: str
+) -> dict:
+    """Has this excipient been used in an approved drug product by this route?
+
+    Reads the FDA Inactive Ingredient Database (route, dosage form and maximum
+    potency on record) and openFDA's substance registry (UNII, and the CFR
+    citations behind a GRAS affirmation).
+
+    Pass the excipient name, CAS number or the trade name the user typed, and the
+    route they asked about. This is a NAME lookup, so it is unaffected by whether
+    the structure came back as a surrogate.
+    """
+    result = precedent.look_up(excipient, route)
+    # Recorded before it reaches the model. The output validator reads this, and
+    # nothing in the dossier can talk it into a claim the lookup did not make.
+    ctx.deps.precedent_calls.append(result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -492,16 +577,35 @@ Workflow:
    generic screening-library filters that are neither excipient- nor protein-specific, and never
    turn one into a protein liability or use one to raise a severity. If it returns no hits, say
    that no published filter set objected — not that the excipient is clean.
-4. If the user gave a protein sequence or a structure identifier, call protein_liability_scan with
-   the sequence, the names of every alert that came back found=True, and structure_id set to any
+4. Call regulatory_precedent with the excipient name the user typed and the route they asked
+   about. This is a name lookup against the FDA Inactive Ingredient Database, so it works even
+   when resolve_identity fell back to a surrogate, and it is the ONLY thing in this system that
+   can see regulatory precedent. Report it as its own endpoint ("Regulatory precedent, <route>").
+   Take the grade ceiling from the tool's max_grade field and the verdict from its interpretation
+   field — do not raise either on your own reading of the data. Quote dosage forms, potencies and
+   route names verbatim; never convert a unit or combine two of them. If it reports
+   precedent_level "route_match" you may grade that endpoint A and call it "Precedented"; every
+   other level means you may not, on any endpoint. State the coverage limits from the tool's note
+   whenever they bear on the answer — above all, that the IID under-represents BLA biologics, so a
+   missing row means "not found in the IID", never "never used".
+5. If the user gave a protein sequence or a structure identifier, call protein_liability_scan with
+   excipient_smiles set to the SMILES resolve_identity returned, and structure_id set to any
    UniProt accession or PDB ID the user mentioned (pass "" if they gave none).
-   The tool returns {"structure": ..., "flags": [...]}. Copy each flag's fields into the dossier
-   verbatim — including accessibility — and never recompute, round or reword a number.
+   protein_sequence takes LITERAL AMINO ACIDS ONLY. An accession like P01857 or a PDB ID like
+   1IGT goes in structure_id and nowhere else — putting one in protein_sequence makes the tool
+   read it as a six-residue protein. If the user gave an identifier and no sequence, pass
+   protein_sequence="".
+   The tool re-derives the structural alerts from the SMILES itself; you do not pass them.
+   It returns {"structure": ..., "alerts_applied": [...], "flags": [...]}. Copy each flag's fields
+   into the dossier verbatim — including accessibility — and never recompute, round or reword a
+   number. If flags is empty, say which alerts were applied and that none of them mapped to a
+   residue in this protein.
    Report what the "structure" field says in your rationale: whether accessibility was modelled,
    which structure was used, and any sequence mismatch or fetch failure it mentions.
-5. If identity resolution fails, grade every endpoint E and say so plainly in the summary —
-   do not guess a structure.
-6. If resolve_identity returns surrogate=True, the structure you screened is a short repeat-unit
+6. If identity resolution fails, grade every structure-derived endpoint E and say so plainly in
+   the summary — do not guess a structure. The precedent endpoint still stands on its own: a name
+   lookup does not need a structure.
+7. If resolve_identity returns surrogate=True, the structure you screened is a short repeat-unit
    stand-in for a polymer, not the real excipient. Cap every structure-derived endpoint at grade D,
    name the surrogate in the rationale, and say in the summary that the real material's chain
    length, polydispersity and residual monomers were NOT assessed.
@@ -509,15 +613,25 @@ Workflow:
 Verdict rules — use ONLY these four words, never "safe":
   Precedented, Supported without precedent, Data gap: test, Alert: avoid.
 
-There is no regulatory-precedent database wired up yet, so no endpoint may be graded A and none
-may be called "Precedented" on the strength of your own recollection — that is a data gap.
+Grade A and the verdict "Precedented" are reserved for what regulatory_precedent actually
+returned. You have read the literature in training and will be tempted to assert precedent from
+memory for the excipients you know well — polysorbate 80, sucrose, histidine. Do not. If the tool
+did not report precedent_level "route_match" for this excipient at this route, that is a data gap,
+however confident you feel. This is checked in code and a violation is handed straight back to you.
 
 Set needs_testing=True whenever any endpoint is below grade B, or any liability has severity "high".
 
-IMPORTANT — state this in the summary field every time: this system has NO regulatory-precedent
-database (no FDA IID / GRAS / DailyMed lookup yet) and NO protein-compatibility simulation.
-Every result here is a chemistry-only triage on structural alerts and a small liability rule table —
-not a full safety assessment.
+The summary is SHORT — three to six sentences, 2000 characters at the outside. It is an
+orientation, not the report. Every piece of detail, every number and every caveat that belongs to
+one endpoint goes in that endpoint's rationale, where someone can act on it. A summary that tries
+to carry the whole analysis runs out of room before the endpoints are written and the dossier is
+rejected as incomplete.
+
+Within that budget, the summary must always say: precedent here comes from FDA records that an
+excipient has appeared in an approved product at a route and potency, which is not a finding about
+THIS protein at the user's concentration; and there is still no protein-compatibility simulation
+and no exposure-margin calculation. Precedent plus structural alerts is a triage, not a safety
+assessment.
 """
 
 _agent: Agent | None = None
@@ -532,16 +646,49 @@ def get_agent() -> Agent:
         _agent = Agent(
             "anthropic:claude-sonnet-5",
             output_type=Dossier,
+            deps_type=ScreenDeps,
             system_prompt=SYSTEM_PROMPT,
             tools=[
                 resolve_identity,
                 structural_alerts,
                 published_alert_screen,
+                regulatory_precedent,
                 protein_liability_scan,
             ],
-            retries=2,  # room for the evidence-floor validator to bounce a bad dossier back
+            # A full dossier with five endpoints and a dozen liabilities is a
+            # lot of JSON. The default cap truncated it mid-object, which the
+            # schema then reported as a missing `endpoints` field.
+            model_settings={"max_tokens": 16000},
+            # Three, not two: there are now two independent ways for a dossier
+            # to be sent back (the schema and the precedent gate), and a run
+            # that trips one on its first attempt still deserves a real chance.
+            retries=3,
         )
+        _agent.output_validator(enforce_precedent_evidence)
     return _agent
+
+
+def enforce_precedent_evidence(ctx: RunContext[ScreenDeps], dossier: Dossier) -> Dossier:
+    """The Stage 1 evidence gate: precedent must have been looked up, not recalled.
+
+    Before Stage 1 this was a blanket ban on grade A, because nothing in the
+    system could see precedent. Now something can, so the rule sharpens rather
+    than relaxes: a dossier may claim precedent exactly when the precedent tool
+    returned a route match during THIS run. The check reads the recorded tool
+    results, never the dossier's own account of them, so a confident rationale
+    cannot argue its way past it.
+    """
+    overclaimed = dossier.overclaims_precedent()
+    if overclaimed and not ctx.deps.route_matched():
+        raise ModelRetry(
+            f"Endpoints {overclaimed} are graded A or called 'Precedented', but the "
+            f"regulatory_precedent tool did not report a route match ({ctx.deps.summary()}). "
+            "Precedent cannot come from your own recollection, however familiar the excipient. "
+            "Call regulatory_precedent for this excipient and route if you have not, and "
+            "otherwise regrade these endpoints to the tool's max_grade with the verdict its "
+            "interpretation field calls for."
+        )
+    return dossier
 
 # ---------------------------------------------------------------------------
 # API
@@ -563,8 +710,14 @@ app.add_middleware(
 @app.get("/health")
 def health():
     # model_configured is the first thing you want to know when the box is up
-    # but every screen is failing.
-    return {"ok": True, "model_configured": bool(os.environ.get("ANTHROPIC_API_KEY"))}
+    # but every screen is failing; the precedent index is the second, since a
+    # box that can't reach fda.gov quietly grades everything as a data gap.
+    return {
+        "ok": True,
+        "model_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "precedent_lookup": PRECEDENT_LOOKUP_AVAILABLE,
+        "precedent_index": precedent.index_status(),
+    }
 
 
 @app.post("/screen", response_model=Dossier)
@@ -580,7 +733,9 @@ async def screen(req: ScreenRequest):
         raise HTTPException(status_code=503, detail=f"agent not configured: {e}") from e
 
     try:
-        result = await agent.run(prompt)
+        # Fresh deps per request: the evidence gate must not see what a previous
+        # screen's precedent lookup returned.
+        result = await agent.run(prompt, deps=ScreenDeps())
     except Exception as e:
         # The agent run is the only call here that leaves the box; surface the
         # failure as a 502 so the frontend can show something more useful than 500.

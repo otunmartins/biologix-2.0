@@ -9,6 +9,8 @@ It says what to test next. It never says an excipient is safe.
 ```
 web/         Next.js frontend — one page (app/page.js), form or natural language
 api/         FastAPI backend — wraps the PydanticAI agent behind /screen
+             main.py the agent and tools, accessibility.py solvent accessibility,
+             precedent.py the FDA precedent lookup
 terraform/   Provisions one EC2 instance to run it all
 docker-compose.yml, Caddyfile   The whole stack on that one instance
 ```
@@ -32,6 +34,11 @@ npm run dev
 
 Open http://localhost:3000. The frontend defaults to `http://localhost:8000` for the API when
 `NEXT_PUBLIC_API_URL` isn't set, so this works with no extra config.
+
+The first screen you run downloads the FDA Inactive Ingredient file (~380 KB) and caches it for
+30 days in the system temp directory; set `IID_CACHE_DIR` to put it somewhere durable. `/health`
+reports whether that index is loaded, which is the first thing to check if every dossier suddenly
+comes back as a data gap.
 
 ## Deploy to AWS
 
@@ -92,26 +99,123 @@ before you build anything that depends on it.
 
 ## What's real vs. simplified right now
 
-This is Stage 0 + a slice of Stage 2 from the design doc. Deliberately:
+This is Stage 0, Stage 1, and a slice of Stage 2 from the design doc. Deliberately:
 
 - **Real:** PubChem identity resolution (name / CAS / SMILES → SMILES + InChIKey), nine curated
   RDKit structural alerts (Michael acceptor, epoxide, aldehyde, peroxide, polyether chain,
   hydrolysable ester, reducing sugar, organomercury, maleimide), a thirteen-row excipient↔residue
   rule table, plus an advisory screen against published filter catalogs (see below).
+- **Real:** regulatory precedent, from the FDA Inactive Ingredient Database and openFDA's
+  substance registry. See the section below — including what the IID does *not* cover, which
+  matters more than what it does.
 - **Surrogates:** polysorbates, poloxamers, PEG and PVP have no single PubChem CID and 404 on a
   name lookup, so `SURROGATES` in `api/main.py` maps them to a short repeat-unit stand-in. That
   captures the reactive features but not chain length, polydispersity, or residual monomers —
   anything derived from a surrogate is capped at grade D and labelled in the rationale. Entering a
   polymer properly (repeat unit + end groups + degree of polymerisation) isn't built yet.
-- **Simplified:** no regulatory precedent lookup at all — no FDA IID, GRAS inventory, DailyMed, or
-  UNII resolution — which is why the agent is instructed never to award a grade A. No statistical
-  mutagenicity model, no exposure-margin/TTC calculation, no polymer repeat-unit handling.
+- **Simplified:** no DailyMed or SPL label mining, no statistical mutagenicity model, no
+  exposure-margin/TTC calculation, no polymer repeat-unit handling.
 - **Real:** solvent-accessibility weighting. Give the scan a UniProt accession (AlphaFold model) or
   a 4-character PDB ID (RCSB experimental structure) and every liability is weighted by relative
   solvent accessibility, computed with Shrake-Rupley against Tien et al. 2013 reference max-ASA.
   Without an identifier it falls back to raw sequence counts and labels each flag `not modelled`.
   On intact IgG (1IGT) this is the difference between "22 Met" and "22 Met, 5 exposed".
 - **Missing:** the Stage 3 OpenMM compatibility screen. See below.
+
+### Where regulatory precedent comes from, and what it isn't
+
+Three free, keyless federal sources, in `api/precedent.py`, because no one of them is enough:
+
+- The **FDA Inactive Ingredient Database** — the quarterly CDER file, ~9,000 rows of
+  (ingredient, route, dosage form) that have appeared in an approved drug product, with the
+  maximum potency on record. Fetched once, cached 30 days, rebuilt lazily on first use so a slow
+  fda.gov can't take the container down at boot. The current download link is scraped off the
+  IID landing page (the media id rotates every quarter) with a pinned URL as the fallback.
+- **Approved product labels** (openFDA SPL), full text over the DESCRIPTION section, counted by
+  distinct FDA application number. **This is the source that covers biologics**, and it is not
+  optional: the IID is a CDER database, so polysorbate 80 subcutaneous is *two rows* there and
+  *eighty distinct BLAs* here — Trulicity, Keytruda, Aranesp, Orencia. Without it the tool grades
+  half the excipients in every approved mAb formulation as "no precedent at this route", which is
+  simply false.
+- **openFDA's substance registry**, for UNII resolution and for the CFR citations behind a GRAS
+  affirmation. The UNII is what makes the IID join trustworthy; `names.name` there is a
+  case-**sensitive** exact-string field and the registry's own casing is inconsistent
+  (`TREHALOSE` but `Sucrose`), so the lookup tries a ladder of spellings before a guarded
+  free-text fallback.
+
+The two precedent sources have opposite failure modes, which is exactly why both are used. The
+IID is a curated assertion with a population gap; the label search is a text match over the right
+population. Every finding reports which one carried it (`precedent_basis`), and the label source
+carries three guards, because full text is the looser instrument:
+
+1. **DESCRIPTION only.** A hypersensitivity warning naming an excipient lives in WARNINGS or
+   CONTRAINDICATIONS, not in the composition section.
+2. **Approved applications only**, counted as *distinct application numbers* rather than label
+   documents, so a product with six label revisions counts once.
+3. **At least three of them** (`MIN_LABEL_APPLICATIONS`). One stray mention is not a formulation.
+   Real excipients clear this by an order of magnitude; calcium chloride subcutaneous sits at two
+   and is deliberately *not* promoted — `test_smoke.py` pins that boundary.
+
+Application numbers are returned in the payload so a reviewer can check any of it.
+
+The lookup returns one of six levels, and the level — not the model's reading of the data — sets
+the grade ceiling:
+
+| level | meaning | ceiling |
+|---|---|---|
+| `route_match` | approved product at this exact route, from either source | A |
+| `systemic_injection_match` | approved at another systemic injection route (IV↔SC↔IM) | B |
+| `parenteral_match` | approved only at a local/compartmental injection route (intravitreal, intra-articular) | C |
+| `other_route_only` | approved only at non-injected routes | C |
+| `gras_only` | no drug precedent; a food citation only | C oral / D otherwise |
+| `none`, `unavailable` | nothing found in either source, or the lookup failed | D |
+
+Bridging is directional, and both ends have to be systemic. IV precedent supports a subcutaneous
+request; it does **not** support an intravitreal one, where the dose goes into a small closed
+compartment with its own tolerance and its own failure mode. Thimerosal is in approved IM and IV
+products and still caps at C for an intravitreal request.
+
+**Limits that decide how much a hit is worth.** All are returned in the payload so they land in
+the rationale rather than being lost:
+
+1. **The two sources have opposite blind spots.** The IID under-represents BLA biologics; the
+   label search is full text and weaker per hit. A finding says which one carried it, and a miss
+   in both means "not found", never "never used".
+2. **A route is not a dose, and never a protein.** A hit says the excipient has been in an
+   approved product at or below the potency shown. It is not clearance at the user's
+   concentration and says nothing about this molecule.
+3. **GRAS is a food determination.** 21 CFR 182/184/186 covers ingestion. Acrylamide carries a
+   21 CFR 173 citation; without the route rule that would have come back as grade C for a
+   subcutaneous injection, which is exactly the borrowed authority this tool exists to prevent.
+
+**Name matching is the whole game, and it is not a prefix comparison.** Excipient names are
+matched to the IID by UNII **and** by name, unioned. The UNII join is exact but misses hydrate
+forms filed under their own code — trehalose dihydrate is what's actually in the approved
+products and does not share a UNII with trehalose. The name join catches those, comparing names
+as *sets of significant words*, because the IID's own naming is inconsistent in every direction:
+
+| you type | the IID files it as | what that needs |
+|---|---|---|
+| trehalose | `TREHALOSE DIHYDRATE` | a hydrate suffix |
+| PEG 3350 | `POLYETHYLENE GLYCOL 3350` | a trade-name alias, then a grade number |
+| sodium phosphate | `SODIUM PHOSPHATE, DIBASIC, DIHYDRATE` | a comma, then two qualifiers |
+| potassium phosphate | `MONOBASIC POTASSIUM PHOSPHATE` | the same qualifier, in front |
+| disodium edetate | `EDETATE DISODIUM` | reversed word order |
+| Captisol | `BETADEX SULFOBUTYL ETHER SODIUM` | a brand alias |
+
+Two names match when their significant words are equal, or when one set contains the other and
+every extra word is a qualifier — a grade number, a hydrate, a salt, a basicity. Both halves of
+that rule are load-bearing. Without the qualifier restriction, `SUCROSE` reaches
+`SUCROSE STEARATE` and `SUCROSE PALMITATE`, which are surfactants, and folding their rows into
+sucrose's would invent precedent out of nothing. Without the containment requirement,
+`SODIUM CHLORIDE` reaches `POTASSIUM CHLORIDE` — their difference is a qualifier word in both
+directions. `test_smoke.py` pins sixteen of these cases, over-matching included.
+
+**Measured coverage:** across a 52-excipient panel — stabilisers, bulking agents, buffers,
+surfactants, preservatives, chelators, cyclodextrins and cosolvents — 51 resolve to IID rows and
+51 resolve a UNII. `test_breadth.py` asserts a precedent *floor* for 27 (excipient, route) pairs
+across five routes rather than an exact level, so the suite doesn't break the next time FDA adds
+a row, only when precedent is lost.
 
 ### Why only two of RDKit's published alert catalogs are enabled
 
@@ -158,9 +262,15 @@ invent a fifth verdict or hand back a bare score.
 
 Two things are enforced in code rather than by prompt, because a prompt rule is not a guarantee:
 
-- **No grade A, no `Precedented`** while `PRECEDENT_LOOKUP_AVAILABLE` is `False`. The model has read
-  the literature in training and will happily assert precedent from memory; the `Dossier` validator
-  rejects it and PydanticAI hands the error back for a retry. Flip the flag when Stage 1 lands.
+- **Grade A and `Precedented` require a precedent lookup that actually returned one.** The model has
+  read the literature in training and will happily assert precedent from memory for the excipients
+  it knows well. The agent's output validator checks the recorded result of the `regulatory_precedent`
+  tool *for this run* — not the dossier's account of it — and unless that result was
+  `route_match`, a grade A or a `Precedented` verdict is handed straight back as a retry. Before
+  Stage 1 this was a blanket ban, since nothing could see precedent; the rule sharpened rather
+  than relaxed when the lookup landed. Setting `PRECEDENT_LOOKUP_AVAILABLE = False` in
+  `api/main.py` restores the blanket ban, which is what you want if the lookup is ever found to
+  be misreporting.
 - **`needs_testing` is derived, not reported** — recomputed from the grades and severities on every
   dossier, so the model can't forget to set it.
 
