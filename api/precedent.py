@@ -484,6 +484,73 @@ def _classify_cfr(citations: list[str]) -> str:
 _label_cache: dict[tuple, dict] = {}
 
 
+# A mention of the excipient counts as composition only when it reads like one:
+# an amount beside it ("albumin (human) (2.5 mg)"), or a sentence that states
+# contents ("each mL contains..."). A phrase search cannot tell "polysorbate 80
+# (0.2 mg)" from "the main protraction mechanism of semaglutide is albumin
+# binding", or a fusion protein built on human serum albumin from one
+# formulated with it — this does.
+_AMOUNT = re.compile(r"\d+(?:\.\d+)?\s*(?:mg|mcg|µg|g|%|mm|mmol|meq|ml|units?)\b")
+_COMPOSITION_CUES = re.compile(
+    r"\b(?:contains?|containing|each|per|inactive|excipients?|formulated|composed|consists?)\b"
+)
+_NOT_AN_INGREDIENT = re.compile(r"^[\s-]*(?:binding|conjugate|fusion|receptor|domain)\b")
+LABEL_PAGE = 10    # full labels run to ~200 KB each, so read them a few at a time
+LABEL_PAGES = 5    # and stop after 50 without reaching the threshold
+
+
+def _is_composition(description: str, name: str) -> bool:
+    text = re.sub(r"\s+", " ", description.lower())
+    for m in re.finditer(r"(?<![a-z0-9-])" + re.escape(name.lower()) + r"(?![a-z0-9])", text):
+        if _NOT_AN_INGREDIENT.match(text[m.end():]):
+            continue
+        start = text.rfind(". ", 0, m.start()) + 1
+        end = text.find(". ", m.end())
+        sentence = text[start:end if end >= 0 else len(text)]
+        near = text[max(0, m.start() - 60):m.end() + 60]
+        if _AMOUNT.search(near) or _COMPOSITION_CUES.search(sentence):
+            return True
+    return False
+
+
+def _verify_composition(query: str, name: str) -> dict | None:
+    """Read matching labels until MIN_LABEL_APPLICATIONS distinct approved
+    applications are confirmed to list the excipient as an ingredient.
+
+    Stops at the threshold rather than reading every label, so n_verified is a
+    floor, not a census. Returns None if openFDA stopped answering part-way.
+    """
+    verified: set[str] = set()
+    examples: list[str] = []
+    read = 0
+    for page in range(LABEL_PAGES):
+        try:
+            response = _openfda_get(
+                f"{LABELS}?search={query}&limit={LABEL_PAGE}&skip={page * LABEL_PAGE}"
+            )
+        except Exception:
+            return None
+        if response.status_code == 404:
+            break
+        if response.status_code != 200:
+            return None
+        rows = response.json().get("results", [])
+        for row in rows:
+            read += 1
+            meta = row.get("openfda", {})
+            application = (meta.get("application_number") or [""])[0]
+            if not application or application in verified:
+                continue
+            if _is_composition(" ".join(row.get("description", [])), name):
+                verified.add(application)
+                brand = (meta.get("brand_name") or meta.get("generic_name") or [""])[0]
+                if brand and len(examples) < 5:
+                    examples.append(f"{brand} ({application})")
+        if len(verified) >= MIN_LABEL_APPLICATIONS or len(rows) < LABEL_PAGE:
+            break
+    return {"n_verified": len(verified), "labels_read": read, "examples": examples}
+
+
 def label_precedent(names: list[str], route: str) -> dict:
     """Approved drug products whose label lists this excipient, by route.
 
@@ -504,6 +571,9 @@ def label_precedent(names: list[str], route: str) -> dict:
       - Distinct applications are counted, not label documents, and
         MIN_LABEL_APPLICATIONS of them are required before this counts as
         precedent at all.
+      - Products where the name is the ACTIVE ingredient are excluded, and the
+        labels are then read to confirm the excipient is listed as an
+        ingredient rather than mentioned — see _is_composition.
 
     It is still weaker evidence per hit than an IID row, which is a curated
     assertion rather than a text match. It is reported separately for that
@@ -517,12 +587,17 @@ def label_precedent(names: list[str], route: str) -> dict:
     # never queried and a route we queried and found nothing in are different
     # findings, and collapsing them would let a network failure read as absence.
     result = {"checked": False, "applications": {}, "n_applications": 0,
-              "examples": [], "matched_name": ""}
+              "n_verified": 0, "labels_read": 0, "examples": [], "matched_name": ""}
 
     for name in names:
         if not name or not route:
             break
-        query = f'description:"{quote(name.lower())}"+AND+openfda.route:"{quote(route)}"'
+        phrase = quote(name.lower())
+        # Products whose ACTIVE ingredient carries the name are not excipient
+        # precedent: iron dextran is not dextran the excipient, iron sucrose is
+        # not sucrose, and an amino-acid infusion's glycine is the drug.
+        query = (f'description:"{phrase}"+AND+openfda.route:"{quote(route)}"'
+                 f'+AND+NOT+openfda.substance_name:"{phrase}"')
         try:
             counts = _openfda_get(
                 f"{LABELS}?search={query}&count=openfda.application_number.exact&limit=1000"
@@ -547,24 +622,16 @@ def label_precedent(names: list[str], route: str) -> dict:
         for application in applications:
             tally[application[:3]] = tally.get(application[:3], 0) + 1
 
-        examples = []
-        try:
-            sample = _openfda_get(f"{LABELS}?search={query}&limit=5")
-            if sample.status_code == 200:
-                for row in sample.json()["results"]:
-                    meta = row.get("openfda", {})
-                    brand = (meta.get("brand_name") or meta.get("generic_name") or [""])[0]
-                    application = (meta.get("application_number") or [""])[0]
-                    if brand and application:
-                        examples.append(f"{brand} ({application})")
-        except Exception:
-            pass
+        verification = _verify_composition(query, name)
+        if verification is None:
+            result["checked"] = False  # the count ran but the check could not
+            break
 
         result = {
             "checked": True,
             "applications": dict(sorted(tally.items(), key=lambda kv: -kv[1])),
             "n_applications": len(applications),
-            "examples": examples,
+            **verification,
             "matched_name": name,
         }
         break
@@ -852,7 +919,7 @@ def look_up(excipient: str, route: str, concentration: str = "") -> dict:
         )),
         wanted,
     )
-    label_backed = labels["n_applications"] >= MIN_LABEL_APPLICATIONS
+    label_backed = labels["n_verified"] >= MIN_LABEL_APPLICATIONS
 
     if same:
         level, source = "route_match", "FDA Inactive Ingredient Database"
@@ -861,7 +928,8 @@ def look_up(excipient: str, route: str, concentration: str = "") -> dict:
         # This is the polysorbate-80-subcutaneous case, and refusing it would
         # mean the tool is wrong about the excipients biologics actually use.
         level = "route_match"
-        source = f"{labels['n_applications']} approved product labels"
+        source = (f"approved product labels ({labels['n_verified']}+ verified as an "
+                  f"ingredient, {labels['n_applications']} mention it)")
     elif wanted in SYSTEMIC_INJECTION and systemic_elsewhere:
         # Both ends must be systemic. IV precedent bridges to SC; it does not
         # bridge to intravitreal, where the dose goes into a small closed
@@ -914,14 +982,19 @@ def look_up(excipient: str, route: str, concentration: str = "") -> dict:
         "approved_products_at_this_route": {
             "checked": labels["checked"],
             "n_approved_applications": labels["n_applications"],
+            "n_verified_as_ingredient": labels["n_verified"],
+            "labels_read": labels["labels_read"],
             "by_application_type": labels["applications"],
             "examples": labels["examples"],
             "note": (
-                "Distinct FDA application numbers whose label lists this excipient in its "
-                "DESCRIPTION (composition) section at this route. BLA = a licensed biologic, "
-                "which is the population the Inactive Ingredient Database misses. This is a "
-                "full-text match, so it is weaker per hit than an IID row; the application "
-                "numbers are given so it can be checked."
+                "n_approved_applications counts distinct FDA applications whose DESCRIPTION "
+                "section mentions this excipient at this route, excluding products where it is "
+                "the active ingredient. n_verified_as_ingredient is how many of those were read "
+                "and confirmed to list it as an ingredient (an amount beside it, or a sentence "
+                "stating contents); reading stops once the threshold is met, so it is a floor. "
+                "Only verified applications count as precedent. BLA = a licensed biologic, the "
+                "population the Inactive Ingredient Database misses. Weaker per hit than an IID "
+                "row; the examples carry application numbers so they can be checked."
             ),
         },
         "approved_at_this_route": [

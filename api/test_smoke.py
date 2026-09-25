@@ -317,6 +317,33 @@ def main_test():
     print(f"ok  labels: polysorbate 80 subcutaneous in {labels['n_applications']} approved "
           f"applications ({labels['applications'].get('BLA')} BLA), e.g. {labels['examples'][0]}")
 
+    # A mention is not an ingredient. These are real DESCRIPTION sentences.
+    MENTIONS = [
+        ("each single-dose 1 mL vial contains 2,000 units of epoetin alfa, albumin (human) "
+         "(2.5 mg), citric acid (0.06 mg)", "albumin", True),
+        ("each mL contains 150 USP units of hyaluronidase with albumin human (1 mg)",
+         "albumin", True),
+        ("Each vial contains dulaglutide, citric acid anhydrous, mannitol, polysorbate 80 and "
+         "water for injection", "polysorbate 80", True),
+        ("The main protraction mechanism of semaglutide is albumin binding, facilitated by "
+         "modification of position 26 lysine with a hydrophilic spacer", "albumin", False),
+        ("a PCSK9-binding domain and human serum albumin (HSA). It is produced in "
+         "genetically engineered yeast", "albumin", False),
+        ("to which an albumin-binding moiety has been attached", "albumin", False),
+        ("The latter are believed to be components of cat serum, such as albumin",
+         "albumin", False),
+    ]
+    for text, name, want in MENTIONS:
+        assert main.precedent._is_composition(text, name) is want, (name, text[:60])
+    print(f"ok  labels: {len(MENTIONS)} mention-vs-ingredient cases (albumin binding is not albumin)")
+
+    # Iron dextran is a drug, not dextran the excipient.
+    dex_iv = main.precedent.label_precedent(["dextran"], "INTRAVENOUS")
+    assert dex_iv["checked"]
+    assert not any("IRON" in e.upper() or "INFED" in e.upper() for e in dex_iv["examples"]), dex_iv
+    print(f"ok  labels: iron dextran excluded from dextran IV "
+          f"({dex_iv['n_applications']} mention, {dex_iv['n_verified']} verified)")
+
     # Poloxamer 188 has no subcutaneous IID row at all. On the IID alone it caps
     # at grade B; it is in approved subcutaneous biologics, so that is wrong.
     plx_sc = main.precedent.look_up("Poloxamer 188", "subcutaneous")
