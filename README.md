@@ -7,7 +7,8 @@ It says what to test next. It never says an excipient is safe.
 ## Layout
 
 ```
-web/         Next.js frontend — one page (app/page.js), form or natural language
+web/         Next.js + TypeScript + Tailwind frontend — app/page.tsx, components/,
+             lib/api.ts (typed mirror of the Dossier schema)
 api/         FastAPI backend — wraps the PydanticAI agent behind /screen
              main.py the agent and tools, accessibility.py solvent accessibility,
              precedent.py the FDA precedent lookup
@@ -318,7 +319,7 @@ is entirely CPU-bound and runs in seconds. When you add the Stage 3 compatibilit
    not pip, unlike everything in `api/` today) with `deploy.resources` reserving the GPU.
 2. Add a `run_compatibility_simulation` tool to the agent, called only when the user explicitly
    asks — never automatically, since it's the expensive, slow step (hours, not seconds).
-3. Gate it behind a button in `web/app/page.js` showing an estimated runtime before it starts, and
+3. Gate it behind a button in `web/app/page.tsx` showing an estimated runtime before it starts, and
    return a job id rather than blocking the request.
 
 The GPU is already there and paid for once you deploy; that work is additive, not a redeploy.
