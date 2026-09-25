@@ -34,11 +34,13 @@ def _dossier(grade, verdict):
         "summary": "Scripted response for the smoke test.",
         "endpoints": [
             {
-                "endpoint": "Oxidation of Met/Trp",
+                # Named so the structure ceiling exempts it: precedent is a name
+                # lookup, and only this endpoint may claim it.
+                "endpoint": "Regulatory precedent, subcutaneous",
                 "verdict": verdict,
                 "evidence_grade": grade,
-                "rationale": "Polyether chain forms peroxides on storage.",
-                "sources": ["PubChem", "local rule table"],
+                "rationale": "FDA IID lists polysorbate 80 for subcutaneous use.",
+                "sources": ["FDA Inactive Ingredient Database"],
             }
         ],
         "liabilities": [
@@ -461,6 +463,77 @@ def main_test():
         if pre._index is None:
             pre._index = real_index
     print("ok  outages: a failed IID build is retried after the cooldown")
+
+    # --- user-described polymers ----------------------------------------------
+    import types
+
+    from pydantic_ai import ModelRetry
+
+    poly = main.polymer
+    peg = poly.describe(poly.PolymerSpec(repeat_unit="[*]CCO[*]", end_group_a="[*]O", dp=75.4))
+    assert abs(peg["mn_estimate"] - 3340) < 5, peg["mn_estimate"]
+    print(f"ok  polymer: PEG 3350 described at DP 75.4 -> Mn {peg['mn_estimate']}")
+
+    for bad in ({"repeat_unit": "CCO"}, {"repeat_unit": "[*]CCO[*]", "end_group_a": "not smiles"}):
+        try:
+            main.ScreenRequest(prompt="x", polymer=bad)
+            raise AssertionError(f"accepted a malformed polymer: {bad}")
+        except ValueError:
+            pass
+    print("ok  polymer: malformed repeat unit / end group rejected at the request")
+
+    ps80_spec = poly.PolymerSpec(
+        repeat_unit="[*]CCO[*]",
+        end_group_a="[*]OC(=O)CCCCCCCC=CCCCCCCCC",
+        dp=20,
+        impurities=[{"name": "ethylene oxide", "level": "<= 1 ppm"}],
+    )
+    ps80 = main.describe_polymer(PS80, ps80_spec)
+    assert ps80["max_structure_grade"] == "C", ps80["note"]
+    assert not ps80["surrogate_check"]["dropped_by_description"]
+    eo = ps80["impurities"][0]
+    assert eo["resolved"] and "Epoxide" in eo["alerts"], eo
+    print("ok  polymer: described PS80 keeps the surrogate's alerts -> ceiling C; residual EO is an epoxide")
+
+    # Methoxy caps remove the ester the real polysorbate has. That must not read cleaner.
+    capped = main.describe_polymer(
+        PS80, poly.PolymerSpec(repeat_unit="[*]CCO[*]", end_group_a="[*]OC", end_group_b="[*]C")
+    )
+    assert capped["max_structure_grade"] == "D", capped
+    assert any("ester" in a for a in capped["surrogate_check"]["dropped_by_description"])
+    print("ok  polymer: a description that drops a known alert keeps the D ceiling")
+
+    deps = main.ScreenDeps(polymer=ps80_spec, identity_calls=[ps80])
+    scan = main.protein_liability_scan(SEQ, ps80["smiles"], "", deps.impurity_sources())
+    from_eo = [f for f in scan["flags"] if f["source"].startswith("residual ethylene oxide")]
+    assert from_eo and from_eo[0]["residue"].startswith("His"), scan["flags"]
+    assert from_eo[0]["source"] == "residual ethylene oxide (<= 1 ppm)"
+    print(f"ok  polymer: residual EO adds {len(from_eo)} flag(s) tagged with its source and level")
+
+    # The ceiling is enforced in code, and only the precedent endpoint is exempt.
+    def gate(calls, endpoints):
+        d = main.Dossier(**{**_dossier("C", "Data gap: test"), "endpoints": [
+            {"endpoint": n, "verdict": "Data gap: test", "evidence_grade": g, "rationale": "."}
+            for n, g in endpoints
+        ]})
+        ctx = types.SimpleNamespace(deps=main.ScreenDeps(identity_calls=calls))
+        return main.enforce_precedent_evidence(ctx, d)
+
+    surrogate = main.resolve_identity(PS80)
+    for calls, endpoints, ok in [
+        ([surrogate], [("Oxidation of Met/Trp", "C")], False),
+        ([surrogate], [("Oxidation of Met/Trp", "D"), ("Regulatory precedent, SC", "C")], True),
+        ([ps80], [("Oxidation of Met/Trp", "C")], True),
+        ([ps80], [("Oxidation of Met/Trp", "B")], False),
+        ([ps80, surrogate], [("Oxidation of Met/Trp", "C")], False),  # strictest wins
+    ]:
+        try:
+            out = gate(calls, endpoints)
+            assert ok, f"{endpoints} should have been bounced for {[c['structure_basis'] for c in calls]}"
+            assert out.structure_basis == calls[-1]["structure_basis"] or len(calls) > 1
+        except ModelRetry:
+            assert not ok, f"{endpoints} wrongly bounced"
+    print("ok  structure ceiling: surrogate D, described C, strictest wins, precedent exempt")
 
     # --- the evidence gate, both directions ----------------------------------
     agent = main.get_agent()

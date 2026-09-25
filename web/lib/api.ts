@@ -24,7 +24,11 @@ export interface LiabilityFlag {
   severity: Severity;
   mitigation: string;
   accessibility: string;
+  // "excipient", or the residual impurity that produced the flag.
+  source: string;
 }
+
+export type StructureBasis = 'pubchem' | 'polymer_description' | 'surrogate' | 'unresolved' | '';
 
 export interface Dossier {
   excipient: string;
@@ -34,6 +38,17 @@ export interface Dossier {
   endpoints: EndpointResult[];
   liabilities: LiabilityFlag[];
   needs_testing: boolean;
+  // Set by the backend from what it actually screened, not by the model.
+  structure_basis: StructureBasis;
+}
+
+// Mirrors api/polymer.py. SMILES use [*] for attachment points.
+export interface PolymerSpec {
+  repeat_unit: string;
+  end_group_a: string;
+  end_group_b: string;
+  dp: number | null;
+  impurities: { name: string; level: string }[];
 }
 
 export interface Health {
@@ -53,17 +68,33 @@ export async function getHealth(signal?: AbortSignal): Promise<Health> {
   return res.json();
 }
 
-export async function runScreen(prompt: string, signal?: AbortSignal): Promise<Dossier> {
+interface ValidationIssue {
+  loc: (string | number)[];
+  msg: string;
+}
+
+export async function runScreen(
+  prompt: string,
+  polymer: PolymerSpec | null,
+  signal?: AbortSignal,
+): Promise<Dossier> {
   const res = await fetch(`${API_URL}/screen`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify(polymer ? { prompt, polymer } : { prompt }),
     signal,
   });
   if (!res.ok) {
     const body = await res.json().catch(() => null);
     // FastAPI puts a string in detail for HTTPException, a list for a 422.
-    const detail = typeof body?.detail === 'string' ? body.detail : JSON.stringify(body?.detail);
+    const detail =
+      typeof body?.detail === 'string'
+        ? body.detail
+        : Array.isArray(body?.detail)
+          ? (body.detail as ValidationIssue[])
+              .map((d) => `${d.loc.filter((l) => l !== 'body').join(' › ')}: ${d.msg.replace(/^Value error, /, '')}`)
+              .join('\n')
+          : '';
     throw new Error(detail || `Server returned ${res.status}`);
   }
   return res.json();

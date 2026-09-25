@@ -119,11 +119,53 @@ This is Stage 0, Stage 1, and a slice of Stage 2 from the design doc. Deliberate
 - **Surrogates:** polysorbates, poloxamers, PEG and PVP have no single PubChem CID and 404 on a
   name lookup, so `SURROGATES` in `api/main.py` maps them to a short repeat-unit stand-in. That
   captures the reactive features but not chain length, polydispersity, or residual monomers —
-  anything derived from a surrogate is capped at grade D and labelled in the rationale. Entering a
-  polymer properly (repeat unit + end groups + degree of polymerisation) isn't built yet.
+  anything derived from a surrogate is capped at grade D and labelled in the rationale.
+- **Real:** described polymers. Give `/screen` a repeat unit, end groups, an approximate DP and
+  any residual impurities, and it screens that chemistry instead of the surrogate — see below.
 - **Simplified:** label mining reads the DESCRIPTION text only — no structured SPL ingredient
   amounts, so label precedent carries no concentrations. No statistical mutagenicity model, no
-  exposure-margin/TTC calculation, no polymer repeat-unit handling.
+  exposure-margin/TTC calculation. Polymers are linear chains of one repeat unit: no
+  polydispersity, branching or block copolymers.
+
+### Describing a polymer
+
+`POST /screen` takes an optional `polymer` object alongside the prompt (`api/polymer.py`):
+
+```json
+{
+  "prompt": "Screen excipient 'Polysorbate 80' ...",
+  "polymer": {
+    "repeat_unit": "[*]CCO[*]",
+    "end_group_a": "[*]OC(=O)CCCCCCCC=CCCCCCCCC",
+    "end_group_b": "[*][H]",
+    "dp": 20,
+    "impurities": [{ "name": "ethylene oxide", "level": "<= 1 ppm" }]
+  }
+}
+```
+
+SMILES use `[*]` for attachment points: two on the repeat unit (head first), one on each end
+group. A malformed one is a 422 at the door, not a failed agent run. The screen builds a
+representative chain of at most ten repeat units — structural alerts are substructure-presence
+tests, so a longer chain fires the same ones — and computes Mn from the full DP (PEG 3350 at DP
+75.4 comes out at 3340).
+
+What a description buys, and where it stops:
+
+- **Ceiling C instead of D** on structure-derived endpoints: an in-domain prediction on the
+  chemistry the user actually has, never A or B.
+- **A description can refine the surrogate, never quietly drop one of its alerts.** Describe
+  "Polysorbate 80" with methoxy caps and the ester alert the real material fires disappears; that
+  is reported as a description conflict and the ceiling stays at D, so a wrong description can't
+  make an excipient look cleaner than the stand-in did.
+- **Residual impurities are screened as their own molecules**, resolved through PubChem. Residual
+  ethylene oxide trips the epoxide alert and adds a His alkylation flag tagged
+  `from residual ethylene oxide (<= 1 ppm)`. The level is quoted, never used to scale a severity —
+  there is no exposure model yet.
+- **Architecture is linear.** A polysorbate's four sorbitan arms are written as one chain with a
+  sorbitan-ester end group, which carries the same reactive groups but not the same shape.
+  Poloxamers (block copolymers) and the cellulosics have no linear preset and stay on the surrogate
+  unless described by hand.
 - **Real:** solvent-accessibility weighting. Give the scan a UniProt accession (AlphaFold model) or
   a 4-character PDB ID (RCSB experimental structure) and every liability is weighted by relative
   solvent accessibility, computed with Shrake-Rupley against Tien et al. 2013 reference max-ASA.
@@ -296,7 +338,7 @@ The four verdicts (`Precedented`, `Supported without precedent`, `Data gap: test
 and the A–E grades are enforced by the Pydantic schema in `api/main.py`, so the model can't
 invent a fifth verdict or hand back a bare score.
 
-Two things are enforced in code rather than by prompt, because a prompt rule is not a guarantee:
+Three things are enforced in code rather than by prompt, because a prompt rule is not a guarantee:
 
 - **Grade A and `Precedented` require a precedent lookup that actually returned one.** The model has
   read the literature in training and will happily assert precedent from memory for the excipients
@@ -307,6 +349,14 @@ Two things are enforced in code rather than by prompt, because a prompt rule is 
   than relaxed when the lookup landed. Setting `PRECEDENT_LOOKUP_AVAILABLE = False` in
   `api/main.py` restores the blanket ban, which is what you want if the lookup is ever found to
   be misreporting.
+- **The structure sets a grade ceiling.** `resolve_identity` records what it actually screened —
+  a PubChem structure (no ceiling), a described polymer (C, or D on a description conflict), a
+  surrogate (D) or nothing (E) — and the output validator bounces any endpoint graded above the
+  strictest ceiling of the run. Only the endpoint named `Regulatory precedent, <route>` is exempt,
+  because precedent is a name lookup. The same record fills the dossier's `structure_basis`, so
+  the frontend reports what was screened from the tool, not from the model. Before this the D cap
+  on surrogates was a prompt instruction, and a route match could license grade A on a structural
+  endpoint of a 3-mer stand-in.
 - **`needs_testing` is derived, not reported** — recomputed from the grades and severities on every
   dossier, so the model can't forget to set it.
 

@@ -13,6 +13,7 @@ import {
   structureKind,
   type ScreenForm as Form,
 } from '@/lib/screen';
+import PolymerPanel from './PolymerPanel';
 import { Spinner } from './icons';
 
 export type Mode = 'form' | 'text';
@@ -149,6 +150,11 @@ export default function ScreenForm(p: Props) {
                   </button>
                 ))}
               </div>
+              <PolymerPanel
+                excipient={form.excipient}
+                value={form.polymer}
+                onChange={(polymer) => onChange({ polymer })}
+              />
               <label className="block">
                 <span className="label">
                   Concentration <span className="hint">— optional</span>

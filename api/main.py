@@ -20,6 +20,7 @@ Run standalone:
 
 import os
 import re
+from itertools import product
 from dataclasses import dataclass, field
 from typing import Literal
 from urllib.parse import quote
@@ -28,11 +29,13 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
-from pydantic_ai import Agent, ModelRetry, RunContext
+from pydantic_ai import Agent, ModelRetry, RunContext, Tool
 from pydantic_ai.exceptions import UserError
 from rdkit import Chem
 
 import accessibility
+import polymer
+from polymer import PolymerSpec
 import precedent
 
 # ---------------------------------------------------------------------------
@@ -56,6 +59,8 @@ class LiabilityFlag(BaseModel):
     mitigation: str
     # Filled verbatim from the tool. "not modelled" when no structure was given.
     accessibility: str = "not modelled"
+    # "excipient", or the residual impurity whose alert produced this flag.
+    source: str = "excipient"
 
 
 # Stage 1 landed: precedent.py reads the FDA Inactive Ingredient Database and
@@ -77,6 +82,36 @@ class ScreenDeps:
     """
 
     precedent_calls: list[dict] = field(default_factory=list)
+    # Same idea for structure: what resolve_identity actually screened this run
+    # sets the ceiling on every structure-derived grade.
+    identity_calls: list[dict] = field(default_factory=list)
+    # A user-described polymer, from the request. When present, resolve_identity
+    # screens this instead of the surrogate table or PubChem.
+    polymer: PolymerSpec | None = None
+
+    def structure_ceiling(self) -> tuple[str | None, str]:
+        """(best grade any structure-derived endpoint may carry, basis).
+
+        The strictest ceiling across every identity call wins, so resolving a
+        second name cannot buy back a grade the first one ruled out."""
+        worst, basis = None, ""
+        for call in self.identity_calls:
+            grade = call.get("max_structure_grade")
+            if grade and (worst is None or grade > worst):
+                worst, basis = grade, call.get("structure_basis", "")
+            elif not basis:
+                basis = call.get("structure_basis", "")
+        return worst, basis
+
+    def impurity_sources(self) -> list[tuple[str, str]]:
+        """(label, SMILES) for every residual impurity that resolved."""
+        out = []
+        for call in self.identity_calls:
+            for imp in call.get("impurities", []):
+                if imp.get("resolved"):
+                    level = f" ({imp['level']})" if imp.get("level") else ""
+                    out.append((f"residual {imp['name']}{level}", imp["smiles"]))
+        return out
 
     def route_matched(self) -> bool:
         levels = {call.get("precedent_level") for call in self.precedent_calls}
@@ -107,6 +142,9 @@ class Dossier(BaseModel):
     endpoints: list[EndpointResult]
     liabilities: list[LiabilityFlag]
     needs_testing: bool
+    # Set by the system from what resolve_identity returned, never by the model:
+    # "pubchem", "polymer_description", "surrogate" or "unresolved".
+    structure_basis: str = Field(default="", description="Leave empty; the system fills this in.")
 
     def overclaims_precedent(self) -> list[str]:
         """Endpoints asserting precedent, which only a tool result can support."""
@@ -142,6 +180,9 @@ class Dossier(BaseModel):
 
 class ScreenRequest(BaseModel):
     prompt: str
+    # Optional structured description of a polymeric excipient. Validated here,
+    # so a bad SMILES is a 422 at the door rather than a failed agent run.
+    polymer: PolymerSpec | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +280,8 @@ def resolve_identity(name_or_smiles: str) -> dict:
         return {
             "resolved": True,
             "surrogate": True,
+            "structure_basis": "surrogate",
+            "max_structure_grade": "D",
             "smiles": smiles,
             "inchikey": None,
             "source": "local surrogate table (polymeric excipient — no single PubChem CID)",
@@ -271,6 +314,8 @@ def resolve_identity(name_or_smiles: str) -> dict:
                 return {
                     "resolved": True,
                     "surrogate": False,
+                    "structure_basis": "pubchem",
+                    "max_structure_grade": None,
                     "smiles": smiles,
                     "inchikey": row.get("InChIKey"),
                     "iupac_name": row.get("IUPACName"),
@@ -281,6 +326,8 @@ def resolve_identity(name_or_smiles: str) -> dict:
                 continue
     return {
         "resolved": False,
+        "structure_basis": "unresolved",
+        "max_structure_grade": "E",
         "note": (
             "Could not resolve via PubChem — treat as unidentified and grade E on every "
             "endpoint. Do not guess a structure. Polymers and mixtures often have no single "
@@ -288,6 +335,98 @@ def resolve_identity(name_or_smiles: str) -> dict:
             "instead of a trade name, which this tool accepts directly."
         ),
     }
+
+
+def _fired(smiles: str) -> list[str]:
+    return [a["alert"] for a in structural_alerts(smiles) if a["found"]]
+
+
+def describe_polymer(name: str, spec: PolymerSpec) -> dict:
+    """Screen a user-described polymer instead of the surrogate table.
+
+    A description may refine the surrogate, never silently drop an alert it
+    fired: if this name has a surrogate and the described chain loses one of its
+    alerts, the description is reported as conflicting and the grade ceiling
+    stays at D. Otherwise the structure is the user's own chemistry, an
+    in-domain prediction, and the ceiling is C.
+    """
+    chain = polymer.describe(spec)
+    described = _fired(chain["smiles"])
+
+    check = None
+    ceiling = "C"
+    hit = _surrogate_for(name)
+    if hit:
+        expected = _fired(hit[0])
+        dropped = [a for a in expected if a not in described]
+        check = {"surrogate_alerts": expected, "dropped_by_description": dropped}
+        if dropped:
+            ceiling = "D"
+
+    impurities = []
+    for imp in spec.impurities:
+        r = resolve_identity(imp.name)
+        entry = {"name": imp.name, "level": imp.level, "resolved": r.get("resolved", False)}
+        if entry["resolved"]:
+            entry["smiles"] = r["smiles"]
+            entry["alerts"] = _fired(r["smiles"])
+            entry["source"] = r.get("source")
+        impurities.append(entry)
+
+    note = (
+        f"USER-DESCRIBED POLYMER. {chain['limits']} Structure-derived endpoints may be graded C at "
+        "best (in-domain prediction on the described chemistry) — never A or B — and the rationale "
+        "must say the structure is the user's description."
+    )
+    if check and check["dropped_by_description"]:
+        note = (
+            f"DESCRIPTION CONFLICT: the described chain does not fire {check['dropped_by_description']}, "
+            f"which the known {name} chemistry does. Treat the description as unreliable: cap every "
+            "structure-derived endpoint at grade D and say so in the summary. " + chain["limits"]
+        )
+    if impurities:
+        note += (
+            " Each resolved residual impurity was screened as its own molecule; report every one "
+            "whose alerts fired, with its level quoted verbatim. The level is NOT used to scale any "
+            "severity — there is no exposure model."
+        )
+
+    return {
+        "resolved": True,
+        "surrogate": False,
+        "structure_basis": "polymer_description",
+        "max_structure_grade": ceiling,
+        "smiles": chain["smiles"],
+        "inchikey": None,
+        "source": "user polymer description (repeat unit + end groups)",
+        "repeat_units_screened": chain["repeat_units_screened"],
+        "dp": chain["dp"],
+        "mn_estimate": chain["mn_estimate"],
+        "description_alerts": described,
+        "surrogate_check": check,
+        "impurities": impurities,
+        "note": note,
+    }
+
+
+def resolve_identity_tool(ctx: RunContext[ScreenDeps], name_or_smiles: str) -> dict:
+    result = (
+        describe_polymer(name_or_smiles, ctx.deps.polymer)
+        if ctx.deps.polymer
+        else resolve_identity(name_or_smiles)
+    )
+    # Recorded before the model sees it; the output validator reads the ceiling
+    # from here, not from anything the dossier says about itself.
+    ctx.deps.identity_calls.append(result)
+    return result
+
+
+resolve_identity_tool.__doc__ = (
+    (resolve_identity.__doc__ or "")
+    + "\n\nIf the user supplied a polymer description with this request, it is used instead: "
+    "the result carries the described chain's SMILES, max_structure_grade, and any residual "
+    "impurities screened as separate molecules."
+)
 
 
 def structural_alerts(smiles: str) -> list[dict]:
@@ -452,7 +591,10 @@ DOWNGRADE = {"high": "moderate", "moderate": "low", "low": "low"}
 
 
 def protein_liability_scan(
-    protein_sequence: str, excipient_smiles: str, structure_id: str = ""
+    protein_sequence: str,
+    excipient_smiles: str,
+    structure_id: str = "",
+    extra_sources: list[tuple[str, str]] | None = None,
 ) -> dict:
     """Residue-level liability flags for an excipient against a protein.
 
@@ -472,7 +614,12 @@ def protein_liability_scan(
     # confident dossier with zero liabilities for an excipient that had just
     # tripped two alerts. A silently empty scan is the worst failure this tool
     # has, so the data no longer makes the round trip through the model.
-    active_alerts = [a["alert"] for a in structural_alerts(excipient_smiles) if a["found"]]
+    active_alerts = _fired(excipient_smiles)
+    # Residual impurities are screened as their own molecules: residual ethylene
+    # oxide is an epoxide whatever the polymer around it looks like.
+    sources = [("excipient", active_alerts)] + [
+        (label, _fired(smiles)) for label, smiles in (extra_sources or [])
+    ]
 
     sequence = "".join(protein_sequence.split()).upper()
 
@@ -496,8 +643,10 @@ def protein_liability_scan(
             )
 
     flags = []
-    for alert, residue, reaction, severity, mitigation in RULE_TABLE:
-        if alert not in active_alerts:
+    for (source, alerts), (alert, residue, reaction, severity, mitigation) in product(
+        sources, RULE_TABLE
+    ):
+        if alert not in alerts:
             continue
         one = THREE_TO_ONE.get(residue)
         if not one:
@@ -528,6 +677,7 @@ def protein_liability_scan(
                 "severity": final_severity,
                 "mitigation": mitigation,
                 "accessibility": note,
+                "source": source,
             }
         )
 
@@ -537,8 +687,27 @@ def protein_liability_scan(
         # and so an empty scan is visibly an excipient with no matching alerts
         # rather than a scan that quietly ran on nothing.
         "alerts_applied": active_alerts,
+        "impurity_alerts_applied": {label: alerts for label, alerts in sources[1:]},
         "flags": flags,
     }
+
+
+def protein_liability_scan_tool(
+    ctx: RunContext[ScreenDeps], protein_sequence: str, excipient_smiles: str, structure_id: str = ""
+) -> dict:
+    # Impurities come from what resolve_identity recorded this run, not from the
+    # model, for the same reason the alerts are re-derived: a list the model has
+    # to carry across is a list it can drop.
+    return protein_liability_scan(
+        protein_sequence, excipient_smiles, structure_id, ctx.deps.impurity_sources()
+    )
+
+
+protein_liability_scan_tool.__doc__ = (
+    (protein_liability_scan.__doc__ or "")
+    + "\n\nAny residual impurities from a polymer description are applied automatically; each "
+    "flag's source field says which molecule produced it."
+)
 
 
 def regulatory_precedent(
@@ -586,7 +755,8 @@ Workflow:
    about, and the excipient concentration exactly as they wrote it ("" if they gave none — the
    protein dose is NOT an excipient concentration). This is a name lookup against the FDA Inactive Ingredient Database, so it works even
    when resolve_identity fell back to a surrogate, and it is the ONLY thing in this system that
-   can see regulatory precedent. Report it as its own endpoint ("Regulatory precedent, <route>").
+   can see regulatory precedent. Report it as its own endpoint, named exactly
+   "Regulatory precedent, <route>" — the structure grade ceiling below exempts that name and no other.
    Take the grade ceiling from the tool's max_grade field and the verdict from its interpretation
    field — do not raise either on your own reading of the data. Quote dosage forms, potencies and
    route names verbatim; never convert a unit or combine two of them. If it reports
@@ -611,10 +781,20 @@ Workflow:
 6. If identity resolution fails, grade every structure-derived endpoint E and say so plainly in
    the summary — do not guess a structure. The precedent endpoint still stands on its own: a name
    lookup does not need a structure.
-7. If resolve_identity returns surrogate=True, the structure you screened is a short repeat-unit
-   stand-in for a polymer, not the real excipient. Cap every structure-derived endpoint at grade D,
-   name the surrogate in the rationale, and say in the summary that the real material's chain
-   length, polydispersity and residual monomers were NOT assessed.
+7. resolve_identity returns max_structure_grade: the best grade ANY endpoint other than
+   "Regulatory precedent, <route>" may carry. It is enforced in code. By structure_basis:
+   - "surrogate": a short repeat-unit stand-in for a polymer, not the real excipient. Ceiling D.
+     Name the surrogate in the rationale, and say in the summary that the real material's chain
+     length, polydispersity and residual monomers were NOT assessed.
+   - "polymer_description": the user described the chain (repeat unit, end groups, DP). Ceiling C,
+     or D when the result reports a DESCRIPTION CONFLICT — then say in the summary that the
+     description dropped an alert the known chemistry fires. Say the structure is the user's
+     description, quote dp and mn_estimate when given, and state that polydispersity and branching
+     were not modelled. For each residual impurity that resolved and fired an alert, add an
+     endpoint "Residual <name>" (ceiling applies) quoting its level verbatim, and say its level was
+     not used to scale severity. An impurity that did not resolve is a data gap: say so.
+   - "unresolved": ceiling E.
+   - "pubchem": no ceiling from structure.
 
 Verdict rules — use ONLY these four words, never "safe":
   Precedented, Supported without precedent, Data gap: test, Alert: avoid.
@@ -655,11 +835,13 @@ def get_agent() -> Agent:
             deps_type=ScreenDeps,
             system_prompt=SYSTEM_PROMPT,
             tools=[
-                resolve_identity,
+                # Registered under the plain names the model and the tests use;
+                # the wrappers read and record the per-run deps.
+                Tool(resolve_identity_tool, name="resolve_identity"),
                 structural_alerts,
                 published_alert_screen,
                 regulatory_precedent,
-                protein_liability_scan,
+                Tool(protein_liability_scan_tool, name="protein_liability_scan"),
             ],
             # A full dossier with five endpoints and a dozen liabilities is a
             # lot of JSON. The default cap truncated it mid-object, which the
@@ -694,7 +876,27 @@ def enforce_precedent_evidence(ctx: RunContext[ScreenDeps], dossier: Dossier) ->
             "otherwise regrade these endpoints to the tool's max_grade with the verdict its "
             "interpretation field calls for."
         )
+
+    ceiling, basis = ctx.deps.structure_ceiling()
+    if ceiling:
+        over = [
+            f"{e.endpoint} ({e.evidence_grade})"
+            for e in dossier.endpoints
+            if e.evidence_grade < ceiling and not _is_precedent_endpoint(e.endpoint)
+        ]
+        if over:
+            raise ModelRetry(
+                f"Endpoints {over} are graded above {ceiling}, the ceiling resolve_identity set for a "
+                f"{basis!r} structure. Only the endpoint named 'Regulatory precedent, <route>' is "
+                f"exempt, because precedent is a name lookup. Regrade these to {ceiling} or below."
+            )
+    # Set from the tool record, whatever the model wrote.
+    dossier.structure_basis = basis
     return dossier
+
+
+def _is_precedent_endpoint(name: str) -> bool:
+    return name.strip().lower().startswith("regulatory precedent")
 
 # ---------------------------------------------------------------------------
 # API
@@ -741,7 +943,7 @@ async def screen(req: ScreenRequest):
     try:
         # Fresh deps per request: the evidence gate must not see what a previous
         # screen's precedent lookup returned.
-        result = await agent.run(prompt, deps=ScreenDeps())
+        result = await agent.run(prompt, deps=ScreenDeps(polymer=req.polymer))
     except Exception as e:
         # The agent run is the only call here that leaves the box; surface the
         # failure as a 502 so the frontend can show something more useful than 500.
