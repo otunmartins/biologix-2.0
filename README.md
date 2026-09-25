@@ -120,7 +120,8 @@ This is Stage 0, Stage 1, and a slice of Stage 2 from the design doc. Deliberate
   captures the reactive features but not chain length, polydispersity, or residual monomers —
   anything derived from a surrogate is capped at grade D and labelled in the rationale. Entering a
   polymer properly (repeat unit + end groups + degree of polymerisation) isn't built yet.
-- **Simplified:** no DailyMed or SPL label mining, no statistical mutagenicity model, no
+- **Simplified:** label mining reads the DESCRIPTION text only — no structured SPL ingredient
+  amounts, so label precedent carries no concentrations. No statistical mutagenicity model, no
   exposure-margin/TTC calculation, no polymer repeat-unit handling.
 - **Real:** solvent-accessibility weighting. Give the scan a UniProt accession (AlphaFold model) or
   a 4-character PDB ID (RCSB experimental structure) and every liability is weighted by relative
@@ -153,15 +154,32 @@ Three free, keyless federal sources, in `api/precedent.py`, because no one of th
 The two precedent sources have opposite failure modes, which is exactly why both are used. The
 IID is a curated assertion with a population gap; the label search is a text match over the right
 population. Every finding reports which one carried it (`precedent_basis`), and the label source
-carries three guards, because full text is the looser instrument:
+carries five guards, because full text is the looser instrument:
 
 1. **DESCRIPTION only.** A hypersensitivity warning naming an excipient lives in WARNINGS or
    CONTRAINDICATIONS, not in the composition section.
-2. **Approved applications only**, counted as *distinct application numbers* rather than label
+2. **Not the active ingredient.** Products whose active substance carries the name are excluded
+   in the query: iron dextran is not dextran the excipient, iron sucrose is not sucrose, and an
+   amino-acid infusion's glycine is the drug.
+3. **An ingredient, not a mention.** The matching labels are read, and one counts only if the
+   name sits beside an amount (`albumin (human) (2.5 mg)`) or in a sentence stating contents
+   (`each mL contains…`). The composition section also *describes* the drug, so a phrase search
+   alone counts semaglutide ("the main protraction mechanism … is albumin binding") and a fusion
+   protein built on human serum albumin as albumin precedent. `test_smoke.py` pins seven real
+   sentences, both ways.
+4. **Approved applications only**, counted as *distinct application numbers* rather than label
    documents, so a product with six label revisions counts once.
-3. **At least three of them** (`MIN_LABEL_APPLICATIONS`). One stray mention is not a formulation.
-   Real excipients clear this by an order of magnitude; calcium chloride subcutaneous sits at two
-   and is deliberately *not* promoted — `test_smoke.py` pins that boundary.
+5. **At least three verified ones** (`MIN_LABEL_APPLICATIONS`). One stray mention is not a
+   formulation. Real excipients clear this by an order of magnitude; calcium chloride
+   subcutaneous sits at two and is deliberately *not* promoted — `test_smoke.py` pins that
+   boundary.
+
+Labels run to ~200 KB each, so they are read ten at a time and reading stops once the threshold
+is met (at most fifty). The payload therefore carries two counts: `n_approved_applications`, the
+applications that mention the excipient, and `n_verified_as_ingredient`, a *floor* on how many
+list it — not a census. Only the verified count can promote a finding to `route_match`. If openFDA
+stops answering part-way through, the label source is reported as not checked rather than as
+whatever was verified before it failed.
 
 Application numbers are returned in the payload so a reviewer can check any of it.
 
