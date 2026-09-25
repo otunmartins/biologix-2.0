@@ -79,9 +79,10 @@ class ScreenDeps:
     precedent_calls: list[dict] = field(default_factory=list)
 
     def route_matched(self) -> bool:
-        return any(
-            call.get("precedent_level") == "route_match" for call in self.precedent_calls
-        )
+        levels = {call.get("precedent_level") for call in self.precedent_calls}
+        # Any call that found the concentration above the record vetoes the
+        # rest, so re-asking without a concentration can't buy the A back.
+        return "route_match" in levels and "route_match_above_record" not in levels
 
     def summary(self) -> str:
         if not self.precedent_calls:
@@ -541,7 +542,7 @@ def protein_liability_scan(
 
 
 def regulatory_precedent(
-    ctx: RunContext[ScreenDeps], excipient: str, route: str
+    ctx: RunContext[ScreenDeps], excipient: str, route: str, concentration: str = ""
 ) -> dict:
     """Has this excipient been used in an approved drug product by this route?
 
@@ -552,8 +553,12 @@ def regulatory_precedent(
     Pass the excipient name, CAS number or the trade name the user typed, and the
     route they asked about. This is a NAME lookup, so it is unaffected by whether
     the structure came back as a surrogate.
+
+    concentration is the EXCIPIENT's concentration or amount exactly as the user
+    wrote it ("0.02% w/v", "10 mg/mL", "5 mg per dose"), or "" if they gave none.
+    Never pass the protein's dose here.
     """
-    result = precedent.look_up(excipient, route)
+    result = precedent.look_up(excipient, route, concentration)
     # Recorded before it reaches the model. The output validator reads this, and
     # nothing in the dossier can talk it into a claim the lookup did not make.
     ctx.deps.precedent_calls.append(result)
@@ -577,8 +582,9 @@ Workflow:
    generic screening-library filters that are neither excipient- nor protein-specific, and never
    turn one into a protein liability or use one to raise a severity. If it returns no hits, say
    that no published filter set objected — not that the excipient is clean.
-4. Call regulatory_precedent with the excipient name the user typed and the route they asked
-   about. This is a name lookup against the FDA Inactive Ingredient Database, so it works even
+4. Call regulatory_precedent with the excipient name the user typed, the route they asked
+   about, and the excipient concentration exactly as they wrote it ("" if they gave none — the
+   protein dose is NOT an excipient concentration). This is a name lookup against the FDA Inactive Ingredient Database, so it works even
    when resolve_identity fell back to a surrogate, and it is the ONLY thing in this system that
    can see regulatory precedent. Report it as its own endpoint ("Regulatory precedent, <route>").
    Take the grade ceiling from the tool's max_grade field and the verdict from its interpretation

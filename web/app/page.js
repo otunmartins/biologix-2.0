@@ -7,7 +7,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 const GRADE_MEANING = {
-  A: 'Approved-product precedent at this route (FDA Inactive Ingredient Database)',
+  A: 'Approved-product precedent at this route, not above the highest level on record (FDA)',
   B: 'Experimental data',
   C: 'In-domain prediction',
   D: 'Out-of-domain or surrogate prediction',
@@ -42,6 +42,7 @@ export default function Home() {
   const [structureId, setStructureId] = useState('');
   const [route, setRoute] = useState('Subcutaneous');
   const [dose, setDose] = useState(100);
+  const [concentration, setConcentration] = useState('');
   const [temp, setTemp] = useState('25°C (room temp)');
   const [freeText, setFreeText] = useState(
     'Is polysorbate 80 a concern for my antibody given subcutaneously, stored at room temperature?'
@@ -85,7 +86,7 @@ export default function Home() {
 
     const prompt =
       mode === 'form'
-        ? `Screen excipient '${excipient}' for a biologic given by the ${route} route, dose ${dose} mg, storage at ${temp}. Protein sequence: ${seq || 'not provided'}. Protein structure identifier: ${structureId.trim() || 'none'}.`
+        ? `Screen excipient '${excipient}' for a biologic given by the ${route} route, protein dose ${dose} mg, excipient concentration ${concentration.trim() || 'not given'}, storage at ${temp}. Protein sequence: ${seq || 'not provided'}. Protein structure identifier: ${structureId.trim() || 'none'}.`
         : freeText;
 
     abortRef.current?.abort();
@@ -109,7 +110,7 @@ export default function Home() {
     } finally {
       setLoading(false);
     }
-  }, [mode, excipient, route, dose, temp, seq, structureId, freeText]);
+  }, [mode, excipient, route, dose, concentration, temp, seq, structureId, freeText]);
 
   // Ctrl/Cmd+Enter runs from anywhere, including inside the textareas.
   useEffect(() => {
@@ -290,10 +291,23 @@ export default function Home() {
                 </select>
               </label>
               <label className="field">
-                <span className="lab">Dose (mg)</span>
+                <span className="lab">Protein dose (mg)</span>
                 <input type="number" value={dose} onChange={(e) => setDose(e.target.value)} />
               </label>
             </div>
+
+            <label className="field">
+              <span className="lab">
+                Excipient concentration{' '}
+                <span className="hint">optional — e.g. 0.02% w/v, 10 mg/mL, 5 mg per dose</span>
+              </span>
+              <input
+                type="text"
+                value={concentration}
+                placeholder="not given"
+                onChange={(e) => setConcentration(e.target.value)}
+              />
+            </label>
 
             <label className="field">
               <span className="lab">Storage temperature</span>

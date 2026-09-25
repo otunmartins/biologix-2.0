@@ -212,6 +212,12 @@ def normalise_route(raw: str, known_routes: set[str]) -> str:
 _index: dict | None = None
 _index_lock = threading.Lock()
 _index_error: str | None = None
+_index_failed_at = 0.0
+
+# After a failed build, wait this long before trying fda.gov again. Short enough
+# that an outage clears itself; long enough that every screen during one isn't
+# stalled behind a three-minute download timeout.
+INDEX_RETRY_SECONDS = 300
 
 
 def _current_iid_url() -> str:
@@ -249,10 +255,18 @@ def _download_iid() -> bytes:
         with open(path, "rb") as fh:
             return fh.read()
 
-    response = httpx.get(_current_iid_url(), timeout=180, follow_redirects=True)
-    response.raise_for_status()
-    payload = response.content
-    zipfile.ZipFile(io.BytesIO(payload))  # reject an HTML error page before caching it
+    try:
+        response = httpx.get(_current_iid_url(), timeout=180, follow_redirects=True)
+        response.raise_for_status()
+        payload = response.content
+        zipfile.ZipFile(io.BytesIO(payload))  # reject an HTML error page before caching it
+    except Exception:
+        # The file changes quarterly, so an expired copy is almost certainly
+        # still right and far better than no precedent at all.
+        if os.path.exists(path):
+            with open(path, "rb") as fh:
+                return fh.read()
+        raise
 
     try:
         with open(path, "wb") as fh:
@@ -305,15 +319,19 @@ def get_index() -> dict:
     """Lazily built, then held for the life of the process.
 
     Built on first tool call rather than at import for the same reason the agent
-    is: a network hiccup at startup should not take the container down.
+    is: a network hiccup at startup should not take the container down. A failed
+    build is retried after INDEX_RETRY_SECONDS rather than never, so one bad
+    minute at fda.gov does not mean no precedent until the container restarts.
     """
-    global _index, _index_error
+    global _index, _index_error, _index_failed_at
     with _index_lock:
-        if _index is None and _index_error is None:
+        if _index is None and time.time() - _index_failed_at >= INDEX_RETRY_SECONDS:
             try:
                 _index = _build_index()
+                _index_error = None
             except Exception as exc:
                 _index_error = f"{type(exc).__name__}: {exc}"
+                _index_failed_at = time.time()
         if _index is None:
             raise RuntimeError(f"FDA IID unavailable ({_index_error})")
         return _index
@@ -340,14 +358,37 @@ def index_status() -> dict:
 _CAS_RE = re.compile(r"^\d{2,7}-\d{2}-\d$")
 
 
+def _openfda_get(url: str) -> httpx.Response:
+    """GET an openFDA URL, with the API key when one is configured.
+
+    Without a key openFDA allows about 1,000 requests a day per IP, and one
+    excipient lookup can spend ten. A key is free and lifts that to 120,000.
+    """
+    key = os.environ.get("OPENFDA_API_KEY", "").strip()
+    if key:
+        url += f"&api_key={quote(key)}"
+    return httpx.get(url, timeout=30)
+
+
+class LookupFailed(Exception):
+    """openFDA could not answer — a timeout, a 429, a 5xx. Not the same as a miss,
+    and never cached as one: a rate-limit blip must not become "no precedent"
+    for the life of the process."""
+
+
 def _substance_search(query: str) -> dict | None:
+    """The first matching record, or None on a definitive miss (404).
+    Raises LookupFailed when openFDA could not answer."""
     try:
-        response = httpx.get(f"{SUBSTANCE}?search={query}&limit=1", timeout=20)
-        if response.status_code != 200:
-            return None
-        return response.json()["results"][0]
-    except Exception:
+        response = _openfda_get(f"{SUBSTANCE}?search={query}&limit=1")
+    except httpx.HTTPError as exc:
+        raise LookupFailed(f"{type(exc).__name__}: {exc}") from exc
+    if response.status_code == 404:
         return None
+    if response.status_code != 200:
+        raise LookupFailed(f"HTTP {response.status_code}")
+    results = response.json().get("results") or []
+    return results[0] if results else None
 
 
 _substance_cache: dict[str, dict] = {}
@@ -382,18 +423,23 @@ def resolve_substance(name_or_cas: str) -> dict:
         candidates = [f'names.name:"{quote(s)}"' for s in spellings if s]
 
     record = None
-    for query in candidates:
-        record = _substance_search(query)
-        if record:
-            break
+    try:
+        for query in candidates:
+            record = _substance_search(query)
+            if record:
+                break
 
-    if record is None and not _CAS_RE.match(raw):
-        loose = _substance_search(quote(f'"{raw}"'))
-        wanted = {_normalise(raw), folded}
-        if loose and any(
-            _normalise(n.get("name", "")) in wanted for n in loose.get("names", [])
-        ):
-            record = loose
+        if record is None and not _CAS_RE.match(raw):
+            loose = _substance_search(quote(f'"{raw}"'))
+            wanted = {_normalise(raw), folded}
+            if loose and any(
+                _normalise(n.get("name", "")) in wanted for n in loose.get("names", [])
+            ):
+                record = loose
+    except LookupFailed as exc:
+        # Reported, not cached: the next screen asks again.
+        return {"found": False, "unii": "", "display_name": "", "cas": "", "cfr": [],
+                "gras": "", "error": f"openFDA substance registry unavailable ({exc})"}
 
     if record is None:
         result = {"found": False, "unii": "", "display_name": "", "cas": "", "cfr": [], "gras": ""}
@@ -411,7 +457,8 @@ def resolve_substance(name_or_cas: str) -> dict:
         }
 
     # A miss costs up to five sequential round trips through the casing ladder,
-    # so misses are cached too — the same unknown name should not pay twice.
+    # so definitive misses are cached too — the same unknown name should not pay
+    # twice. Failures returned above and are not.
     if len(_substance_cache) >= _SUBSTANCE_CACHE_MAX:
         _substance_cache.pop(next(iter(_substance_cache)))
     _substance_cache[key] = result
@@ -477,16 +524,19 @@ def label_precedent(names: list[str], route: str) -> dict:
             break
         query = f'description:"{quote(name.lower())}"+AND+openfda.route:"{quote(route)}"'
         try:
-            counts = httpx.get(
-                f"{LABELS}?search={query}&count=openfda.application_number.exact&limit=1000",
-                timeout=30,
+            counts = _openfda_get(
+                f"{LABELS}?search={query}&count=openfda.application_number.exact&limit=1000"
             )
         except Exception:
-            break  # network trouble, not a miss: leave checked False
+            # Network trouble, not a miss. Clear checked even if an earlier
+            # spelling came back 404: a half-asked question is not a "no".
+            result["checked"] = False
+            break
         if counts.status_code == 404:
             result["checked"] = True  # a definitive "no products", not a failure
             continue
         if counts.status_code != 200:
+            result["checked"] = False
             break
 
         applications = [row["term"] for row in counts.json().get("results", [])]
@@ -499,7 +549,7 @@ def label_precedent(names: list[str], route: str) -> dict:
 
         examples = []
         try:
-            sample = httpx.get(f"{LABELS}?search={query}&limit=5", timeout=30)
+            sample = _openfda_get(f"{LABELS}?search={query}&limit=5")
             if sample.status_code == 200:
                 for row in sample.json()["results"]:
                     meta = row.get("openfda", {})
@@ -519,6 +569,10 @@ def label_precedent(names: list[str], route: str) -> dict:
         }
         break
 
+    # An unchecked result is a network failure, not an answer — cache it and a
+    # single 429 would read as "no approved labels" until the process restarts.
+    if not result["checked"]:
+        return result
     if len(_label_cache) >= _SUBSTANCE_CACHE_MAX:
         _label_cache.pop(next(iter(_label_cache)))
     _label_cache[key] = result
@@ -533,6 +587,7 @@ def label_precedent(names: list[str], route: str) -> dict:
 # gate in main.py only cares whether the level is "route_match".
 CEILINGS = {
     "route_match": "A",
+    "route_match_above_record": "B",
     "systemic_injection_match": "B",
     "parenteral_match": "C",
     "other_route_only": "C",
@@ -686,7 +741,76 @@ def _potency_summary(rows: list[dict]) -> dict:
     return {unit: f"{value:g}" for unit, value in sorted(best.items())}
 
 
-def look_up(excipient: str, route: str) -> dict:
+# What a formulator types, mapped onto the two potency units the IID uses at
+# injected routes: %w/v (a concentration) and mg (an amount per dosage unit).
+# Only conversions that are definitions are made — 1 %w/v is 10 mg/mL by
+# definition. Molar units need a molecular weight and a per-dose amount cannot
+# become a concentration without a fill volume, so neither is attempted.
+_CONC_UNITS = {
+    "%w/v": ("%w/v", 1.0), "%": ("%w/v", 1.0),
+    "mg/ml": ("%w/v", 0.1), "g/l": ("%w/v", 0.1),
+    "ug/ml": ("%w/v", 1e-4), "mcg/ml": ("%w/v", 1e-4), "µg/ml": ("%w/v", 1e-4),
+    "g/100ml": ("%w/v", 1.0),
+    "mg": ("mg", 1.0), "g": ("mg", 1000.0),
+    "ug": ("mg", 1e-3), "mcg": ("mg", 1e-3), "µg": ("mg", 1e-3),
+}
+
+
+def parse_concentration(text: str) -> dict | None:
+    """'0.02% w/v', '10 mg/mL', '47 mg' -> a value in an IID unit, or None."""
+    m = re.match(r"^\s*(\d+(?:\.\d+)?|\.\d+)\s*(.*?)\s*$", text or "")
+    if not m:
+        return None
+    unit = re.sub(r"[\s()]", "", m.group(2).lower()).replace("μ", "µ")
+    # "5 mg per dose", "5 mg/vial": the IID's mg column is already per dosage unit.
+    unit = re.sub(r"(?:per|/)(?:dose|vial|unit|injection|syringe)$", "", unit)
+    if unit not in _CONC_UNITS:
+        return None
+    iid_unit, factor = _CONC_UNITS[unit]
+    value = float(m.group(1)) * factor
+    return {"value": value, "unit": iid_unit, "interpreted_as": f"{value:g} {iid_unit}"}
+
+
+def _check_concentration(concentration: str, same: list[dict], label_backed: bool) -> dict:
+    """Is the requested concentration within the highest on record at this route?
+
+    "above_record" costs the route match its grade A. Everything short of a
+    comparison that actually ran — nothing given, nothing parseable, no IID
+    potency in a comparable unit — leaves A available but is reported, so the
+    rationale can say the concentration was not checked.
+    """
+    check = {"as_given": concentration or "", "interpreted_as": "", "highest_on_record": ""}
+    if not concentration.strip():
+        return {**check, "status": "not_given",
+                "note": "No concentration given, so precedent covers the route only. Say so."}
+    parsed = parse_concentration(concentration)
+    if parsed is None:
+        return {**check, "status": "unparsed",
+                "note": ("Could not read this as %w/v, mg/mL or mg per dose, so it was not "
+                         "compared. Say the concentration was not checked against precedent.")}
+    check["interpreted_as"] = parsed["interpreted_as"]
+    on_record = _potency_summary(same).get(parsed["unit"])
+    if on_record is None:
+        where = ("approved product labels, which carry no concentrations"
+                 if label_backed and not same else
+                 f"IID rows that state no potency in {parsed['unit']}")
+        return {**check, "status": "not_comparable",
+                "note": (f"Precedent at this route comes from {where}, so the concentration "
+                         "could not be compared. Say it was not checked.")}
+    check["highest_on_record"] = f"{on_record} {parsed['unit']}"
+    # The tolerance is for unit conversion, not leniency: 3 mg/mL is 0.3 %w/v,
+    # but 3 * 0.1 is 0.30000000000000004 in floating point.
+    if parsed["value"] > float(on_record) * (1 + 1e-9):
+        return {**check, "status": "above_record",
+                "note": ("Above the highest potency the IID records at this route. Route "
+                         "precedent does not reach this level; grade B at best. The IID "
+                         "under-represents biologics and some rows state no potency, so this "
+                         "is 'above what is on record', not 'above what has been approved'.")}
+    return {**check, "status": "within_record",
+            "note": "At or below the highest potency the IID records at this route."}
+
+
+def look_up(excipient: str, route: str, concentration: str = "") -> dict:
     """Precedent for one excipient at one route. The agent's Stage 1 tool.
 
     Never raises: an unreachable IID comes back as level "unavailable", which
@@ -752,8 +876,26 @@ def look_up(excipient: str, route: str) -> dict:
     else:
         level, source = "none", "nothing found in either source"
 
+    concentration_check = None
+    if level == "route_match":
+        concentration_check = _check_concentration(concentration, same, label_backed)
+        if concentration_check["status"] == "above_record":
+            level = "route_match_above_record"
+
+    # A source that failed pushes the level down, never up, so this is not a
+    # safety problem — but a grade lowered by an outage must say so, or it reads
+    # as evidence of absence.
+    lookup_errors = []
+    if substance.get("error"):
+        lookup_errors.append(substance["error"] + "; UNII join and GRAS check skipped")
+    if wanted and not labels["checked"]:
+        lookup_errors.append(
+            "openFDA label search unavailable; approved-label precedent not checked"
+        )
+
     return {
         "available": True,
+        "lookup_errors": lookup_errors,
         "source": f"FDA Inactive Ingredient Database ({index['n_rows']} rows), openFDA substance registry",
         "excipient_as_asked": excipient,
         "unii": substance["unii"],
@@ -764,6 +906,10 @@ def look_up(excipient: str, route: str) -> dict:
         "route_matched": wanted or f"'{route}' did not match any FDA route term",
         "precedent_level": level,
         "precedent_basis": source,
+        "concentration_check": concentration_check or {
+            "status": "not_applicable",
+            "note": "No route precedent, so there was no potency to compare against.",
+        },
         "max_grade": _ceiling(level, wanted, substance["gras"]),
         "approved_products_at_this_route": {
             "checked": labels["checked"],
@@ -809,7 +955,17 @@ _INTERPRETATION = {
         "products when approved_products_at_this_route lists them, since 'it is in these "
         "four approved products' is what a formulator can actually act on. Quote dosage "
         "forms and potencies verbatim, and say plainly that precedent at a route is not "
-        "clearance at the user's concentration and says nothing about this protein."
+        "clearance at the user's concentration and says nothing about this protein. Read "
+        "concentration_check: if its status is not 'within_record', say in the rationale "
+        "that the concentration was not checked against precedent, and why."
+    ),
+    "route_match_above_record": (
+        "The excipient is in approved products at this route, but the concentration asked "
+        "about is above the highest potency the IID records there. Precedent at a route does "
+        "not extend past the levels it was established at: grade B at best, verdict "
+        "'Supported without precedent'. Quote the highest on record and the concentration as "
+        "interpreted, verbatim, and repeat concentration_check's caveat about what the IID "
+        "does not cover."
     ),
     "systemic_injection_match": (
         "No row at the requested route, but the excipient is approved at another systemic "
@@ -851,5 +1007,7 @@ _CAVEAT = (
     "excipient has been in an approved product at that route at or below the potency "
     "shown, which is not clearance at the user's concentration and not a statement about "
     "this protein; (3) GRAS is a food determination and does not transfer to a parenteral "
-    "route; (4) neither source is a safety finding about the combination being screened."
+    "route; (4) neither source is a safety finding about the combination being screened. "
+    "If lookup_errors is non-empty, part of the lookup failed: say so in the rationale, and "
+    "say that a lower grade may reflect the outage rather than a lack of precedent."
 )

@@ -338,6 +338,103 @@ def main_test():
     assert thim["max_grade"] == "C"
     print("ok  precedent: IV/IM precedent does not bridge to intravitreal")
 
+    # --- concentration against the highest potency on record -----------------
+    pre = main.precedent
+    PARSES = [
+        ("0.02% w/v", "%w/v", 0.02), ("0.02 %", "%w/v", 0.02), ("3 mg/mL", "%w/v", 0.3),
+        ("200 µg/mL", "%w/v", 0.02), ("5 mg per dose", "mg", 5.0), ("0.5 g", "mg", 500.0),
+        ("10 mM", None, None), ("lots", None, None), ("", None, None),
+    ]
+    for text, unit, value in PARSES:
+        got = pre.parse_concentration(text)
+        if unit is None:
+            assert got is None, (text, got)
+        else:
+            assert got["unit"] == unit and abs(got["value"] - value) < 1e-9, (text, got)
+    print(f"ok  concentration parsing: {len(PARSES)} cases, molar units refused")
+
+    # Polysorbate 80 subcutaneous: the IID's highest on record is 0.3 %w/v.
+    CONC = [("0.02% w/v", "within_record", "route_match", "A"),
+            ("3 mg/mL", "within_record", "route_match", "A"),   # exactly at the record
+            ("0.5% w/v", "above_record", "route_match_above_record", "B"),
+            ("10 mM", "unparsed", "route_match", "A"),
+            ("", "not_given", "route_match", "A")]
+    for conc, status, level, grade in CONC:
+        r = pre.look_up(PS80, "subcutaneous", conc)
+        assert r["concentration_check"]["status"] == status, (conc, r["concentration_check"])
+        assert r["precedent_level"] == level and r["max_grade"] == grade, (conc, r["precedent_level"])
+    print("ok  concentration: above the IID record caps a route match at B")
+
+    # Label-only precedent carries no potency, so nothing can be compared.
+    plx = pre.look_up("Poloxamer 188", "subcutaneous", "0.1% w/v")
+    assert plx["concentration_check"]["status"] == "not_comparable", plx["concentration_check"]
+    print("ok  concentration: label-only precedent reported as not comparable")
+
+    # Re-asking without a concentration must not buy the A back.
+    deps = main.ScreenDeps(precedent_calls=[
+        pre.look_up(PS80, "subcutaneous", ""),
+        pre.look_up(PS80, "subcutaneous", "0.5% w/v"),
+    ])
+    assert not deps.route_matched(), deps.summary()
+    print("ok  evidence gate: an above-record call vetoes a route match from the same run")
+
+    # --- failures are reported, never cached as answers -----------------------
+    # A 429 or a timeout must not become "no precedent" for the life of the
+    # process. Simulated offline by swapping out httpx.get.
+    pre = main.precedent
+    real_get = pre.httpx.get
+    seen_urls = []
+
+    def rate_limited(url, **_):
+        seen_urls.append(url)
+        return pre.httpx.Response(429, request=pre.httpx.Request("GET", url))
+
+    pre.httpx.get = rate_limited
+    try:
+        sub = pre.resolve_substance("Glycerin")
+        assert not sub["found"] and "unavailable" in sub.get("error", ""), sub
+        assert "GLYCERIN" not in pre._substance_cache, "a failed lookup was cached as a miss"
+
+        lab = pre.label_precedent(["glycerin"], "INTRAVENOUS")
+        assert lab["checked"] is False, lab
+        assert (("glycerin",), "INTRAVENOUS") not in pre._label_cache
+
+        during = pre.look_up("Glycerin", "intravenous")
+        assert len(during["lookup_errors"]) == 2, during["lookup_errors"]
+
+        os.environ["OPENFDA_API_KEY"] = "test-key"
+        pre.resolve_substance("Some uncached name")
+        assert seen_urls[-1].endswith("&api_key=test-key"), seen_urls[-1]
+    finally:
+        pre.httpx.get = real_get
+        os.environ.pop("OPENFDA_API_KEY", None)
+
+    after = pre.look_up("Glycerin", "intravenous")
+    assert after["lookup_errors"] == [] and after["precedent_level"] == "route_match", after
+    print("ok  outages: a rate limit is reported in lookup_errors, not cached, and clears")
+
+    # The IID build must be retried after a failure, not given up on forever.
+    real_build, real_index = pre._build_index, pre._index
+    calls = []
+
+    def failing_build():
+        calls.append(1)
+        raise OSError("fda.gov unreachable")
+
+    pre._build_index, pre._index, pre._index_failed_at = failing_build, None, 0.0
+    try:
+        for _ in range(2):
+            assert pre.look_up("Sucrose", "oral")["precedent_level"] == "unavailable"
+        assert len(calls) == 1, "retried inside the cooldown"
+        pre._build_index = real_build
+        pre._index_failed_at -= pre.INDEX_RETRY_SECONDS
+        assert pre.look_up("Sucrose", "oral")["available"], "not retried after the cooldown"
+    finally:
+        pre._build_index = real_build
+        if pre._index is None:
+            pre._index = real_index
+    print("ok  outages: a failed IID build is retried after the cooldown")
+
     # --- the evidence gate, both directions ----------------------------------
     agent = main.get_agent()
 

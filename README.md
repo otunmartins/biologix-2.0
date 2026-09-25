@@ -40,6 +40,13 @@ The first screen you run downloads the FDA Inactive Ingredient file (~380 KB) an
 reports whether that index is loaded, which is the first thing to check if every dossier suddenly
 comes back as a data gap.
 
+The precedent lookup also calls openFDA, which without a key allows about 1,000 requests a day
+per IP — roughly a hundred excipient lookups. Set `OPENFDA_API_KEY` (free, from
+open.fda.gov/apis/authentication) to lift that to 120,000. When a source does fail, the lookup
+says so in `lookup_errors` rather than grading the excipient as if nothing were found, failures
+are never cached, and a failed IID download is retried after five minutes (falling back to an
+expired copy on disk if there is one).
+
 ## Deploy to AWS
 
 Defaults to a `t3.large` on the current Ubuntu 22.04 AMI — no AMI to look up, and no GPU quota
@@ -164,11 +171,21 @@ the grade ceiling:
 | level | meaning | ceiling |
 |---|---|---|
 | `route_match` | approved product at this exact route, from either source | A |
+| `route_match_above_record` | route match, but the concentration given is above the highest potency the IID records there | B |
 | `systemic_injection_match` | approved at another systemic injection route (IV↔SC↔IM) | B |
 | `parenteral_match` | approved only at a local/compartmental injection route (intravitreal, intra-articular) | C |
 | `other_route_only` | approved only at non-injected routes | C |
 | `gras_only` | no drug precedent; a food citation only | C oral / D otherwise |
 | `none`, `unavailable` | nothing found in either source, or the lookup failed | D |
+
+**Concentration.** Give the excipient's concentration (`0.02% w/v`, `10 mg/mL`, `5 mg per dose`)
+and a route match is checked against the highest potency the IID records at that route, like for
+like: `%w/v` against `%w/v` (mg/mL converts by definition), `mg` per dose against `mg`. Above the
+record, the grade caps at B. When nothing can be compared — no concentration given, a molar unit,
+or precedent that came only from labels, which carry no concentrations — grade A stays available
+and the rationale has to say the concentration was not checked. This errs low for biologics: the
+IID's maximum under-represents BLA products, so "above the record" means above what the IID
+records, not above what has been approved.
 
 Bridging is directional, and both ends have to be systemic. IV precedent supports a subcutaneous
 request; it does **not** support an intravitreal one, where the dose goes into a small closed
