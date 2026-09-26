@@ -626,6 +626,62 @@ def main_test():
     print("ok  measurements: orphans rejected, every row stamped with version and timestamp, "
           "export round-trips")
 
+    # --- calibration ----------------------------------------------------------
+    CAL = main.calibration
+
+    # With nothing recorded, the posterior must BE the prior, not a fitted-looking number.
+    empty = CAL.calibrate([])
+    assert empty["posterior"]["factor"] == CAL.PRIOR_MEAN and not empty["usable"]
+    assert "IS the prior" in empty["note"]
+
+    # A known factor must be recovered from consistent data.
+    truth = 0.42
+    clean = [{"excipient": f"x{i}", "quantity": "m_value", "predicted_value": p,
+              "value": truth * p, "sd": 20.0, "source": "experiment"}
+             for i, p in enumerate([-3200, -1500, 900, 2100, 1700, -800])]
+    fit = CAL.calibrate(clean)
+    assert abs(fit["posterior"]["factor"] - truth) < 0.01, fit["posterior"]
+    assert abs(fit["least_squares"]["factor"] - truth) < 0.01
+    assert fit["r_squared"] > 0.99 and fit["loo_rmse"] is not None
+    print(f"ok  calibration: recovers a known factor ({fit['posterior']['factor']} vs {truth}), "
+          f"R2={fit['r_squared']}")
+
+    # Confidence must grow with evidence, not with a single precise point.
+    widths = []
+    for k in (1, 2, 6):
+        lo, hi = CAL.calibrate(clean[:k])["posterior"]["credible_95"]
+        widths.append(hi - lo)
+    assert widths[0] > widths[1] > widths[2], widths
+    assert widths[0] > 0.2, "one measurement must not look like a calibration"
+    print(f"ok  calibration: interval narrows with evidence ({widths[0]:.2f} -> {widths[2]:.3f}); "
+          "a single point stays wide")
+
+    # Excipients that disagree about f mean the one-factor model does not hold.
+    # Tight error bars on each point must NOT buy confidence in that case.
+    contradictory = [{"excipient": c, "quantity": "m_value", "predicted_value": 1000,
+                      "value": v, "sd": 5.0}
+                     for c, v in [("a", 900), ("b", 200), ("c", 1500), ("d", 1100)]]
+    bad = CAL.calibrate(contradictory)
+    lo, hi = bad["posterior"]["credible_95"]
+    assert hi - lo > 0.5, (lo, hi)
+    assert lo < 1.0 < hi, "contradictory data must not resolve a correction"
+    assert bad["r_squared"] < 0.5
+    print(f"ok  calibration: disagreeing excipients keep the interval wide ([{lo:.2f},{hi:.2f}]) "
+          "despite tight per-point error bars")
+
+    # Statistics are gated on the n they need, never reported on too few points.
+    two = CAL.calibrate(clean[:2])
+    assert two["r_squared"] is None and two["loo_rmse"] is None
+    assert "needs 3 pairs" in two["interpretation"] or "R^2 needs" in two["interpretation"]
+
+    # Applying the factor must carry BOTH uncertainties.
+    applied = CAL.apply_factor(-3253.6, 432.3, fit)
+    assert applied["interval_95"][0] < applied["calibrated"] < applied["interval_95"][1]
+    # Lysozyme urea: uncalibrated -3254, measured near -1300. The correction must land there.
+    assert applied["interval_95"][0] < -1300 < applied["interval_95"][1], applied
+    print(f"ok  calibration: corrected lysozyme urea to {applied['calibrated']} "
+          f"{applied['interval_95']}, bracketing the measured -1300")
+
     # --- interaction potentials -> m-value ------------------------------------
     I = main.interactions
 
