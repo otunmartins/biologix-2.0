@@ -1,0 +1,89 @@
+name: Deploy
+
+# Merging to main deploys. Nothing else does — there is no staging environment,
+# so treat a merge here as a release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One deploy at a time. Two overlapping `docker compose up --build` runs on the
+# same box will fight over the image names and the port bindings.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open an SSH session to the instance
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          HOST: ${{ secrets.EC2_HOST }}
+          USER: ${{ secrets.EC2_USER }}
+          HOST_KEY: ${{ secrets.EC2_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if [ -n "${HOST_KEY:-}" ]; then
+            # Pinned host key: the connection fails if the box's identity changes.
+            printf '%s\n' "$HOST_KEY" > ~/.ssh/known_hosts
+            echo "StrictHostKeyChecking=yes" >> ~/.ssh/config
+          else
+            # Trust on first use. Fine for a box you just created; set the
+            # EC2_HOST_KEY secret (from `ssh-keyscan <ip>`) to pin it instead.
+            echo "::warning::EC2_HOST_KEY not set - accepting the host key on first use"
+            ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          fi
+          cat >> ~/.ssh/config <<EOF
+          Host target
+            HostName $HOST
+            User ${USER:-ubuntu}
+            IdentityFile ~/.ssh/deploy_key
+            ConnectTimeout 20
+          EOF
+
+      - name: Pull and rebuild
+        env:
+          APP_DIR: ${{ secrets.EC2_APP_DIR }}
+        run: |
+          set -euo pipefail
+          ssh target bash -euo pipefail <<EOF
+            cd "${APP_DIR:-/home/ubuntu/biologix-2.0}"
+
+            # .env lives on the box and is NOT in the repo - never overwrite it.
+            test -f .env || { echo "::error::no .env on the instance; deploy aborted"; exit 1; }
+
+            git fetch --prune origin
+            git reset --hard origin/main
+
+            # --build because NEXT_PUBLIC_API_URL is baked into the frontend
+            # bundle at build time; a restart alone would not pick up a change.
+            docker compose up -d --build
+
+            # The box has a small root volume and every build leaves the old
+            # image behind. Without this it fills up after a dozen deploys.
+            docker image prune -f
+          EOF
+
+      - name: Verify the API answers
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if ssh target 'curl -fsS localhost/health' > health.json 2>/dev/null; then
+              cat health.json
+              # Up but keyless answers 200 and then fails every screen with 503,
+              # which is a broken deploy that a plain health check calls healthy.
+              grep -q '"model_configured":true' health.json \
+                || { echo "::error::API is up but ANTHROPIC_API_KEY is not configured"; exit 1; }
+              echo "::notice::deploy verified"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::/health did not respond within 150s"
+          ssh target 'docker compose logs --tail 50' || true
+          exit 1
