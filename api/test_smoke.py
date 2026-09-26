@@ -10,6 +10,7 @@ must be accepted once the precedent tool has actually returned a route match.
 """
 
 import asyncio
+import json
 import os
 
 # The Anthropic provider wants a key at construction time. Nothing is ever sent —
@@ -574,6 +575,56 @@ def main_test():
         ctx, main.Dossier(**{**_dossier("C", "Data gap: test"), "exposure": {"made": "up"}}))
     assert d.exposure == biweekly
     print("ok  exposure: the dossier carries the computed margins, not the model's")
+
+    # --- measurement store ----------------------------------------------------
+    import tempfile
+    MS = main.measurements
+
+    conn = MS.connect(os.path.join(tempfile.mkdtemp(), "t.db"))
+    bid = MS.add_biologic(conn, MS.Biologic(name="Test mAb", structure_id="1IGT", modality="mAb"))
+
+    full = MS.Measurement(biologic_id=bid, excipient="Trehalose", concentration="0.5 M",
+                          quantity="delta_tm_c", value=4.6, sd=0.3, n_replicates=3,
+                          buffer="20 mM histidine", ph=6.0, method="nanoDSF",
+                          predicted_value=5.9)
+    MS.add_measurement(conn, full)
+    assert full.is_calibration_grade()[0]
+
+    # A row missing its conditions is kept and counted, never silently dropped,
+    # but it must not be fitted against: the number is not comparable.
+    thin = MS.Measurement(biologic_id=bid, excipient="Sucrose", quantity="delta_tm_c", value=3.1)
+    MS.add_measurement(conn, thin)
+    ok, missing = thin.is_calibration_grade()
+    assert not ok and "no buffer" in missing and "no pH" in missing, missing
+
+    # A simulated result is an observation with a different provenance, so an
+    # OpenMM run can be recorded without pretending it is a measurement.
+    MS.add_measurement(conn, MS.Measurement(
+        biologic_id=bid, excipient="Trehalose", concentration="0.5 M", quantity="m_value",
+        value=980.0, buffer="20 mM histidine", ph=6.0, method="alchemical FEP",
+        source="simulation", simulation_detail="OpenMM 8.1, CHARMM36m"))
+
+    s = MS.summary(conn, bid)
+    assert s["n_measurements"] == 3 and s["n_calibration_grade"] == 2, s
+    assert s["n_paired_with_prediction"] == 1
+    assert s["by_quantity"]["m_value"]["sources"] == {"simulation": 1}
+    assert s["why_rows_are_not_calibration_grade"], "blockers must be reported, not just counted"
+    print(f"ok  measurements: {s['n_measurements']} rows, {s['n_calibration_grade']} fit-able; "
+          "incomplete rows kept with their reasons")
+
+    # Referential integrity, and provenance stamped on every row.
+    try:
+        MS.add_measurement(conn, MS.Measurement(biologic_id="missing", excipient="x",
+                                                quantity="tm_c", value=1.0))
+        raise AssertionError("a measurement with no biologic was accepted")
+    except Exception as e:
+        assert "IntegrityError" in type(e).__name__, e
+    exported = json.loads(MS.export(conn, bid))
+    assert exported["biologic"]["name"] == "Test mAb"
+    assert all(r["recorded_by_version"] for r in exported["measurements"])
+    assert all(r["observed_at"] for r in exported["measurements"])
+    print("ok  measurements: orphans rejected, every row stamped with version and timestamp, "
+          "export round-trips")
 
     # --- interaction potentials -> m-value ------------------------------------
     I = main.interactions

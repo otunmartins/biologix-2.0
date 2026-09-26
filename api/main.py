@@ -37,6 +37,7 @@ import accessibility
 import design
 import exposure
 import interactions
+import measurements
 from design import DesignGoal
 from exposure import ExposureInputs
 import polymer
