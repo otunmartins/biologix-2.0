@@ -56,3 +56,36 @@ export default function Structure({
     </div>
   );
 }
+
+// The SMILES under a drawing, as text: selectable, and one click to copy into
+// ChemDraw, RDKit or a lab notebook. Kept to the drawing's width; a long chain
+// wraps rather than widening the card.
+export function Smiles({ smiles, width }: { smiles: string; width?: number }) {
+  const [copied, setCopied] = useState(false);
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(smiles);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // No clipboard (plain http, or permission denied): the text stays selectable.
+    }
+  }
+
+  return (
+    <div className="flex items-start gap-1.5" style={{ maxWidth: width ?? '100%' }}>
+      <code className="min-w-0 flex-1 select-all break-all font-mono text-[11px] leading-snug text-slate-600">
+        {smiles}
+      </code>
+      <button
+        type="button"
+        onClick={copy}
+        aria-label="Copy SMILES"
+        className="shrink-0 rounded border border-slate-200 px-1.5 py-px text-[10px] font-semibold uppercase tracking-wide text-slate-500 transition hover:bg-slate-50 hover:text-slate-700"
+      >
+        {copied ? 'Copied' : 'Copy'}
+      </button>
+    </div>
+  );
+}

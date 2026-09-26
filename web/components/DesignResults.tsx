@@ -4,7 +4,7 @@ import { useState } from 'react';
 import type { CandidateStatus, DesignGoal, StoredCandidate } from '@/lib/api';
 import { GradeBox } from './badges';
 import { CheckCircle, Chevron, Flask, Info, Triangle } from './icons';
-import Structure from './Structure';
+import Structure, { Smiles } from './Structure';
 
 interface Props {
   goal: DesignGoal;
@@ -84,6 +84,7 @@ function CandidateStructures({ c }: { c: StoredCandidate }) {
             <figure key={u.smiles} className="space-y-1.5">
               <Structure smiles={u.smiles} width={220} height={160} label={`Repeat unit of ${c.name}`} />
               {u.label && <figcaption className="text-center text-xs text-slate-500">{u.label}</figcaption>}
+              <Smiles smiles={u.smiles} width={220} />
             </figure>
           ))}
         </div>
@@ -97,6 +98,9 @@ function CandidateStructures({ c }: { c: StoredCandidate }) {
             height={200}
             label={`The ${c.screened_units}-unit chain the alerts were run on`}
           />
+          <div className="mt-1.5">
+            <Smiles smiles={c.screened_oligomer_smiles} width={560} />
+          </div>
           <p className="mt-1.5 text-xs leading-relaxed text-slate-500">
             The {c.screened_units}-unit chain the structural alerts were actually run on, end groups included.
           </p>

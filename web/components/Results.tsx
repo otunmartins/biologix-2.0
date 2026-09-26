@@ -6,7 +6,7 @@ import { GRADE_MEANING, VERDICTS, overview, sortLiabilities } from '@/lib/screen
 import ExposureTable from './ExposureTable';
 import { GradeBox, SeverityTag, VERDICT_STYLE, VerdictPill } from './badges';
 import { CheckCircle, Chevron, Download, Refresh, Triangle } from './icons';
-import Structure from './Structure';
+import Structure, { Smiles } from './Structure';
 
 // What the backend actually screened, from its own record of the run.
 const BASIS: Record<string, { label: string; ok: boolean }> = {
@@ -112,13 +112,15 @@ export default function Results({ dossier: d, context, onRerun, loading }: Props
             </p>
           </div>
           {d.structure_smiles && (
-            <Structure
-              smiles={d.structure_smiles}
-              width={200}
-              height={140}
-              label={`Structure screened for ${d.excipient}`}
-              className="hidden sm:grid"
-            />
+            <div className="hidden w-[200px] shrink-0 space-y-1.5 sm:block">
+              <Structure
+                smiles={d.structure_smiles}
+                width={200}
+                height={140}
+                label={`Structure screened for ${d.excipient}`}
+              />
+              <Smiles smiles={d.structure_smiles} width={200} />
+            </div>
           )}
         </header>
 
