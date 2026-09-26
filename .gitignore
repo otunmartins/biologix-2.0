@@ -10,3 +10,11 @@ terraform/*.tfstate.backup
 terraform/*.tfvars
 *.pem
 *.tsbuildinfo
+
+# The training data is 5.7 MB and recoverable: tg_model.fetch_data() pulls it
+# back from Zenodo. tg_model.pkl is NOT ignored, even though it is a build
+# artefact -- the deploy builds the image on the box from a fresh checkout, so
+# anything not committed here simply does not exist in production, and without
+# the pickle the designer silently falls back to the backbone handbook table.
+tg_data.csv
+measurements.db

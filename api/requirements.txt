@@ -4,3 +4,4 @@ pydantic-ai[anthropic]
 rdkit
 biopython
 httpx
+scikit-learn

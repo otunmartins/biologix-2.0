@@ -428,8 +428,8 @@ into the laboratory.
 
 ```
 "Lyophilised enzyme for tropical distribution — must hold at 30 °C for a year."
-   -> 40 motif pairings built, screened and ranked
-   -> #1 Poly(methacrylamide) bearing trehalose · Tg ≈ 165 °C · no alerts · grade D
+   -> 50 motif pairings built, screened and ranked
+   -> #1 Poly(methacrylamide) bearing trehalose · Tg ≈ 104 °C predicted · no alerts · grade D
 ```
 
 **Candidates are enumerated, not invented.** A model asked to propose stabilising polymers will
@@ -470,8 +470,26 @@ Two rules worth knowing:
 - **An exposed residue makes the matching alert cost more.** Tell it the protein exposes Met and
   every polyether candidate is penalised harder.
 
-Tg values are **homopolymer literature values, reported not computed**; a real copolymer or cake
-depends on composition, moisture and processing.
+**Tg is predicted for the repeat unit, and judged on its lower bound.** `api/tg_model.py` is a
+forest trained on 7204 experimental polymers (LAMALAB curated benchmark, Zenodo 14980914),
+measured at R² 0.885 / MAE 26.3 °C on a random split but **R² 0.704 / MAE 36.3 °C on a scaffold
+split** — whole chemical families held out, which is the honest number for designed chemistry and
+the one the app plans around. Each prediction carries the forest's spread on that query and its
+Tanimoto distance to the nearest training polymer; a candidate outside the model's domain is
+labelled an extrapolation.
+
+The screen then scores the prediction **minus its uncertainty**, not the prediction itself,
+because the two ways of being wrong do not cost the same: understating Tg drops a candidate the
+laboratory would have measured anyway, while overstating it recommends a matrix that is not a
+glass at storage temperature. For the same reason the backbone's handbook value is *not* treated
+as safer — it cannot see the pendant, and a flexible side chain plasticises a stiff backbone by
+60–100 °C — so it carries the same uncertainty, and an out-of-domain prediction is allowed to
+argue a candidate down but never up.
+
+Either way this is a **homopolymer** number. A real copolymer or cake depends on composition,
+moisture and processing, and has to be measured by modulated DSC — which is why that assay is in
+every dried candidate's suggested experiments. `GET /health` reports `tg_model`: false there means
+the trained model is absent and the designer is running on the backbone handbook table.
 
 **What it does not do.** There is no molecular dynamics, no free-energy or preferential-interaction
 calculation and no predicted Tm — those need the Stage 3 compatibility simulation that is not
