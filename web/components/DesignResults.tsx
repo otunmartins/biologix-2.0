@@ -4,6 +4,7 @@ import { useState } from 'react';
 import type { CandidateStatus, DesignGoal, StoredCandidate } from '@/lib/api';
 import { GradeBox } from './badges';
 import { CheckCircle, Chevron, Flask, Info, Triangle } from './icons';
+import Structure from './Structure';
 
 interface Props {
   goal: DesignGoal;
@@ -58,6 +59,51 @@ function StatusBadge({ status }: { status: CandidateStatus }) {
   );
 }
 
+// Copolymers carry one repeat unit per pendant; a homopolymer, or a candidate
+// stored before composition existed, has the single joined SMILES only.
+function repeatUnits(c: StoredCandidate): { smiles: string; label: string | null }[] {
+  if (c.composition.length > 0) {
+    return c.composition.map((p) => ({
+      smiles: p.repeat_unit_smiles,
+      label: c.composition.length > 1 ? `${p.pendant.split(' (')[0]} · ${Math.round(p.fraction * 100)}%` : null,
+    }));
+  }
+  return c.repeat_unit_smiles.split(' ; ').map((smiles) => ({ smiles, label: null }));
+}
+
+function CandidateStructures({ c }: { c: StoredCandidate }) {
+  const units = repeatUnits(c);
+  return (
+    <div className="space-y-3">
+      <div>
+        <div className="eyebrow mb-2">{units.length > 1 ? 'Repeat units' : 'Repeat unit'}</div>
+        <div className="flex flex-wrap gap-3">
+          {units.map((u) => (
+            <figure key={u.smiles} className="space-y-1.5">
+              <Structure smiles={u.smiles} width={220} height={160} label={`Repeat unit of ${c.name}`} />
+              {u.label && <figcaption className="text-center text-xs text-slate-500">{u.label}</figcaption>}
+            </figure>
+          ))}
+        </div>
+      </div>
+      {c.screened_oligomer_smiles && (
+        <div>
+          <div className="eyebrow mb-2">Screened as</div>
+          <Structure
+            smiles={c.screened_oligomer_smiles}
+            width={560}
+            height={200}
+            label={`The ${c.screened_units}-unit chain the alerts were run on`}
+          />
+          <p className="mt-1.5 text-xs leading-relaxed text-slate-500">
+            The {c.screened_units}-unit chain the structural alerts were actually run on, end groups included.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CandidateCard({
   c,
   defaultOpen,
@@ -73,7 +119,6 @@ function CandidateCard({
 }) {
   const [open, setOpen] = useState(defaultOpen);
   const clean = c.alerts_fired.length === 0;
-  const isCopolymer = c.composition.length > 1;
   const queued = c.status !== 'benchmarked';
 
   return (
@@ -85,6 +130,13 @@ function CandidateCard({
         className="flex w-full items-start gap-3 px-5 py-4 text-left transition hover:bg-slate-50"
       >
         <Chevron className={`mt-1 h-5 w-5 shrink-0 text-slate-400 transition-transform ${open ? 'rotate-90' : ''}`} />
+        <Structure
+          smiles={repeatUnits(c)[0]?.smiles ?? ''}
+          width={72}
+          height={56}
+          label={`Repeat unit of ${c.name}`}
+          className="hidden sm:grid"
+        />
         <span className="min-w-0 flex-1">
           <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span className="font-semibold text-slate-900">{c.name}</span>
@@ -111,21 +163,7 @@ function CandidateCard({
         <div className="space-y-4 border-t border-slate-200 px-5 py-4 md:pl-[3.25rem]">
           <p className="text-[15px] leading-relaxed text-slate-700">{c.mechanism}</p>
 
-          {isCopolymer && (
-            <div>
-              <div className="eyebrow mb-1.5">Composition</div>
-              <div className="flex flex-wrap gap-1.5">
-                {c.composition.map((p) => (
-                  <span
-                    key={p.pendant}
-                    className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[13px] text-slate-600"
-                  >
-                    {p.pendant.split(' (')[0]} · {Math.round(p.fraction * 100)}%
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
+          <CandidateStructures c={c} />
 
           {c.supports.length > 0 && (
             <ul className="space-y-1.5">

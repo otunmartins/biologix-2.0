@@ -40,6 +40,9 @@ export interface Dossier {
   needs_testing: boolean;
   // Set by the backend from what it actually screened, not by the model.
   structure_basis: StructureBasis;
+  // The SMILES the screen actually ran on; empty if nothing resolved. Optional
+  // because dossiers saved before this field existed do not have it.
+  structure_smiles?: string;
   // Computed by the backend from the request, before the agent runs.
   exposure: ExposureAssessment | null;
 }

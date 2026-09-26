@@ -6,6 +6,7 @@ import { GRADE_MEANING, VERDICTS, overview, sortLiabilities } from '@/lib/screen
 import ExposureTable from './ExposureTable';
 import { GradeBox, SeverityTag, VERDICT_STYLE, VerdictPill } from './badges';
 import { CheckCircle, Chevron, Download, Refresh, Triangle } from './icons';
+import Structure from './Structure';
 
 // What the backend actually screened, from its own record of the run.
 const BASIS: Record<string, { label: string; ok: boolean }> = {
@@ -88,26 +89,37 @@ export default function Results({ dossier: d, context, onRerun, loading }: Props
   return (
     <div className="flex min-h-full flex-col">
       <div className="flex-1 space-y-6 px-6 py-7 lg:px-10">
-        <header>
-          <div className="eyebrow">Single screen</div>
-          {/* The agent writes `protein` freely; a long one reads better below the title. */}
-          {d.protein.length <= 32 ? (
-            <h1 className="mt-1.5 text-2xl font-semibold tracking-tight text-slate-900 sm:text-[28px]">
-              {d.excipient} <span className="font-normal text-slate-400">×</span> {d.protein}
-            </h1>
-          ) : (
-            <>
+        <header className="flex items-start justify-between gap-6">
+          <div className="min-w-0">
+            <div className="eyebrow">Single screen</div>
+            {/* The agent writes `protein` freely; a long one reads better below the title. */}
+            {d.protein.length <= 32 ? (
               <h1 className="mt-1.5 text-2xl font-semibold tracking-tight text-slate-900 sm:text-[28px]">
-                {d.excipient}
+                {d.excipient} <span className="font-normal text-slate-400">×</span> {d.protein}
               </h1>
-              <p className="mt-1 text-[17px] font-medium text-slate-700">
-                <span className="text-slate-400">×</span> {d.protein}
-              </p>
-            </>
+            ) : (
+              <>
+                <h1 className="mt-1.5 text-2xl font-semibold tracking-tight text-slate-900 sm:text-[28px]">
+                  {d.excipient}
+                </h1>
+                <p className="mt-1 text-[17px] font-medium text-slate-700">
+                  <span className="text-slate-400">×</span> {d.protein}
+                </p>
+              </>
+            )}
+            <p className="mt-1.5 text-[15px] text-slate-500">
+              {(context ?? [d.route]).join(' · ')}
+            </p>
+          </div>
+          {d.structure_smiles && (
+            <Structure
+              smiles={d.structure_smiles}
+              width={200}
+              height={140}
+              label={`Structure screened for ${d.excipient}`}
+              className="hidden sm:grid"
+            />
           )}
-          <p className="mt-1.5 text-[15px] text-slate-500">
-            {(context ?? [d.route]).join(' · ')}
-          </p>
         </header>
 
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">

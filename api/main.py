@@ -27,7 +27,7 @@ from typing import Literal
 from urllib.parse import quote
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent, ModelRetry, RunContext, Tool
@@ -38,6 +38,7 @@ import accessibility
 import active
 import candidates
 import db
+import depict
 import orchestrator
 import design
 import exposure
@@ -162,6 +163,9 @@ class Dossier(BaseModel):
     # Set by the system from what resolve_identity returned, never by the model:
     # "pubchem", "polymer_description", "surrogate" or "unresolved".
     structure_basis: str = Field(default="", description="Leave empty; the system fills this in.")
+    # System-filled too: the SMILES resolve_identity actually screened, so the
+    # structure drawn next to the dossier is the one the alerts ran on.
+    structure_smiles: str = Field(default="", description="Leave empty; the system fills this in.")
     # Likewise system-filled: the impurity exposure margins exactly as computed.
     exposure: dict | None = Field(default=None, description="Leave null; the system fills this in.")
 
@@ -985,6 +989,10 @@ def enforce_precedent_evidence(ctx: RunContext[ScreenDeps], dossier: Dossier) ->
             )
     # Set from the tool record and the request, whatever the model wrote.
     dossier.structure_basis = basis
+    # The first call that resolved to a structure is the excipient itself; later
+    # ones, if any, are the model looking up something else by name.
+    dossier.structure_smiles = next(
+        (c["smiles"] for c in ctx.deps.identity_calls if c.get("resolved") and c.get("smiles")), "")
     dossier.exposure = ctx.deps.exposure
     return dossier
 
@@ -1073,6 +1081,31 @@ def _database_status() -> dict:
     if err := _ensure_tables():
         return {"reachable": False, "error": err}
     return {"reachable": True}
+
+
+_render_budget = depict.RenderBudget()
+
+
+@app.get("/structure.svg")
+def structure_svg(
+    request: Request,
+    smiles: str = Query(..., min_length=1, max_length=depict.MAX_SMILES),
+    w: int = Query(240, ge=depict.MIN_SIDE, le=depict.MAX_SIDE),
+    h: int = Query(180, ge=depict.MIN_SIDE, le=depict.MAX_SIDE),
+):
+    """A 2D drawing of one molecule or repeat unit. Public on purpose; see depict.py."""
+    # Caddy sets X-Forwarded-For to the real client and drops one sent by the
+    # client; the direct address is Caddy's own, so it is only the fallback.
+    client = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+              or (request.client.host if request.client else "unknown"))
+    if not _render_budget.allow(client):
+        raise HTTPException(status_code=429, detail="too many drawings; try again in a minute")
+    drawing = depict.svg(smiles, w, h)
+    if drawing is None:
+        raise HTTPException(status_code=422, detail="not a SMILES RDKit can read")
+    # A drawing never changes for the same input, so the browser may keep it.
+    return Response(drawing, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=604800, immutable"})
 
 
 @app.post("/design")
