@@ -1,4 +1,6 @@
 .env
+# Next.js reads web/.env.local in dev; it holds the Google client secret.
+.env*.local
 node_modules/
 .next/
 __pycache__/
