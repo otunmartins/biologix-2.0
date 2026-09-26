@@ -29,7 +29,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build the api image
         run: docker build -t biologix-api ./api
@@ -63,7 +63,7 @@ jobs:
   web:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build the web image
         # `next build` type-checks, so this is also the TypeScript check.
@@ -72,7 +72,7 @@ jobs:
   compose:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: docker-compose.yml parses
         run: cp .env.example .env && docker compose config -q
