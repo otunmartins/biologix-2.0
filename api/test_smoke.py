@@ -1174,6 +1174,22 @@ def main_test():
         assert prov["usage"] and prov["usage"]["requests"] >= 4, prov["usage"]
         print("ok  history: a run that ran out of retries records each gate rejection, its steps and its tokens")
 
+        # The other way to run out of retries: a dossier that keeps failing its
+        # schema. The record must say which field, not just "exceeded retries".
+        def wordy(messages, info):
+            if not any(isinstance(p, ToolCallPart) for m in messages for p in getattr(m, "parts", [])):
+                return ModelResponse(parts=[ToolCallPart("resolve_identity", {"name_or_smiles": PS80})])
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name,
+                                                     {**_dossier("D", "Data gap: test"), "summary": "x" * 2500})])
+        with agent.override(model=FunctionModel(wordy)):
+            r = client.post("/screen", headers=as_("tok-alice"), json={"prompt": f"Screen {PS80} subcutaneous"})
+        assert r.status_code == 502
+        sid = client.get("/history", params={"kind": "screen"}, headers=as_("tok-alice")).json()["items"][0]["id"]
+        prov = client.get(f"/history/screens/{sid}", headers=as_("tok-alice")).json()["provenance"]
+        assert prov["schema_rejections"] and prov["schema_rejections"][0].startswith("summary:"), prov["schema_rejections"]
+        assert not prov["gate_rejections"], "a schema failure is not an evidence-gate rejection"
+        print("ok  history: a run that kept failing its schema records which field, each time")
+
         # If saving fails, the user still gets their dossier, marked unsaved.
         real_record = main.history.record_screen
         def unsavable(*a, **k):

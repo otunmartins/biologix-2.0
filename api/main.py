@@ -1426,6 +1426,7 @@ def _record_screen(user_id: int, req: ScreenRequest, deps: "ScreenDeps", result,
             "precedent_index": precedent.index_status(),
             "tool_trace": _tool_trace(messages),
             "gate_rejections": deps.gate_rejections,
+            "schema_rejections": _schema_rejections(messages),
         }
         request = req.model_dump(mode="json")
         dossier = result.output.model_dump(mode="json") if result is not None else None
@@ -1453,6 +1454,22 @@ def _usage(messages: list) -> dict | None:
     return {"requests": len(responses), "input_tokens": total("input_tokens"),
             "output_tokens": total("output_tokens"),
             "tool_calls": len(_tool_trace(messages))}
+
+
+def _schema_rejections(messages: list) -> list[str]:
+    """Every time the dossier failed its schema and went back to the model, and
+    why -- the other way a run ends in "exceeded maximum retries". Evidence-gate
+    rejections are also retries, so those already in gate_rejections are left out."""
+    from pydantic_ai.messages import RetryPromptPart
+    reasons = []
+    for message in messages:
+        for part in getattr(message, "parts", []):
+            if isinstance(part, RetryPromptPart) and part.tool_name == "final_result":
+                if isinstance(part.content, str):
+                    continue  # a ModelRetry from the evidence gate
+                reasons += [f"{'.'.join(map(str, e.get('loc', ())))}: {e.get('msg', '')}"[:300]
+                            for e in part.content]
+    return reasons
 
 
 def _tool_trace(messages: list) -> list[dict]:
