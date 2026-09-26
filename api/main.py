@@ -34,7 +34,9 @@ from pydantic_ai.exceptions import UserError
 from rdkit import Chem
 
 import accessibility
+import design
 import exposure
+from design import DesignGoal
 from exposure import ExposureInputs
 import polymer
 from polymer import PolymerSpec
@@ -182,6 +184,18 @@ class Dossier(BaseModel):
             e.evidence_grade not in ("A", "B") for e in self.endpoints
         ) or any(l.severity == "high" for l in self.liabilities)
         return self
+
+
+class DesignRequest(BaseModel):
+    """Either describe the problem in your own words, or hand over a parsed goal.
+
+    goal wins when both are given, so a caller that already knows the numbers
+    never pays for a model round trip to restate them.
+    """
+
+    prompt: str = Field(default="", max_length=4000)
+    goal: DesignGoal | None = None
+    limit: int = Field(default=12, ge=1, le=40)
 
 
 class ScreenRequest(BaseModel):
@@ -837,6 +851,42 @@ Exposure margins, when present, cover residual impurities only, against a generi
 never the excipient itself. Precedent plus structural alerts is a triage, not a safety assessment.
 """
 
+DESIGN_PROMPT = """You extract a formulation goal from what the user wrote. That is your only job.
+
+Fill the fields from their words and nothing else:
+  protein   - what they are formulating, in their words
+  route     - route of administration if stated, else ""
+  target_temp_c      - the storage temperature they need to survive, in Celsius. "room
+              temperature" is 25, "ambient" 25, "warehouse"/"tropical"/"Zone IV" 30.
+              Leave null if they gave none - do NOT invent one.
+  duration_months    - how long it must hold, null if unstated
+  format    - "lyophilised" if they mention lyophilised, freeze-dried, dried, powder or a
+              cake; otherwise "liquid"
+  exposed_residues   - only residues they explicitly say are exposed or liable (Met, Trp,
+              Cys, Lys, His, Asn). Empty list if they did not say. Never guess from the
+              protein's name.
+  notes     - anything else that constrains the formulation, briefly
+
+You do NOT suggest polymers, excipients or mechanisms. Something else does that, from a
+curated table. Inventing a temperature or a residue here silently changes which candidates
+are ranked, so leave a field empty rather than filling it with a plausible value."""
+
+_design_agent: Agent | None = None
+
+
+def get_design_agent() -> Agent:
+    global _design_agent
+    if _design_agent is None:
+        _design_agent = Agent(
+            "anthropic:claude-sonnet-5",
+            output_type=DesignGoal,
+            system_prompt=DESIGN_PROMPT,
+            model_settings={"max_tokens": 1000},
+            retries=2,
+        )
+    return _design_agent
+
+
 _agent: Agent | None = None
 
 
@@ -944,6 +994,36 @@ def health():
         "precedent_lookup": PRECEDENT_LOOKUP_AVAILABLE,
         "precedent_index": precedent.index_status(),
     }
+
+
+@app.post("/design")
+async def design_candidates(req: DesignRequest):
+    """Rank polymer candidates for stabilising a biologic above fridge temperature.
+
+    The model, if it is used at all, only reads the goal out of the user's words.
+    Every candidate, its chemistry, its alerts and its ranking come from
+    design.py deterministically - so this endpoint cannot invent a stabiliser.
+    """
+    goal = req.goal
+    if goal is None:
+        if not req.prompt.strip():
+            raise HTTPException(status_code=422, detail="give either a prompt or a goal")
+        try:
+            agent = get_design_agent()
+        except UserError as e:
+            raise HTTPException(status_code=503, detail=f"agent not configured: {e}") from e
+        try:
+            goal = (await agent.run(req.prompt)).output
+        except Exception as e:
+            raise HTTPException(
+                status_code=502, detail=f"could not read the goal from that prompt: {e}") from e
+
+    result = design.design(goal, req.limit)
+    # Said once here as well as in every candidate, because this is the claim
+    # most likely to be over-read: a ranking is not a prediction.
+    result["verdict"] = "Data gap: test"
+    result["max_grade"] = "D"
+    return result
 
 
 @app.post("/screen", response_model=Dossier)

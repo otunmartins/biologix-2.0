@@ -1,11 +1,23 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import DesignPanel from '@/components/DesignPanel';
+import DesignResults from '@/components/DesignResults';
 import Results from '@/components/Results';
 import ScreenForm, { type Mode } from '@/components/ScreenForm';
 import { GradeBox } from '@/components/badges';
 import { Info, Molecule, Spinner, Triangle } from '@/components/icons';
-import { API_URL, getHealth, runScreen, type Dossier, type Grade, type Health } from '@/lib/api';
+import {
+  API_URL,
+  getHealth,
+  runDesign,
+  runScreen,
+  type Candidate,
+  type DesignResult,
+  type Dossier,
+  type Grade,
+  type Health,
+} from '@/lib/api';
 import {
   DEFAULT_FORM,
   GRADE_MEANING,
@@ -106,6 +118,54 @@ function EmptyState() {
   );
 }
 
+const DESIGN_STEPS = [
+  ['Read the goal', 'A model reads the temperature, duration and format out of your words — and does nothing else.'],
+  ['Enumerate', 'Every backbone is paired with every pendant group from a curated motif table and built as a real structure.'],
+  ['Screen', 'Each chain goes through the same structural alerts and rule table as any other excipient here.'],
+  ['Rank', 'Scored on hydration, glass transition, charge and the alerts that actually fired, for laboratory triage.'],
+] as const;
+
+function DesignEmpty() {
+  return (
+    <div className="mx-auto max-w-3xl space-y-8 px-6 py-12 lg:px-10">
+      <div>
+        <div className="eyebrow">Polymer designer</div>
+        <h1 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">
+          Stabilising a biologic out of the fridge
+        </h1>
+        <p className="mt-3 max-w-2xl text-[15px] leading-relaxed text-slate-600">
+          Describe the biologic and the temperature it has to survive. You get a ranked shortlist of
+          polymer candidates to take into the laboratory, each with the chemistry that supports it,
+          the liabilities it carries, and the experiments that would settle it.
+        </p>
+      </div>
+
+      <ol className="grid gap-3 sm:grid-cols-2">
+        {DESIGN_STEPS.map(([title, body], i) => (
+          <li key={title} className="rounded-xl border border-slate-200 bg-white p-4 shadow-card">
+            <div className="flex items-center gap-2.5">
+              <span className="grid h-6 w-6 place-items-center rounded-full bg-slate-900 text-xs font-semibold text-white">
+                {i + 1}
+              </span>
+              <span className="font-semibold text-slate-900">{title}</span>
+            </div>
+            <p className="mt-2 text-sm leading-relaxed text-slate-600">{body}</p>
+          </li>
+        ))}
+      </ol>
+
+      <div className="flex gap-3 rounded-xl border border-gap-line bg-gap-soft px-4 py-3.5 text-sm leading-relaxed text-slate-800">
+        <Triangle className="mt-0.5 h-5 w-5 shrink-0 text-gap" />
+        <p>
+          <b className="font-semibold">Hypotheses, not predictions.</b> Nothing here simulates the
+          protein. Candidates are enumerated from known stabilising motifs and ranked by chemistry
+          the app can see — every one comes back grade D, to be tested.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function LoadingState({ elapsed }: { elapsed: number }) {
   return (
     <div className="space-y-6 px-6 py-7 lg:px-10" aria-busy="true">
@@ -137,8 +197,13 @@ function LoadingState({ elapsed }: { elapsed: number }) {
   );
 }
 
+type Workflow = 'screen' | 'design';
+
 export default function Home() {
+  const [workflow, setWorkflow] = useState<Workflow>('screen');
   const [mode, setMode] = useState<Mode>('form');
+  const [designPrompt, setDesignPrompt] = useState('');
+  const [designResult, setDesignResult] = useState<DesignResult | null>(null);
   const [form, setForm] = useState<Form>(DEFAULT_FORM);
   const [freeText, setFreeText] = useState(
     'Is polysorbate 80 a concern for my antibody given subcutaneously, stored at room temperature?',
@@ -215,19 +280,58 @@ export default function Home() {
     }
   }, [mode, form, freeText]);
 
+  const design = useCallback(async () => {
+    if (!designPrompt.trim()) return;
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setLoading(true);
+    setElapsed(0);
+    setError(null);
+    setDesignResult(null);
+    try {
+      setDesignResult(await runDesign(designPrompt, null, ctrl.signal));
+    } catch (e) {
+      if ((e as Error).name !== 'AbortError') setError((e as Error).message);
+    } finally {
+      if (abortRef.current === ctrl) setLoading(false);
+    }
+  }, [designPrompt]);
+
   // Ctrl/Cmd+Enter runs from anywhere, including inside the textareas.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !loading) {
         e.preventDefault();
-        run();
+        (workflow === 'design' ? design : run)();
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [run, loading]);
+  }, [run, design, workflow, loading]);
 
   const updateForm = useCallback((patch: Partial<Form>) => setForm((f) => ({ ...f, ...patch })), []);
+
+
+  // A candidate is only a hypothesis until the screen judges it, so handing it
+  // over switches workflow and fills the polymer description in place.
+  const screenCandidate = useCallback((c: Candidate) => {
+    setForm((f) => ({
+      ...f,
+      excipient: c.name,
+      polymer: {
+        ...f.polymer,
+        enabled: true,
+        repeatUnit: c.screen_as.repeat_unit,
+        endA: c.screen_as.end_group_a,
+        endB: c.screen_as.end_group_b,
+      },
+    }));
+    setMode('form');
+    setWorkflow('screen');
+    setDossier(null);
+    setError(null);
+  }, []);
 
   return (
     <div className="flex min-h-screen flex-col lg:h-screen">
@@ -237,13 +341,45 @@ export default function Home() {
             <Molecule className="h-[18px] w-[18px]" />
           </span>
           <span className="text-[15px] font-semibold tracking-tight text-slate-900">Excipient Screen</span>
-          <span className="hidden text-sm text-slate-400 sm:inline">· biologic formulation triage</span>
         </div>
+
+        <nav className="flex rounded-lg bg-slate-100 p-1 text-sm font-medium">
+          {(
+            [
+              ['screen', 'Screen'],
+              ['design', 'Design'],
+            ] as const
+          ).map(([w, label]) => (
+            <button
+              key={w}
+              type="button"
+              onClick={() => {
+                setWorkflow(w);
+                setError(null);
+              }}
+              aria-current={workflow === w}
+              className={`rounded-md px-4 py-1.5 transition ${
+                workflow === w ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
         <ApiBadge api={api} />
       </header>
 
       <div className="flex flex-1 flex-col lg:min-h-0 lg:flex-row">
         <aside className="shrink-0 border-b border-slate-200 bg-white lg:w-[400px] lg:border-b-0 lg:border-r">
+          {workflow === 'design' ? (
+            <DesignPanel
+              prompt={designPrompt}
+              onPrompt={setDesignPrompt}
+              loading={loading}
+              elapsed={elapsed}
+              onRun={design}
+            />
+          ) : (
           <ScreenForm
             mode={mode}
             onMode={setMode}
@@ -255,6 +391,7 @@ export default function Home() {
             elapsed={elapsed}
             onRun={run}
           />
+          )}
         </aside>
 
         <main className="flex-1 lg:min-h-0 lg:overflow-y-auto">
@@ -280,7 +417,15 @@ export default function Home() {
             </div>
           )}
 
-          {loading ? (
+          {workflow === 'design' ? (
+            loading ? (
+              <LoadingState elapsed={elapsed} />
+            ) : designResult ? (
+              <DesignResults result={designResult} onScreen={screenCandidate} />
+            ) : (
+              <DesignEmpty />
+            )
+          ) : loading ? (
             <LoadingState elapsed={elapsed} />
           ) : dossier ? (
             <Results dossier={dossier} context={context} onRerun={run} loading={loading} />

@@ -420,6 +420,72 @@ is entirely CPU-bound and runs in seconds. When you add the Stage 3 compatibilit
 
 The GPU is already there and paid for once you deploy; that work is additive, not a redeploy.
 
+## The polymer designer
+
+The app's second workflow (`POST /design`, the **Design** tab). Describe a biologic and the
+temperature it has to survive, and it returns a ranked shortlist of polymer candidates to take
+into the laboratory.
+
+```
+"Lyophilised enzyme for tropical distribution — must hold at 30 °C for a year."
+   -> 40 motif pairings built, screened and ranked
+   -> #1 Poly(methacrylamide) bearing trehalose · Tg ≈ 165 °C · no alerts · grade D
+```
+
+**Candidates are enumerated, not invented.** A model asked to propose stabilising polymers will
+produce fluent, unfalsifiable suggestions — exactly what the evidence gate exists to stop. So the
+chemistry comes from a curated table in `api/design.py`: five backbones × eight pendant groups,
+each with its mechanism stated. The model's only job is reading the goal out of the user's words
+(temperature, duration, liquid or lyophilised, which residues are exposed), and its prompt forbids
+it from inventing a value for a field the user left empty. Hand over a structured `goal` instead
+and no model is called at all.
+
+**The screens do the discriminating.** Each pairing is built into a real 4-unit chain and put
+through the same structural alerts and rule table as any other excipient here, so the ranking is
+driven by chemistry the app can see:
+
+| what fires | on what | consequence |
+|---|---|---|
+| Reducing sugar | glucose pendant | glycates Lys — ranked to the bottom, below every clean candidate |
+| Polyether chain | oligo(ethylene glycol) pendant | peroxides oxidise Met/Trp on storage |
+| Michael acceptor | acrylamide backbone | residual monomer alkylates Cys |
+| Hydrolysable ester | methacrylate backbone | pH drift promotes deamidation |
+
+The sugar regiochemistry is load-bearing and easy to get wrong. Pendants attach through the
+**6-hydroxyl**, as real glycopolymer chemistry does, which leaves the anomeric centre's true
+character intact: glucose keeps its free anomeric OH and is rejected, trehalose and sucrose keep
+both anomeric carbons glycosidic and are not. Attach a sugar through its anomeric carbon instead
+and this silently inverts — glucose reads as safe. `test_smoke.py` pins it.
+
+**Scoring is transparent and additive**, and every term states its own reason: hydroxyl density
+(hydrogen bonding, the basis of both preferential exclusion and water replacement), zwitterionic
+hydration, glass transition, the alerts that actually fired, and the stated caution on each motif.
+Two rules worth knowing:
+
+- **Vitrification only counts for a dried product.** A matrix has to be a glass at the storage
+  temperature to immobilise the protein, so Tg is scored continuously in its margin over the
+  target — residual moisture plasticises a real cake by tens of degrees, so headroom keeps paying.
+  PEG (Tg ≈ −60 °C) is a poor lyophilisation matrix for exactly this reason. For a liquid
+  formulation Tg is ignored entirely.
+- **An exposed residue makes the matching alert cost more.** Tell it the protein exposes Met and
+  every polyether candidate is penalised harder.
+
+Tg values are **homopolymer literature values, reported not computed**; a real copolymer or cake
+depends on composition, moisture and processing.
+
+**What it does not do.** There is no molecular dynamics, no free-energy or preferential-interaction
+calculation and no predicted Tm — those need the Stage 3 compatibility simulation that is not
+built. The ranking is a triage ordering for laboratory work, not a prediction that any candidate
+will stabilise anything. Every candidate is **grade D**, verdict **"Data gap: test"**, and each
+carries the experiments that would settle it (nanoDSF/DSC for Tm shift, accelerated stability with
+SEC, modulated DSC for cake Tg, plus an assay for whatever alert fired). Nothing here addresses
+synthesis feasibility, polydispersity, endotoxin, immunogenicity or clearance, any of which can
+rule out a candidate on its own.
+
+**The designer proposes; the screen judges.** Every candidate carries a *Screen this candidate*
+action that drops its repeat unit into the polymer description on the Screen tab, where it goes
+through identity, precedent, alerts and the liability map like any other excipient.
+
 ## Not a safety assessment
 
 Chemistry-only triage on structural alerts and a small rule table. A human checkpoint is required

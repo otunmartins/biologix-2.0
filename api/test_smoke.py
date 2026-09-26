@@ -575,6 +575,84 @@ def main_test():
     assert d.exposure == biweekly
     print("ok  exposure: the dossier carries the computed margins, not the model's")
 
+    # --- polymer designer -----------------------------------------------------
+    D = main.design
+
+    built = {(b.key, p.key): D.build_chain(b, p) for b in D.BACKBONES for p in D.PENDANTS}
+    unbuilt = [k for k, v in built.items() if not v]
+    assert not unbuilt, f"motif pairs that do not assemble: {unbuilt}"
+    print(f"ok  designer: all {len(built)} motif pairs assemble into a screenable chain")
+
+    # The regiochemistry claim the whole motif table rests on. Sugars are linked
+    # through the 6-OH, so the anomeric centre keeps its real character: glucose
+    # stays reducing and would glycate Lys, trehalose and sucrose do not. Attach
+    # them through the anomeric carbon instead and this silently inverts.
+    mab = next(b for b in D.BACKBONES if b.key == "methacrylamide")
+    for pendant_key, should_fire in [("glucose", True), ("trehalose", False), ("sucrose", False)]:
+        pend = next(p for p in D.PENDANTS if p.key == pendant_key)
+        fired = main._fired(D.build_chain(mab, pend))
+        reducing = any("Reducing sugar" in a for a in fired)
+        assert reducing is should_fire, f"{pendant_key}: reducing={reducing}, expected {should_fire}"
+    print("ok  designer: glucose reads as reducing, trehalose and sucrose do not (6-O linked)")
+
+    liquid = D.design(D.DesignGoal(target_temp_c=25, format="liquid"), limit=40)
+    ranks = {c["name"]: c["rank"] for c in liquid["candidates"]}
+    worst = [c for c in liquid["candidates"] if any("Reducing" in a for a in c["alerts_fired"])]
+    assert worst and min(c["rank"] for c in worst) > len(liquid["candidates"]) * 0.6, \
+        "a reducing-sugar candidate ranked too highly"
+    best = liquid["candidates"][0]
+    assert not best["alerts_fired"], best["alerts_fired"]
+    print(f"ok  designer: top candidate is alert-free ({best['name']}); "
+          f"reducing sugars sit at rank {min(c['rank'] for c in worst)}+ of {len(ranks)}")
+
+    # Vitrification only applies to a dried product, and only a backbone whose
+    # Tg clears the storage temperature can hold the protein in a glass.
+    lyo = D.design(D.DesignGoal(target_temp_c=25, format="lyophilised"), limit=40)["candidates"]
+    top_tg = lyo[0]["backbone_tg_c"]
+    assert top_tg and top_tg >= 75, f"a low-Tg backbone won a lyophilised goal: {lyo[0]['name']}"
+    assert lyo[0]["backbone_tg_c"] == max(c["backbone_tg_c"] or 0 for c in lyo), \
+        "the highest-Tg backbone did not win a lyophilised goal"
+    # A backbone with little headroom over the storage temperature must say so:
+    # residual moisture plasticises a real cake by tens of degrees.
+    hot = D.design(D.DesignGoal(target_temp_c=40, format="lyophilised"), limit=40)["candidates"]
+    low = next(c for c in hot if (c["backbone_tg_c"] or 0) < 60)
+    assert any("plasticise" in r or "not be a glass" in r for r in low["risks"]), low["risks"]
+    # Vitrification is a dried-product mechanism: a liquid formulation must not
+    # be judged on the glass transition at all.
+    for c in D.design(D.DesignGoal(target_temp_c=25, format="liquid"), limit=40)["candidates"]:
+        assert not any("glass" in r or "plasticise" in r for r in c["risks"]), (c["name"], c["risks"])
+    print(f"ok  designer: dried goal favours the highest Tg ({top_tg} C); a 55 C backbone is "
+          "warned about at 40 C")
+
+    # A protein that exposes the residue an alert attacks makes that alert cost more.
+    plain = D.design(D.DesignGoal(target_temp_c=25), limit=40)["candidates"]
+    met = D.design(D.DesignGoal(target_temp_c=25, exposed_residues=["Met"]), limit=40)["candidates"]
+    def peg_on_vinyl(rows):
+        return next(c for c in rows if "Oligo(ethylene glycol)" in c["pendant"]
+                    and c["backbone"].startswith("Poly(vinyl)"))
+    assert peg_on_vinyl(met)["score"] < peg_on_vinyl(plain)["score"], \
+        "exposed Met did not raise the polyether cost"
+    assert any("exposes Met" in r for r in peg_on_vinyl(met)["risks"])
+    print("ok  designer: an exposed-Met protein penalises polyether candidates further")
+
+    assert "no molecular dynamics" in D.LIMITS.lower().replace("-", " ") or "molecular dynamics" in D.LIMITS
+    print("ok  designer: the limits state plainly that no simulation was run")
+
+    # The parsing agent reads the goal and nothing else. Scripted, so no key needed.
+    def design_script(messages, info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {
+            "protein": "IgG1 mAb", "route": "subcutaneous", "target_temp_c": 30.0,
+            "duration_months": 6.0, "format": "lyophilised",
+            "exposed_residues": ["Met"], "notes": "tropical distribution"})])
+
+    dagent = main.get_design_agent()
+    with dagent.override(model=FunctionModel(design_script)):
+        parsed = asyncio.run(dagent.run("mAb for Zone IV, freeze dried, 6 months")).output
+    assert parsed.format == "lyophilised" and parsed.target_temp_c == 30.0
+    out = D.design(parsed, limit=3)
+    assert out["candidates"] and out["goal"]["exposed_residues"] == ["Met"]
+    print(f"ok  designer: a parsed goal drives the ranking ({out['candidates'][0]['name']})")
+
     # --- the evidence gate, both directions ----------------------------------
     agent = main.get_agent()
 

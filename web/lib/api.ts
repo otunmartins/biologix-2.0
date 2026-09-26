@@ -82,6 +82,48 @@ export interface PolymerSpec {
   impurities: { name: string; level: string }[];
 }
 
+// ---- polymer designer (mirrors api/design.py) ----------------------------
+
+export interface DesignGoal {
+  protein: string;
+  route: string;
+  target_temp_c: number | null;
+  duration_months: number | null;
+  format: 'liquid' | 'lyophilised';
+  exposed_residues: string[];
+  notes: string;
+}
+
+export interface Candidate {
+  rank: number;
+  name: string;
+  backbone: string;
+  pendant: string;
+  repeat_unit_smiles: string;
+  screened_oligomer_smiles: string;
+  screened_units: number;
+  backbone_tg_c: number | null;
+  charge: string;
+  score: number;
+  mechanism: string;
+  supports: string[];
+  risks: string[];
+  alerts_fired: string[];
+  descriptors: Record<string, number>;
+  suggested_experiments: string[];
+  // Feeds straight into the screening form, which is what actually judges it.
+  screen_as: { repeat_unit: string; end_group_a: string; end_group_b: string };
+}
+
+export interface DesignResult {
+  goal: DesignGoal;
+  candidates: Candidate[];
+  n_motif_pairs_considered: number;
+  limits: string;
+  verdict: string;
+  max_grade: string;
+}
+
 export interface Health {
   ok: boolean;
   model_configured: boolean;
@@ -102,6 +144,30 @@ export async function getHealth(signal?: AbortSignal): Promise<Health> {
 interface ValidationIssue {
   loc: (string | number)[];
   msg: string;
+}
+
+export async function runDesign(
+  prompt: string,
+  goal: DesignGoal | null,
+  signal?: AbortSignal,
+): Promise<DesignResult> {
+  const res = await fetch(`${API_URL}/design`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(goal ? { goal, limit: 12 } : { prompt, limit: 12 }),
+    signal,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    const detail =
+      typeof body?.detail === 'string'
+        ? body.detail
+        : Array.isArray(body?.detail)
+          ? (body.detail as ValidationIssue[]).map((d) => d.msg).join('; ')
+          : '';
+    throw new Error(detail || `Server returned ${res.status}`);
+  }
+  return res.json();
 }
 
 export async function runScreen(
