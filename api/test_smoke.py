@@ -1158,6 +1158,22 @@ def main_test():
         assert failed["status"] == "failed" and "model unavailable" in failed["error"]
         print("ok  history: a failed screen is recorded as failed, with its error")
 
+        # A run the evidence gate keeps sending back fails with only "exceeded
+        # maximum retries"; the record must say what the gate objected to.
+        def stubborn(messages, info):
+            if not any(isinstance(p, ToolCallPart) for m in messages for p in getattr(m, "parts", [])):
+                return ModelResponse(parts=[ToolCallPart("resolve_identity", {"name_or_smiles": PS80})])
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, _dossier("A", "Precedented"))])
+        with agent.override(model=FunctionModel(stubborn)):
+            r = client.post("/screen", headers=as_("tok-alice"), json={"prompt": f"Screen {PS80} subcutaneous"})
+        assert r.status_code == 502
+        sid = client.get("/history", params={"kind": "screen"}, headers=as_("tok-alice")).json()["items"][0]["id"]
+        prov = client.get(f"/history/screens/{sid}", headers=as_("tok-alice")).json()["provenance"]
+        assert len(prov["gate_rejections"]) >= 3 and "route match" in prov["gate_rejections"][0], prov["gate_rejections"]
+        assert prov["tool_trace"][0]["tool"] == "resolve_identity", "a failed run keeps its tool sequence"
+        assert prov["usage"] and prov["usage"]["requests"] >= 4, prov["usage"]
+        print("ok  history: a run that ran out of retries records each gate rejection, its steps and its tokens")
+
         # If saving fails, the user still gets their dossier, marked unsaved.
         real_record = main.history.record_screen
         def unsavable(*a, **k):

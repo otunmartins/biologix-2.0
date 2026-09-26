@@ -420,6 +420,9 @@ export interface ScreenProvenance {
   exposure: ExposureAssessment | null;
   precedent_index: { loaded?: boolean; rows?: number; cached_on_disk?: boolean; last_error?: string | null };
   tool_trace: { tool: string; args: Record<string, unknown> }[];
+  // Why the evidence gate sent a dossier back, once per rejection. Absent on
+  // records saved before it was recorded.
+  gate_rejections?: string[];
 }
 
 export interface ScreenRecord {

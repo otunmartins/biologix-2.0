@@ -178,6 +178,29 @@ function Precedent({ call }: { call: Record<string, any> }) {
   );
 }
 
+// Each time the evidence gate refused a dossier, in the gate's own words. On a
+// failed run this is the reason; on a successful one, what was corrected first.
+function Rejections({ reasons, failed }: { reasons: string[]; failed: boolean }) {
+  const times = reasons.length === 1 ? 'once' : `${reasons.length} times`;
+  return (
+    <div className="space-y-3">
+      <p className="text-sm text-slate-700">
+        {failed
+          ? `The model's dossier was refused ${times} and the run stopped, rather than return grades its tools did not support.`
+          : `The model's dossier was refused ${times} before one passed. The result above is the corrected one.`}
+      </p>
+      <ol className="space-y-2">
+        {reasons.map((r, i) => (
+          <li key={i} className="flex gap-2 rounded-lg border border-gap-line bg-gap-soft px-3 py-2 text-[13px] text-slate-800">
+            <span className="mt-px shrink-0 font-mono text-xs text-gap">{i + 1}</span>
+            <span>{r}</span>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
 export default function ScreenProvenance({ record }: { record: ScreenRecord }) {
   const p = record.provenance;
   const index = p.precedent_index ?? {};
@@ -207,6 +230,12 @@ export default function ScreenProvenance({ record }: { record: ScreenRecord }) {
           </div>
         )}
       </Section>
+
+      {(p.gate_rejections ?? []).length > 0 && (
+        <Section title="Sent back by the evidence gate">
+          <Rejections reasons={p.gate_rejections!} failed={record.status === 'failed'} />
+        </Section>
+      )}
 
       {p.identity_calls.map((call, i) => (
         <Section key={`id-${i}`} title={p.identity_calls.length > 1 ? `Identity · lookup ${i + 1}` : 'Identity'}>

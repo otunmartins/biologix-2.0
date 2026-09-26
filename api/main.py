@@ -33,7 +33,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
-from pydantic_ai import Agent, ModelRetry, RunContext, Tool
+from pydantic_ai import Agent, ModelRetry, RunContext, Tool, capture_run_messages
 from pydantic_ai.exceptions import UserError
 from rdkit import Chem
 
@@ -110,6 +110,9 @@ class ScreenDeps:
     polymer: PolymerSpec | None = None
     # Impurity exposure margins, computed from the request before the run.
     exposure: dict | None = None
+    # Every time the evidence gate sent a dossier back, and why. A run that runs
+    # out of retries fails with only "exceeded maximum retries"; this is the why.
+    gate_rejections: list[str] = field(default_factory=list)
 
     def structure_ceiling(self) -> tuple[str | None, str]:
         """(best grade any structure-derived endpoint may carry, basis).
@@ -985,7 +988,7 @@ def enforce_precedent_evidence(ctx: RunContext[ScreenDeps], dossier: Dossier) ->
     """
     overclaimed = dossier.overclaims_precedent()
     if overclaimed and not ctx.deps.route_matched():
-        raise ModelRetry(
+        raise _rejected(ctx,
             f"Endpoints {overclaimed} are graded A or called 'Precedented', but the "
             f"regulatory_precedent tool did not report a route match ({ctx.deps.summary()}). "
             "Precedent cannot come from your own recollection, however familiar the excipient. "
@@ -1002,7 +1005,7 @@ def enforce_precedent_evidence(ctx: RunContext[ScreenDeps], dossier: Dossier) ->
             if e.evidence_grade < ceiling and not _is_precedent_endpoint(e.endpoint)
         ]
         if over:
-            raise ModelRetry(
+            raise _rejected(ctx,
                 f"Endpoints {over} are graded above {ceiling}, the ceiling resolve_identity set for a "
                 f"{basis!r} structure. Only the endpoint named 'Regulatory precedent, <route>' is "
                 f"exempt, because precedent is a name lookup. Regrade these to {ceiling} or below."
@@ -1015,6 +1018,12 @@ def enforce_precedent_evidence(ctx: RunContext[ScreenDeps], dossier: Dossier) ->
         (c["smiles"] for c in ctx.deps.identity_calls if c.get("resolved") and c.get("smiles")), "")
     dossier.exposure = ctx.deps.exposure
     return dossier
+
+
+def _rejected(ctx: RunContext[ScreenDeps], reason: str) -> ModelRetry:
+    """Note the rejection on the run's record, then hand it back to the model."""
+    ctx.deps.gate_rejections.append(reason)
+    return ModelRetry(reason)
 
 
 def _is_precedent_endpoint(name: str) -> bool:
@@ -1373,17 +1382,21 @@ async def screen(req: ScreenRequest, user_id: int = Depends(users.current_user))
     # screen's precedent lookup returned.
     deps = ScreenDeps(polymer=req.polymer)
     result, error = None, None
-    try:
-        if req.polymer and req.polymer.impurities:
-            # Before the run, from the request alone: the model reports these
-            # numbers and has no way to change them.
-            deps.exposure = exposure.assess(req.polymer.impurities, req.exposure)
-        result = await agent.run(prompt, deps=deps)
-    except Exception as e:
-        error = f"agent run failed: {e}"
+    # Captured so a failed run still has its tool sequence and token usage on
+    # the record; a successful run's result carries the same messages.
+    with capture_run_messages() as messages:
+        try:
+            if req.polymer and req.polymer.impurities:
+                # Before the run, from the request alone: the model reports these
+                # numbers and has no way to change them.
+                deps.exposure = exposure.assess(req.polymer.impurities, req.exposure)
+            result = await agent.run(prompt, deps=deps)
+        except Exception as e:
+            error = f"agent run failed: {e}"
 
     dossier = result.output if result is not None else None
-    history_id = _record_screen(user_id, req, deps, result, error, started, time.perf_counter() - t0)
+    history_id = _record_screen(user_id, req, deps, result, messages, error, started,
+                                time.perf_counter() - t0)
     if dossier is None:
         # The agent run is the only call here that leaves the box; surface the
         # failure as a 502 so the frontend can show something more useful than 500.
@@ -1392,29 +1405,27 @@ async def screen(req: ScreenRequest, user_id: int = Depends(users.current_user))
     return dossier
 
 
-def _record_screen(user_id: int, req: ScreenRequest, deps: "ScreenDeps", result, error: str | None,
-                   started: datetime, seconds: float) -> str | None:
+def _record_screen(user_id: int, req: ScreenRequest, deps: "ScreenDeps", result, messages: list,
+                   error: str | None, started: datetime, seconds: float) -> str | None:
     """Save the run to the user's history. Returns its id, or None if saving
     failed -- which is logged and otherwise swallowed: the user still gets the
     dossier they waited for, marked unsaved. Everything, including assembling
     the record, is inside the try for that reason."""
     try:
-        usage = result.usage if result is not None else None
-        # A property in current pydantic-ai, a method in older releases.
-        usage = usage() if callable(usage) else usage
+        messages = result.all_messages() if result is not None else messages
         provenance = {
             "model": SCREEN_MODEL,
             "app_version": history.APP_VERSION,
             "duration_s": round(seconds, 2),
-            "usage": usage and {k: getattr(usage, k, None)
-                                for k in ("requests", "input_tokens", "output_tokens", "tool_calls")},
+            "usage": _usage(messages),
             # Exactly what each tool returned during this run: the same record the
             # evidence gate judged the dossier against.
             "identity_calls": deps.identity_calls,
             "precedent_calls": deps.precedent_calls,
             "exposure": deps.exposure,
             "precedent_index": precedent.index_status(),
-            "tool_trace": _tool_trace(result) if result is not None else [],
+            "tool_trace": _tool_trace(messages),
+            "gate_rejections": deps.gate_rejections,
         }
         request = req.model_dump(mode="json")
         dossier = result.output.model_dump(mode="json") if result is not None else None
@@ -1431,12 +1442,25 @@ def _record_screen(user_id: int, req: ScreenRequest, deps: "ScreenDeps", result,
         return None
 
 
-def _tool_trace(result) -> list[dict]:
+def _usage(messages: list) -> dict | None:
+    """Model calls and tokens, summed from the responses: the same whether the
+    run succeeded or ran out of retries part-way."""
+    from pydantic_ai.messages import ModelResponse
+    responses = [m for m in messages if isinstance(m, ModelResponse)]
+    if not responses:
+        return None
+    total = lambda k: sum(getattr(r.usage, k, 0) or 0 for r in responses)
+    return {"requests": len(responses), "input_tokens": total("input_tokens"),
+            "output_tokens": total("output_tokens"),
+            "tool_calls": len(_tool_trace(messages))}
+
+
+def _tool_trace(messages: list) -> list[dict]:
     """Which tools the model called, in order, with what arguments. The results
     are already in identity_calls / precedent_calls; this is the sequence."""
     from pydantic_ai.messages import ToolCallPart
     trace = []
-    for message in result.all_messages():
+    for message in messages:
         for part in getattr(message, "parts", []):
             if isinstance(part, ToolCallPart):
                 args = part.args if isinstance(part.args, dict) else part.args_as_dict()
