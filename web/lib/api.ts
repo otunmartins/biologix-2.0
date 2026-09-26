@@ -217,8 +217,23 @@ export interface Health {
 // container). Falls back to localhost:8000 for local dev.
 export const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
+// Every call goes through here so the session cookie always travels with it:
+// the API knows who is asking only from that cookie (api/users.py). 'include'
+// rather than the default 'same-origin' because in local dev the API is on
+// another port; in production it is the same origin and either would do.
+async function call(path: string, init: RequestInit = {}): Promise<Response> {
+  const res = await fetch(`${API_URL}${path}`, { ...init, credentials: 'include' });
+  if (res.status === 401) {
+    // Signed out in another tab, or the session expired. Reloading lets the
+    // server render the sign-in screen instead of a run that can never succeed.
+    window.location.reload();
+    throw new Error('Your session has ended. Sign in again.');
+  }
+  return res;
+}
+
 export async function getHealth(signal?: AbortSignal): Promise<Health> {
-  const res = await fetch(`${API_URL}/health`, { signal });
+  const res = await call('/health', { signal });
   if (!res.ok) throw new Error(`health returned ${res.status}`);
   return res.json();
 }
@@ -233,7 +248,7 @@ export async function runDesign(
   goal: DesignGoal | null,
   signal?: AbortSignal,
 ): Promise<DesignResult> {
-  const res = await fetch(`${API_URL}/design`, {
+  const res = await call('/design', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(goal ? { goal, limit: 12 } : { prompt, limit: 12 }),
@@ -258,7 +273,7 @@ export async function iterateDesign(
   args: { campaignId?: string; prompt?: string; goal?: DesignGoal; batchSize?: number },
   signal?: AbortSignal,
 ): Promise<IterateResult> {
-  const res = await fetch(`${API_URL}/design/iterate`, {
+  const res = await call('/design/iterate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -286,7 +301,7 @@ export async function queueCandidates(
   candidateIds: string[],
   signal?: AbortSignal,
 ): Promise<{ queued: number; queue_summary: QueueSummary }> {
-  const res = await fetch(`${API_URL}/design/queue`, {
+  const res = await call('/design/queue', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ candidate_ids: candidateIds }),
@@ -302,7 +317,7 @@ export async function runScreen(
   exposure: ExposureInputs | null,
   signal?: AbortSignal,
 ): Promise<Dossier> {
-  const res = await fetch(`${API_URL}/screen`, {
+  const res = await call('/screen', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({

@@ -79,6 +79,13 @@ jobs:
             grep -qE '^DATABASE_URL=.+' .env \
               || { echo "::error::DATABASE_URL missing from .env on the instance; deploy aborted"; exit 1; }
 
+            # Sign-in. Without these the site comes up and nobody can get past
+            # the sign-in screen, which /health cannot see.
+            for var in AUTH_SECRET AUTH_GOOGLE_ID AUTH_GOOGLE_SECRET; do
+              grep -qE "^\$var=.+" .env \
+                || { echo "::error::\$var missing from .env on the instance; deploy aborted"; exit 1; }
+            done
+
             git fetch --prune origin
             git reset --hard origin/main
 
@@ -93,31 +100,64 @@ jobs:
 
       - name: Verify the API answers
         id: verify
+        env:
+          # Optional repository variable, e.g. https://biologix.app. When set, the
+          # site is also checked from outside, through DNS, TLS and Caddy.
+          SITE_URL: ${{ vars.SITE_URL }}
         run: |
           set -euo pipefail
+          # Straight to the api container, not through Caddy: once SITE_ADDRESS
+          # is a domain, Caddy answers localhost with an empty 308 to https,
+          # which reads as a broken API and would roll every deploy back.
+          health() {
+            ssh target "cd '$APP_DIR' && docker compose exec -T api python -c 'import urllib.request; print(urllib.request.urlopen(\"http://localhost:8000/health\", timeout=10).read().decode())'"
+          }
+          ok=
           for attempt in $(seq 1 30); do
-            if ssh target 'curl -fsS localhost/health' > health.json 2>/dev/null; then
-              cat health.json
-              # Up but keyless answers 200 and then fails every screen with 503,
-              # which is a broken deploy that a plain health check calls healthy.
-              grep -q '"model_configured":true' health.json \
-                || { echo "::error::API is up but ANTHROPIC_API_KEY is not configured"; exit 1; }
-              # Same trap with the database: a URL that is set but wrong (the
-              # direct string instead of the pooled one, a dead Neon branch)
-              # still answers 200 here.
-              grep -q '"database":{"reachable":true}' health.json \
-                || { echo "::error::API is up but cannot reach Postgres (see database in /health)"; exit 1; }
-              # And the Tg model: without it the designer quietly falls back to
-              # the handbook table instead of failing.
-              grep -q '"tg_model":true' health.json \
-                || { echo "::error::API is up but the Tg model did not load"; exit 1; }
-              echo "::notice::deploy verified"
+            if health > health.json 2>/dev/null && [ -s health.json ]; then ok=1; break; fi
+            sleep 5
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::/health did not respond within 150s"
+            ssh target "cd '$APP_DIR' && docker compose logs --tail 50" || true
+            exit 1
+          fi
+          cat health.json
+          # Up but keyless answers 200 and then fails every screen with 503,
+          # which is a broken deploy that a plain health check calls healthy.
+          grep -q '"model_configured":true' health.json \
+            || { echo "::error::API is up but ANTHROPIC_API_KEY is not configured"; exit 1; }
+          # Same trap with the database: a URL that is set but wrong (the
+          # direct string instead of the pooled one, a dead Neon branch)
+          # still answers 200 here. Reachable also means the sign-in tables exist.
+          grep -q '"database":{"reachable":true}' health.json \
+            || { echo "::error::API is up but cannot reach Postgres (see database in /health)"; exit 1; }
+          # And the Tg model: without it the designer quietly falls back to
+          # the handbook table instead of failing.
+          grep -q '"tg_model":true' health.json \
+            || { echo "::error::API is up but the Tg model did not load"; exit 1; }
+
+          if [ -z "${SITE_URL:-}" ]; then
+            echo "::warning::SITE_URL not set - checked the API only, not the public site"
+            echo "::notice::deploy verified"
+            exit 0
+          fi
+          # From outside: Caddy routes /health to the API and /api/auth to the
+          # web app, the certificate is valid, and Google sign-in will call back
+          # to this site - an AUTH_URL that does not match it (WEB_ORIGIN in
+          # .env) makes every Google sign-in fail with redirect_uri_mismatch.
+          # Retried because Caddy may still be fetching a certificate.
+          site="${SITE_URL%/}"
+          for attempt in $(seq 1 24); do
+            if curl -fsS "$site/health" >/dev/null 2>&1 \
+               && curl -fsS "$site/api/auth/providers" 2>/dev/null \
+                  | grep -qF "\"callbackUrl\":\"$site/api/auth/callback/google\""; then
+              echo "::notice::deploy verified, including $site and Google sign-in"
               exit 0
             fi
             sleep 5
           done
-          echo "::error::/health did not respond within 150s"
-          ssh target 'docker compose logs --tail 50' || true
+          echo "::error::$site/health or /api/auth/providers did not answer correctly from outside"
           exit 1
 
       - name: Roll back to the previous build
@@ -136,7 +176,7 @@ jobs:
             docker compose up -d --build
           EOF
           for attempt in $(seq 1 30); do
-            if ssh target 'curl -fsS localhost/health' >/dev/null 2>&1; then
+            if ssh target "cd '$APP_DIR' && docker compose exec -T api python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\", timeout=10)'" >/dev/null 2>&1; then
               echo "::notice::rolled back to $PREV and it answers /health"
               exit 0
             fi
