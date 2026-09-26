@@ -41,7 +41,8 @@ def fresh_store(module):
         # CASCADE and the order together: candidate references campaign,
         # measurement references biologic, campaign and sessions reference users.
         conn.execute("DROP TABLE IF EXISTS candidate, iteration, campaign, "
-                     "measurement, biologic, passwords, sessions, accounts, verification_token, "
+                     "measurement, biologic, screen_run, event, passwords, sessions, accounts, "
+                     "verification_token, "
                      "users CASCADE")
     main.db.reset_schema_cache()
     conn.close()
@@ -1107,6 +1108,127 @@ def main_test():
             os.environ["DATABASE_URL"] = saved_url
     print("ok  sign-in: no cookie, unknown and expired sessions get 401 on every route; "
           "a live one sees only its own campaigns; /health stays public")
+
+    # --- history and provenance, end to end through the HTTP layer -----------
+    os.environ["DATABASE_URL"] = TEST_DB
+    try:
+        client = TestClient(main.app)
+        agent = main.get_agent()
+
+        # Structure drawings are public and pure: no cookie needed, junk refused.
+        r = client.get("/structure.svg", params={"smiles": "[*]N(CC[*])C(=O)CCO"})
+        assert r.status_code == 200 and r.headers["content-type"].startswith("image/svg+xml"), r.status_code
+        assert "<svg" in r.text
+        assert client.get("/structure.svg", params={"smiles": "C1CC(("}).status_code == 422
+        assert client.get("/structure.svg", params={"smiles": "C" * 1001}).status_code == 422
+        print("ok  structures: repeat units draw as SVG without signing in; bad or oversized SMILES get 422")
+
+        # A screen is saved with everything that produced it.
+        form = {"excipient": PS80, "route": "subcutaneous", "dose": "150"}
+        script, _ = make_script(call_precedent=True)
+        with agent.override(model=FunctionModel(script)):
+            r = client.post("/screen", headers=as_("tok-alice"),
+                            json={"prompt": f"Screen {PS80} subcutaneous. Sequence: {SEQ}", "form": form})
+        assert r.status_code == 200, r.text
+        dossier = r.json()
+        sid = dossier["history_id"]
+        assert sid, "a saved screen must say where it was saved"
+        assert dossier["structure_smiles"] == main.SURROGATES["polysorbate 80"][0], \
+            "the drawn structure must be the one resolve_identity screened"
+        rec = client.get(f"/history/screens/{sid}", headers=as_("tok-alice")).json()
+        prov = rec["provenance"]
+        assert rec["status"] == "ok" and rec["request"]["form"] == form
+        assert rec["dossier"]["excipient"] == dossier["excipient"]
+        assert prov["model"] == main.SCREEN_MODEL and prov["app_version"]
+        assert prov["identity_calls"] and prov["identity_calls"][0]["smiles"] == dossier["structure_smiles"]
+        assert prov["precedent_calls"], "what the FDA lookup returned must be on the record"
+        assert [t["tool"] for t in prov["tool_trace"]][:4] == [
+            "resolve_identity", "structural_alerts", "protein_liability_scan", "regulatory_precedent"]
+        assert [e["kind"] for e in rec["events"]] == ["screen.completed"]
+        print("ok  history: a screen is saved with its request, form, dossier, model, build, "
+              "tool sequence and what each data source returned")
+
+        # A failed run is history too.
+        def broken(messages, info):
+            raise RuntimeError("model unavailable")
+        with agent.override(model=FunctionModel(broken)):
+            r = client.post("/screen", headers=as_("tok-alice"), json={"prompt": "Screen sucrose IV"})
+        assert r.status_code == 502
+        failed = client.get("/history", params={"kind": "screen"}, headers=as_("tok-alice")).json()["items"][0]
+        assert failed["status"] == "failed" and "model unavailable" in failed["error"]
+        print("ok  history: a failed screen is recorded as failed, with its error")
+
+        # If saving fails, the user still gets their dossier, marked unsaved.
+        real_record = main.history.record_screen
+        def unsavable(*a, **k):
+            raise RuntimeError("database write failed")
+        main.history.record_screen = unsavable
+        try:
+            script, _ = make_script(call_precedent=True)
+            with agent.override(model=FunctionModel(script)):
+                r = client.post("/screen", headers=as_("tok-alice"),
+                                json={"prompt": f"Screen {PS80} subcutaneous. Sequence: {SEQ}"})
+        finally:
+            main.history.record_screen = real_record
+        assert r.status_code == 200 and r.json()["history_id"] is None, r.text
+        print("ok  history: when saving fails the dossier is still returned, with history_id null")
+
+        # A campaign's whole life is in its event log.
+        goal = {"protein": "IgG1 mAb", "route": "subcutaneous", "target_temp_c": 25,
+                "duration_months": 24, "format": "liquid", "exposed_residues": [], "notes": ""}
+        r = client.post("/design/iterate", headers=as_("tok-alice"),
+                        json={"goal": goal, "prompt": "keep my mAb stable at 25 C", "batch_size": 4})
+        assert r.status_code == 200, r.text
+        camp = r.json()["campaign_id"]
+        first = r.json()["candidates"][0]["id"]
+        assert client.post(f"/design/campaign/{camp}/end", headers=as_("tok-alice")).json()["already"] is False
+        assert client.post(f"/design/campaign/{camp}/end", headers=as_("tok-alice")).json()["already"] is True
+        r = client.post("/design/iterate", headers=as_("tok-alice"), json={"campaign_id": camp, "batch_size": 4})
+        assert r.status_code == 200 and r.json()["iteration"] == 2
+        assert client.post("/design/queue", headers=as_("tok-alice"),
+                           json={"candidate_ids": [first]}).json()["queued"] == 1
+        state = client.get(f"/design/campaign/{camp}", headers=as_("tok-alice")).json()
+        kinds = [e["kind"] for e in state["events"]]
+        assert kinds == ["campaign.started", "campaign.iterated", "campaign.ended",
+                         "campaign.reopened", "campaign.iterated", "candidate.queued"], kinds
+        assert state["prompt"] == "keep my mAb stable at 25 C" and state["ended_at"] is None
+        assert state["events"][0]["data"]["goal_parsed_by"] is None, "a given goal was not parsed by a model"
+        assert state["events"][-1]["data"]["candidates"][0]["id"] == first
+        print("ok  history: a campaign logs started, iterated, ended, reopened and queued, in order; "
+              "ending twice logs once")
+
+        # The list: newest first, both kinds, paginated, filtered.
+        page = client.get("/history", headers=as_("tok-alice")).json()
+        items = page["items"]
+        assert [i["kind"] for i in items][:1] == ["campaign"] and items[0]["id"] == camp
+        assert items[0]["n_iterations"] == 2 and items[0]["n_queued"] == 1 and items[0]["top"]["smiles"]
+        assert {i["kind"] for i in items} == {"screen", "campaign"}
+        seen, cursor = [], None
+        while True:
+            params = {"limit": 1, **({"before": cursor} if cursor else {})}
+            pg = client.get("/history", params=params, headers=as_("tok-alice")).json()
+            seen += [i["id"] for i in pg["items"]]
+            cursor = pg["next"]
+            if not cursor:
+                break
+        assert seen == [i["id"] for i in items], "paging one at a time must walk the same list"
+        assert all(i["kind"] == "screen" for i in
+                   client.get("/history", params={"kind": "screen"}, headers=as_("tok-alice")).json()["items"])
+        assert client.get("/history", params={"before": "garbage"}, headers=as_("tok-alice")).status_code == 422
+        print(f"ok  history: {len(items)} items newest first; paging one at a time walks the same list; "
+              "filters work; a bad cursor is a 422")
+
+        # None of it is anyone else's.
+        assert client.get("/history", headers=as_("tok-bob")).json()["items"] == []
+        assert client.get(f"/history/screens/{sid}", headers=as_("tok-bob")).status_code == 404
+        assert client.post(f"/design/campaign/{camp}/end", headers=as_("tok-bob")).status_code == 404
+        assert client.get("/history").status_code == 401
+        print("ok  history: another user sees none of it and cannot end your campaign; signed out is 401")
+    finally:
+        if saved_url is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = saved_url
 
     # --- orchestration (advisory campaign controller) -------------------------
     OR = main.orchestrator

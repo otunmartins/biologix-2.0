@@ -18,9 +18,12 @@ Run standalone:
   uvicorn main:app --reload --port 8000
 """
 
+import json
 import os
 import re
+import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from itertools import product
 from dataclasses import dataclass, field
 from typing import Literal
@@ -42,6 +45,7 @@ import depict
 import orchestrator
 import design
 import exposure
+import history
 import interactions
 import calibration
 import measurements
@@ -168,6 +172,8 @@ class Dossier(BaseModel):
     structure_smiles: str = Field(default="", description="Leave empty; the system fills this in.")
     # Likewise system-filled: the impurity exposure margins exactly as computed.
     exposure: dict | None = Field(default=None, description="Leave null; the system fills this in.")
+    # The id of this run in the user's history, or null if it could not be saved.
+    history_id: str | None = Field(default=None, description="Leave null; the system fills this in.")
 
     def overclaims_precedent(self) -> list[str]:
         """Endpoints asserting precedent, which only a tool result can support."""
@@ -235,6 +241,15 @@ class ScreenRequest(BaseModel):
     polymer: PolymerSpec | None = None
     # Dose volume, interval and duration, for impurity exposure margins.
     exposure: ExposureInputs | None = None
+    # The form exactly as the user filled it, kept only for their history so
+    # "open in workspace" can refill it. Never read by the screen itself.
+    form: dict | None = None
+
+    @model_validator(mode="after")
+    def _form_is_small(self):
+        if self.form is not None and len(json.dumps(self.form)) > 20_000:
+            raise ValueError("form snapshot is too large")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -904,11 +919,16 @@ are ranked, so leave a field empty rather than filling it with a plausible value
 _design_agent: Agent | None = None
 
 
+# Named, so the history can record which model produced each result.
+SCREEN_MODEL = "anthropic:claude-sonnet-5"
+DESIGN_MODEL = "anthropic:claude-sonnet-5"
+
+
 def get_design_agent() -> Agent:
     global _design_agent
     if _design_agent is None:
         _design_agent = Agent(
-            "anthropic:claude-sonnet-5",
+            DESIGN_MODEL,
             output_type=DesignGoal,
             system_prompt=DESIGN_PROMPT,
             model_settings={"max_tokens": 1000},
@@ -927,7 +947,7 @@ def get_agent() -> Agent:
     global _agent
     if _agent is None:
         _agent = Agent(
-            "anthropic:claude-sonnet-5",
+            SCREEN_MODEL,
             output_type=Dossier,
             deps_type=ScreenDeps,
             system_prompt=SYSTEM_PROMPT,
@@ -1012,7 +1032,7 @@ def _ensure_tables() -> str | None:
     that touches the database needs a signed-in user first.
     """
     try:
-        candidates.connect().close()  # users first, then the campaign store
+        history.connect().close()  # users, then campaigns, then the history tables
         return None
     except Exception as e:
         return _scrub(f"{type(e).__name__}: {e}")
@@ -1164,8 +1184,12 @@ async def design_iterate(req: IterateRequest, user_id: int = Depends(users.curre
     Starts a campaign from a goal/prompt, or continues one by campaign_id, proposing
     a fresh batch that is screened and stored. Every candidate stays grade D — the
     loop optimises the transparent triage proxy, not stabilisation (see active.py).
+
+    Every change lands in the user's history in the same transaction as the
+    change itself (history.py): started, iterated, and reopened if the campaign
+    had been ended with "New experiment".
     """
-    conn = candidates.connect()
+    conn = history.connect()
     try:
         if req.campaign_id:
             state = candidates.campaign_state(conn, req.campaign_id, owner_id=user_id)
@@ -1176,34 +1200,50 @@ async def design_iterate(req: IterateRequest, user_id: int = Depends(users.curre
             prior = [active.PriorCandidate(p["backbone_key"], p["components"], p["score"])
                      for p in candidates.prior_for(conn, campaign_id)]
         else:
+            # Outside the transaction: this may be a model call, and a
+            # transaction should not stay open across one.
             goal = await _resolve_goal(req.prompt, req.goal)
-            campaign_id = candidates.create_campaign(conn, goal.model_dump(), owner_id=user_id)
-            prior = []
+            campaign_id, prior = None, []
 
         proposal = active.propose_batch(goal, prior, k=req.batch_size)
-        iteration = candidates.next_iteration(conn, campaign_id)
 
-        items = []
-        for rank, cand in enumerate(proposal.candidates, 1):
-            items.append({
-                "payload": design.candidate_dict(cand, goal, rank),
-                "backbone_key": cand.backbone.key,
-                "components": [[p.key, round(f, 2)] for p, f in cand.components],
-                "score": cand.score,
+        with db.tx(conn):
+            if campaign_id is None:
+                campaign_id = candidates.create_campaign(
+                    conn, goal.model_dump(), owner_id=user_id, prompt=req.prompt.strip())
+                history.log_event(conn, user_id, "campaign.started", "campaign", campaign_id, {
+                    "prompt": req.prompt.strip(), "goal": goal.model_dump(),
+                    # Which model read the goal out of the words, if one did.
+                    "goal_parsed_by": DESIGN_MODEL if req.goal is None else None,
+                })
+            elif candidates.reopen_campaign(conn, campaign_id, owner_id=user_id):
+                history.log_event(conn, user_id, "campaign.reopened", "campaign", campaign_id)
+
+            iteration = candidates.next_iteration(conn, campaign_id)
+            items = []
+            for rank, cand in enumerate(proposal.candidates, 1):
+                items.append({
+                    "payload": design.candidate_dict(cand, goal, rank),
+                    "backbone_key": cand.backbone.key,
+                    "components": [[p.key, round(f, 2)] for p, f in cand.components],
+                    "score": cand.score,
+                })
+            stored = candidates.add_candidates(conn, campaign_id, iteration, items)
+            candidates.record_metrics(conn, campaign_id, iteration, proposal.metrics)
+            history.log_event(conn, user_id, "campaign.iterated", "campaign", campaign_id, {
+                "iteration": iteration, "n_candidates": len(stored), "metrics": proposal.metrics,
             })
-        stored = candidates.add_candidates(conn, campaign_id, iteration, items)
-        candidates.record_metrics(conn, campaign_id, iteration, proposal.metrics)
 
-        history = candidates.metrics_history(conn, campaign_id)
+        metrics_hist = candidates.metrics_history(conn, campaign_id)
         return {
             "campaign_id": campaign_id,
             "iteration": iteration,
             "goal": goal.model_dump(),
             "candidates": stored,
             "metrics": proposal.metrics,
-            "metrics_history": history,
+            "metrics_history": metrics_hist,
             # The advisory campaign controller's read of where the run stands.
-            "recommendation": orchestrator.recommend(history),
+            "recommendation": orchestrator.recommend(metrics_hist),
             "queue_summary": candidates.queue_summary(conn, owner_id=user_id, campaign_id=campaign_id),
             "limits": active.ACTIVE_LIMITS,
             "orchestration": orchestrator.ORCHESTRATION_NOTE,
@@ -1218,17 +1258,43 @@ async def design_iterate(req: IterateRequest, user_id: int = Depends(users.curre
 def design_queue(req: QueueRequest, user_id: int = Depends(users.current_user)):
     """Send benchmarked candidates to the OpenMM simulation backlog. A position in
     the queue is a triage decision, not evidence — nothing here upgrades a grade."""
-    conn = candidates.connect()
+    conn = history.connect()
     try:
-        n = candidates.enqueue(conn, req.candidate_ids, owner_id=user_id)
-        return {"queued": n, "queue_summary": candidates.queue_summary(conn, owner_id=user_id)}
+        with db.tx(conn):
+            queued = candidates.enqueue_rows(conn, req.candidate_ids, owner_id=user_id)
+            # Logged per campaign, and only for what was actually queued.
+            by_campaign: dict[str, list[dict]] = {}
+            for q in queued:
+                by_campaign.setdefault(q["campaign_id"], []).append(
+                    {"id": q["id"], "name": q["name"], "score": q["score"]})
+            for cid, rows in by_campaign.items():
+                history.log_event(conn, user_id, "candidate.queued", "campaign", cid,
+                                  {"candidates": rows})
+        return {"queued": len(queued), "queue_summary": candidates.queue_summary(conn, owner_id=user_id)}
+    finally:
+        conn.close()
+
+
+@app.post("/design/campaign/{campaign_id}/end")
+def design_campaign_end(campaign_id: str, user_id: int = Depends(users.current_user)):
+    """The "New experiment" button: close this campaign. It stays in the user's
+    history and can be continued later, which reopens it. Idempotent."""
+    conn = history.connect()
+    try:
+        with db.tx(conn):
+            outcome = candidates.end_campaign(conn, campaign_id, owner_id=user_id)
+            if outcome is None:
+                raise HTTPException(status_code=404, detail="no such campaign")
+            if outcome == "ended":
+                history.log_event(conn, user_id, "campaign.ended", "campaign", campaign_id)
+        return {"campaign_id": campaign_id, "ended": True, "already": outcome == "already"}
     finally:
         conn.close()
 
 
 @app.get("/design/campaign/{campaign_id}")
 def design_campaign(campaign_id: str, user_id: int = Depends(users.current_user)):
-    conn = candidates.connect()
+    conn = history.connect()
     try:
         state = candidates.campaign_state(conn, campaign_id, owner_id=user_id)
         if state is None:
@@ -1236,7 +1302,39 @@ def design_campaign(campaign_id: str, user_id: int = Depends(users.current_user)
         state["limits"] = active.ACTIVE_LIMITS
         state["recommendation"] = orchestrator.recommend(state["metrics_history"])
         state["orchestration"] = orchestrator.ORCHESTRATION_NOTE
+        # The campaign's provenance: every start, batch, queue and end, in order.
+        state["events"] = history.events_for(conn, campaign_id, owner_id=user_id)
         return state
+    finally:
+        conn.close()
+
+
+@app.get("/history")
+def history_list(kind: Literal["all", "screen", "campaign"] = "all",
+                 before: str | None = Query(None, max_length=200),
+                 limit: int = Query(20, ge=1, le=50),
+                 user_id: int = Depends(users.current_user)):
+    """The signed-in user's screens and campaigns, newest first, a page at a time.
+    Pass `next` from one page as `before` to get the following one."""
+    conn = history.connect()
+    try:
+        return history.list_history(conn, owner_id=user_id, kind=kind, before=before, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    finally:
+        conn.close()
+
+
+@app.get("/history/screens/{screen_id}")
+def history_screen(screen_id: str, user_id: int = Depends(users.current_user)):
+    """One screen in full: what was asked, what came back, and how it was produced."""
+    conn = history.connect()
+    try:
+        record = history.screen_record(conn, screen_id, owner_id=user_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="no such screen")
+        record["events"] = history.events_for(conn, screen_id, owner_id=user_id)
+        return record
     finally:
         conn.close()
 
@@ -1269,17 +1367,84 @@ async def screen(req: ScreenRequest, user_id: int = Depends(users.current_user))
         # Config problem, not a transient one — usually a missing ANTHROPIC_API_KEY.
         raise HTTPException(status_code=503, detail=f"agent not configured: {e}") from e
 
+    started = datetime.now(timezone.utc)
+    t0 = time.perf_counter()
+    # Fresh deps per request: the evidence gate must not see what a previous
+    # screen's precedent lookup returned.
+    deps = ScreenDeps(polymer=req.polymer)
+    result, error = None, None
     try:
-        # Fresh deps per request: the evidence gate must not see what a previous
-        # screen's precedent lookup returned.
-        deps = ScreenDeps(polymer=req.polymer)
         if req.polymer and req.polymer.impurities:
             # Before the run, from the request alone: the model reports these
             # numbers and has no way to change them.
             deps.exposure = exposure.assess(req.polymer.impurities, req.exposure)
         result = await agent.run(prompt, deps=deps)
     except Exception as e:
+        error = f"agent run failed: {e}"
+
+    dossier = result.output if result is not None else None
+    history_id = _record_screen(user_id, req, deps, result, error, started, time.perf_counter() - t0)
+    if dossier is None:
         # The agent run is the only call here that leaves the box; surface the
         # failure as a 502 so the frontend can show something more useful than 500.
-        raise HTTPException(status_code=502, detail=f"agent run failed: {e}") from e
-    return result.output
+        raise HTTPException(status_code=502, detail=error)
+    dossier.history_id = history_id
+    return dossier
+
+
+def _record_screen(user_id: int, req: ScreenRequest, deps: "ScreenDeps", result, error: str | None,
+                   started: datetime, seconds: float) -> str | None:
+    """Save the run to the user's history. Returns its id, or None if saving
+    failed -- which is logged and otherwise swallowed: the user still gets the
+    dossier they waited for, marked unsaved. Everything, including assembling
+    the record, is inside the try for that reason."""
+    try:
+        usage = result.usage if result is not None else None
+        # A property in current pydantic-ai, a method in older releases.
+        usage = usage() if callable(usage) else usage
+        provenance = {
+            "model": SCREEN_MODEL,
+            "app_version": history.APP_VERSION,
+            "duration_s": round(seconds, 2),
+            "usage": usage and {k: getattr(usage, k, None)
+                                for k in ("requests", "input_tokens", "output_tokens", "tool_calls")},
+            # Exactly what each tool returned during this run: the same record the
+            # evidence gate judged the dossier against.
+            "identity_calls": deps.identity_calls,
+            "precedent_calls": deps.precedent_calls,
+            "exposure": deps.exposure,
+            "precedent_index": precedent.index_status(),
+            "tool_trace": _tool_trace(result) if result is not None else [],
+        }
+        request = req.model_dump(mode="json")
+        dossier = result.output.model_dump(mode="json") if result is not None else None
+        conn = history.connect()
+        try:
+            return history.record_screen(
+                conn, user_id, request=request, dossier=dossier, error=error,
+                provenance=_jsonable(provenance), started_at=started,
+                finished_at=datetime.now(timezone.utc))
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"warning: screen not saved to history: {_scrub(f'{type(e).__name__}: {e}')}", flush=True)
+        return None
+
+
+def _tool_trace(result) -> list[dict]:
+    """Which tools the model called, in order, with what arguments. The results
+    are already in identity_calls / precedent_calls; this is the sequence."""
+    from pydantic_ai.messages import ToolCallPart
+    trace = []
+    for message in result.all_messages():
+        for part in getattr(message, "parts", []):
+            if isinstance(part, ToolCallPart):
+                args = part.args if isinstance(part.args, dict) else part.args_as_dict()
+                trace.append({"tool": part.tool_name, "args": args})
+    return trace
+
+
+def _jsonable(value):
+    """Round-trip through JSON so anything a tool returned (tuples, sets, dates)
+    lands in JSONB as plain data rather than failing the insert."""
+    return json.loads(json.dumps(value, default=str))
