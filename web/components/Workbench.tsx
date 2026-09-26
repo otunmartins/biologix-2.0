@@ -57,9 +57,13 @@ function ApiBadge({ api }: { api: ApiState }) {
           ? ['bg-gap', 'No model key']
           : ['bg-precedented', 'API ready'];
   return (
-    <span className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-medium text-slate-600">
+    // On a phone only the dot shows; the label stays as a tooltip and for screen readers.
+    <span
+      title={label}
+      className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-2 py-2 text-xs font-medium text-slate-600 sm:px-3 sm:py-1"
+    >
       <span className={`h-2 w-2 rounded-full ${dot}`} />
-      {label}
+      <span className="sr-only sm:not-sr-only">{label}</span>
     </span>
   );
 }
@@ -551,15 +555,16 @@ export default function Workbench({ user }: { user: SessionUser }) {
 
   return (
     <div className="flex min-h-screen flex-col lg:h-screen">
-      <header className="flex h-14 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-5">
+      {/* On a phone the tabs drop to a second, full-width row; from sm up it is one row. */}
+      <header className="flex shrink-0 flex-wrap items-center justify-between gap-y-2 border-b border-slate-200 bg-white px-4 py-2 sm:h-14 sm:flex-nowrap sm:px-5 sm:py-0">
         <div className="flex items-center gap-2.5">
           <span className="grid h-8 w-8 place-items-center rounded-lg bg-slate-900 text-white">
             <Molecule className="h-[18px] w-[18px]" />
           </span>
-          <span className="text-[15px] font-semibold tracking-tight text-slate-900">Excipient Screen</span>
+          <span className="whitespace-nowrap text-[15px] font-semibold tracking-tight text-slate-900">Excipient Screen</span>
         </div>
 
-        <nav className="flex rounded-lg bg-slate-100 p-1 text-sm font-medium">
+        <nav className="order-last flex w-full rounded-lg bg-slate-100 p-1 text-sm font-medium sm:order-none sm:w-auto">
           {(
             [
               ['screen', 'Screen'],
@@ -575,7 +580,7 @@ export default function Workbench({ user }: { user: SessionUser }) {
                 setError(null);
               }}
               aria-current={workflow === w}
-              className={`rounded-md px-4 py-1.5 transition ${
+              className={`flex-1 rounded-md px-4 py-1.5 transition sm:flex-none ${
                 workflow === w ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'
               }`}
             >
