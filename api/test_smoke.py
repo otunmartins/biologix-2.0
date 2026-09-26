@@ -575,6 +575,42 @@ def main_test():
     assert d.exposure == biweekly
     print("ok  exposure: the dossier carries the computed margins, not the model's")
 
+    # --- interaction potentials -> m-value ------------------------------------
+    I = main.interactions
+
+    urea = I.m_value("1LYZ", "urea")
+    assert urea["available"] and urea["m_value_cal_per_mol_molal"] < 0, urea
+    assert urea["direction"] == "destabilising"
+    # The backbone amide carries the effect, which is the whole basis of the
+    # transfer model: osmolytes act on the peptide backbone, not the side chains.
+    assert urea["by_group"][0]["group"] == "amide_O", urea["by_group"][:2]
+    # Protecting osmolytes must come out the other way.
+    for protecting in ("proline", "glycine betaine"):
+        assert I.m_value("1LYZ", protecting)["m_value_cal_per_mol_molal"] > 0, protecting
+    print(f"ok  m-value: urea destabilises 1LYZ ({urea['m_value_cal_per_mol_molal']} cal/mol/m, "
+          f"backbone amide O dominant); proline and betaine stabilise")
+
+    # Published uncertainties are propagated, not decoration: proline's larger
+    # errors leave its sign unresolved where urea's does not.
+    assert urea["interval_95"][1] < 0, "urea's interval should exclude zero"
+    assert I.m_value("1LYZ", "proline")["direction"] == "not resolved from zero"
+    print("ok  m-value: alpha uncertainties propagate — proline's sign is not resolved, urea's is")
+
+    # A solute with no published alphas is refused rather than estimated.
+    assert I.m_value("1LYZ", "trehalose")["available"] is False
+    assert "never estimated" in I.m_value("1LYZ", "trehalose")["note"]
+    print("ok  m-value: an unparameterised solute is refused, never inferred by analogy")
+
+    # Protein-agnostic: the same machinery on a different fold, and the result
+    # must be JSON-safe for the API.
+    import json as _json
+    other = I.m_value("P01857", "urea")
+    assert other["available"] and other["n_residues"] != urea["n_residues"]
+    assert _json.dumps(other)
+    assert other["excluded_area_no_alpha"] >= 0
+    print(f"ok  m-value: same engine on an unrelated structure ({other['n_residues']} residues), "
+          "output JSON-safe")
+
     # --- polymer designer -----------------------------------------------------
     D = main.design
 

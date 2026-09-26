@@ -36,6 +36,7 @@ from rdkit import Chem
 import accessibility
 import design
 import exposure
+import interactions
 from design import DesignGoal
 from exposure import ExposureInputs
 import polymer
