@@ -60,7 +60,6 @@ roughly a tenth of a g5's cost. See the GPU section below for when that changes.
 aws configure                 # access key, secret, default region
 aws ec2 create-key-pair --key-name excipient-screen \
   --query KeyMaterial --output text > excipient-screen.pem
-curl -s ifconfig.me           # your public IP, for the ssh_cidr below
 ```
 
 **2. Apply:**
@@ -68,8 +67,11 @@ curl -s ifconfig.me           # your public IP, for the ssh_cidr below
 ```bash
 cd terraform
 terraform init
-terraform apply -var="key_name=excipient-screen" -var="ssh_cidr=YOUR_IP/32"
+terraform apply -var="key_name=excipient-screen"
 ```
+
+Leave `ssh_cidr` at its default. Deploys SSH in from GitHub's runners, whose addresses change,
+so restricting it to your own IP blocks every deploy. Login is key-only.
 
 This prints a public IP. It's an Elastic IP, so it survives a stop/start of the instance.
 
@@ -77,10 +79,27 @@ This prints a public IP. It's an Elastic IP, so it survives a stop/start of the 
 
 ```bash
 ssh -i excipient-screen.pem ubuntu@<the-ip>
-git clone <your-repo> && cd <your-repo>   # or scp the directory up
-cp .env.example .env                       # set ANTHROPIC_API_KEY and put <the-ip> in the last two vars
-docker compose up -d --build               # first build is slow: RDKit + a Next.js build
+git clone https://github.com/otunmartins/biologix-2.0.git && cd biologix-2.0
+cp .env.example .env    # ANTHROPIC_API_KEY, Neon's POOLED DATABASE_URL, <the-ip> in the last two vars
+docker compose up -d --build    # first build is slow: RDKit + a Next.js build
+curl -s localhost/health        # model_configured, database.reachable and tg_model all true
 ```
+
+Clone it to exactly `/home/ubuntu/biologix-2.0` (what the commands above do): that's where the deploy
+workflow looks, unless you set an `EC2_APP_DIR` secret.
+
+**4. Turn on deploys from `main`:**
+
+```bash
+gh secret set EC2_HOST --body <the-ip>
+gh secret set EC2_USER --body ubuntu
+gh secret set EC2_SSH_KEY < excipient-screen.pem
+gh secret set EC2_HOST_KEY --body "$(ssh-keyscan <the-ip> 2>/dev/null)"
+gh variable set DEPLOY_ENABLED --body true
+```
+
+From then on every merge to `main` runs the tests, deploys, checks `/health`, and rolls back to the
+previous build if the new one comes up unhealthy.
 
 Open `http://<the-ip>`. That's plain HTTP — fine for testing, but don't put anything confidential
 through it. For HTTPS, point a domain's A record at the IP, set `SITE_ADDRESS`, `WEB_ORIGIN` and

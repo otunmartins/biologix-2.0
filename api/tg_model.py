@@ -49,7 +49,11 @@ RDLogger.DisableLog("rdApp.*")
 DATA_URL = ("https://zenodo.org/records/14980914/files/"
             "LAMALAB_CURATED_Tg_structured.csv?download=1")
 CACHE_DIR = os.environ.get("IID_CACHE_DIR") or os.path.dirname(__file__)
-MODEL_PATH = os.path.join(CACHE_DIR, "tg_model.pkl")
+# Beside this file, NOT in CACHE_DIR: the pickle is committed and COPY'd into the
+# image at /app, while docker-compose points IID_CACHE_DIR at an empty /cache
+# volume. Looking there, production never found the model and served the
+# handbook fallback. The training data can stay a cache; it is re-fetchable.
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tg_model.pkl")
 DATA_PATH = os.path.join(CACHE_DIR, "tg_data.csv")
 
 # Held-out performance, measured in training and carried with every prediction

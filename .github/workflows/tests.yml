@@ -1,0 +1,78 @@
+name: Tests
+
+# Runs on every pull request, and deploy.yml calls it before it touches the box,
+# so nothing reaches production without passing here first.
+#
+# Both jobs build the same Dockerfiles the box builds from, so a dependency that
+# will not install, a type error that breaks `next build`, or a pickle the pinned
+# scikit-learn cannot read fails here instead of on the server.
+on:
+  pull_request:
+  workflow_call:
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    services:
+      # The smoke test drops and recreates its tables, so it gets a throwaway
+      # database of its own -- never Neon.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: biologix
+          POSTGRES_PASSWORD: devpass
+          POSTGRES_DB: biologix_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U biologix"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the api image
+        run: docker build -t biologix-api ./api
+
+      - name: The Tg model loads
+        # tg_model.available() swallows a load failure and the designer falls
+        # back to the handbook table, so a missing pickle or a scikit-learn that
+        # cannot read it would otherwise pass every test and ship. Run with the
+        # same IID_CACHE_DIR docker-compose sets, and with scikit-learn's
+        # version-mismatch warning promoted to an error.
+        run: |
+          docker run --rm -e IID_CACHE_DIR=/cache biologix-api python -c "
+          import warnings
+          from sklearn.exceptions import InconsistentVersionWarning
+          warnings.simplefilter('error', InconsistentVersionWarning)
+          import tg_model
+          r = tg_model.predict('*CC(*)C(=O)N')
+          assert r.get('available') is not False, r
+          print('tg_model ok, Tg', r['tg_c'], 'C')
+          "
+
+      - name: Smoke test
+        # test_breadth.py is left out on purpose: it hits PubChem, fda.gov and
+        # openFDA, so it fails whenever one of them is slow, not when the code is
+        # wrong. Run it by hand before a release that touches the screen.
+        run: >-
+          docker run --rm --network host
+          -e TEST_DATABASE_URL=postgresql://biologix:devpass@localhost:5432/biologix_test
+          biologix-api python test_smoke.py
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the web image
+        # `next build` type-checks, so this is also the TypeScript check.
+        run: docker build --build-arg NEXT_PUBLIC_API_URL=http://localhost -t biologix-web ./web
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: docker-compose.yml parses
+        run: cp .env.example .env && docker compose config -q
