@@ -535,6 +535,46 @@ def main_test():
             assert not ok, f"{endpoints} wrongly bounced"
     print("ok  structure ceiling: surrogate D, described C, strictest wins, precedent exempt")
 
+    # --- impurity exposure margins -------------------------------------------
+    X = main.exposure
+    LEVELS = [("<= 1 ppm", 1.0), ("≤1ppm", 1.0), ("NMT 10 µg/g", 10.0), ("0.001 %", 10.0),
+              ("50 ppb", 0.05), ("1 mg/kg", 1.0), ("2 meq/kg", None), ("trace", None), ("", None)]
+    for text, want in LEVELS:
+        assert X.parse_level(text) == want, (text, X.parse_level(text))
+    print(f"ok  exposure: {len(LEVELS)} impurity levels parsed, peroxide values in meq/kg refused")
+
+    assert X.excipient_mg_per_dose("0.02% w/v", 1.0)[0] == 0.2
+    assert X.excipient_mg_per_dose("10 mg/mL", 0.5)[0] == 5.0
+    assert X.excipient_mg_per_dose("5 mg per dose", None)[0] == 5.0
+    assert X.excipient_mg_per_dose("0.02% w/v", None)[0] is None, "a concentration needs a volume"
+    print("ok  exposure: mass per dose from %w/v, mg/mL and mg per dose; no volume, no mass")
+
+    eo = [main.polymer.Impurity(name="Ethylene oxide", level="<= 1 ppm")]
+    # Every 2 weeks for a year is 27 dosing days: ICH M7 counts dosing days, so <= 1 month.
+    biweekly = X.assess(eo, X.ExposureInputs(
+        excipient_concentration="0.02% w/v", dose_volume_ml=1, dosing_interval_days=14,
+        treatment_duration_days=365))
+    assert biweekly["acceptable_intake_ug_per_day"] == 120.0, biweekly["duration_basis"]
+    row = biweekly["impurities"][0]
+    assert row["ug_per_dose"] == 0.0002 and row["status"] == "within", row
+    daily = X.assess(eo, X.ExposureInputs(
+        excipient_concentration="0.02% w/v", dose_volume_ml=1, treatment_duration_days=365))
+    assert daily["acceptable_intake_ug_per_day"] == 20.0
+    assert X.assess(eo, None)["acceptable_intake_ug_per_day"] == 1.5, "no duration must mean lifetime"
+    print("ok  exposure: biweekly for a year is 27 dosing days (120 µg/day); daily is 20; unknown is lifetime")
+
+    high = X.assess([main.polymer.Impurity(name="EO", level="1000 ppm")], X.ExposureInputs(
+        excipient_concentration="50 mg/mL", dose_volume_ml=2))
+    assert high["impurities"][0]["status"] == "above" and high["impurities"][0]["margin"] < 1, high
+    print(f"ok  exposure: 1000 ppm in 100 mg daily for life is above (margin {high['impurities'][0]['margin']})")
+
+    # System-filled, whatever the model wrote.
+    ctx = types.SimpleNamespace(deps=main.ScreenDeps(identity_calls=[ps80], exposure=biweekly))
+    d = main.enforce_precedent_evidence(
+        ctx, main.Dossier(**{**_dossier("C", "Data gap: test"), "exposure": {"made": "up"}}))
+    assert d.exposure == biweekly
+    print("ok  exposure: the dossier carries the computed margins, not the model's")
+
     # --- the evidence gate, both directions ----------------------------------
     agent = main.get_agent()
 

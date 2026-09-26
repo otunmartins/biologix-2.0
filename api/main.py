@@ -9,8 +9,8 @@ What's also real: regulatory precedent, from the FDA Inactive Ingredient
 Database and openFDA's substance registry, and the protein scan is weighted by
 solvent accessibility when a structure identifier is supplied.
 
-What's simplified: no mutagenicity model, no exposure-margin calculation, and no
-compatibility simulation. See root README.
+What's simplified: no mutagenicity model, exposure margins for residual impurities
+only (against the generic ICH M7 benchmark), and no compatibility simulation. See root README.
 
 Run standalone:
   pip install -r requirements.txt
@@ -34,6 +34,8 @@ from pydantic_ai.exceptions import UserError
 from rdkit import Chem
 
 import accessibility
+import exposure
+from exposure import ExposureInputs
 import polymer
 from polymer import PolymerSpec
 import precedent
@@ -88,6 +90,8 @@ class ScreenDeps:
     # A user-described polymer, from the request. When present, resolve_identity
     # screens this instead of the surrogate table or PubChem.
     polymer: PolymerSpec | None = None
+    # Impurity exposure margins, computed from the request before the run.
+    exposure: dict | None = None
 
     def structure_ceiling(self) -> tuple[str | None, str]:
         """(best grade any structure-derived endpoint may carry, basis).
@@ -145,6 +149,8 @@ class Dossier(BaseModel):
     # Set by the system from what resolve_identity returned, never by the model:
     # "pubchem", "polymer_description", "surrogate" or "unresolved".
     structure_basis: str = Field(default="", description="Leave empty; the system fills this in.")
+    # Likewise system-filled: the impurity exposure margins exactly as computed.
+    exposure: dict | None = Field(default=None, description="Leave null; the system fills this in.")
 
     def overclaims_precedent(self) -> list[str]:
         """Endpoints asserting precedent, which only a tool result can support."""
@@ -183,6 +189,8 @@ class ScreenRequest(BaseModel):
     # Optional structured description of a polymeric excipient. Validated here,
     # so a bad SMILES is a 422 at the door rather than a failed agent run.
     polymer: PolymerSpec | None = None
+    # Dose volume, interval and duration, for impurity exposure margins.
+    exposure: ExposureInputs | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +349,7 @@ def _fired(smiles: str) -> list[str]:
     return [a["alert"] for a in structural_alerts(smiles) if a["found"]]
 
 
-def describe_polymer(name: str, spec: PolymerSpec) -> dict:
+def describe_polymer(name: str, spec: PolymerSpec, margins: dict | None = None) -> dict:
     """Screen a user-described polymer instead of the surrogate table.
 
     A description may refine the surrogate, never silently drop an alert it
@@ -384,11 +392,19 @@ def describe_polymer(name: str, spec: PolymerSpec) -> dict:
             f"which the known {name} chemistry does. Treat the description as unreliable: cap every "
             "structure-derived endpoint at grade D and say so in the summary. " + chain["limits"]
         )
+    if margins:
+        note += (
+            " exposure gives each impurity's intake against the ICH M7 acceptable intake for this "
+            "treatment duration. Quote ug_per_dosing_day, acceptable_intake_ug_per_day and margin "
+            "verbatim, and the basis caveat with them. status 'above' means the specification allows "
+            "more than the benchmark: verdict 'Data gap: test' — lot data or a compound-specific "
+            "assessment is needed. 'not_computed' means say why, from its reason field."
+        )
     if impurities:
         note += (
             " Each resolved residual impurity was screened as its own molecule; report every one "
             "whose alerts fired, with its level quoted verbatim. The level is NOT used to scale any "
-            "severity — there is no exposure model."
+            "severity; its only use is the exposure margin, when one was computed."
         )
 
     return {
@@ -405,13 +421,14 @@ def describe_polymer(name: str, spec: PolymerSpec) -> dict:
         "description_alerts": described,
         "surrogate_check": check,
         "impurities": impurities,
+        "exposure": margins,
         "note": note,
     }
 
 
 def resolve_identity_tool(ctx: RunContext[ScreenDeps], name_or_smiles: str) -> dict:
     result = (
-        describe_polymer(name_or_smiles, ctx.deps.polymer)
+        describe_polymer(name_or_smiles, ctx.deps.polymer, ctx.deps.exposure)
         if ctx.deps.polymer
         else resolve_identity(name_or_smiles)
     )
@@ -815,9 +832,9 @@ rejected as incomplete.
 
 Within that budget, the summary must always say: precedent here comes from FDA records that an
 excipient has appeared in an approved product at a route and potency, which is not a finding about
-THIS protein at the user's concentration; and there is still no protein-compatibility simulation
-and no exposure-margin calculation. Precedent plus structural alerts is a triage, not a safety
-assessment.
+THIS protein at the user's concentration; and there is still no protein-compatibility simulation.
+Exposure margins, when present, cover residual impurities only, against a generic ICH M7 benchmark —
+never the excipient itself. Precedent plus structural alerts is a triage, not a safety assessment.
 """
 
 _agent: Agent | None = None
@@ -890,8 +907,9 @@ def enforce_precedent_evidence(ctx: RunContext[ScreenDeps], dossier: Dossier) ->
                 f"{basis!r} structure. Only the endpoint named 'Regulatory precedent, <route>' is "
                 f"exempt, because precedent is a name lookup. Regrade these to {ceiling} or below."
             )
-    # Set from the tool record, whatever the model wrote.
+    # Set from the tool record and the request, whatever the model wrote.
     dossier.structure_basis = basis
+    dossier.exposure = ctx.deps.exposure
     return dossier
 
 
@@ -943,7 +961,12 @@ async def screen(req: ScreenRequest):
     try:
         # Fresh deps per request: the evidence gate must not see what a previous
         # screen's precedent lookup returned.
-        result = await agent.run(prompt, deps=ScreenDeps(polymer=req.polymer))
+        deps = ScreenDeps(polymer=req.polymer)
+        if req.polymer and req.polymer.impurities:
+            # Before the run, from the request alone: the model reports these
+            # numbers and has no way to change them.
+            deps.exposure = exposure.assess(req.polymer.impurities, req.exposure)
+        result = await agent.run(prompt, deps=deps)
     except Exception as e:
         # The agent run is the only call here that leaves the box; surface the
         # failure as a 502 so the frontend can show something more useful than 500.

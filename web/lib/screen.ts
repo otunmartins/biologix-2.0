@@ -3,6 +3,7 @@ import type {
   EndpointResult,
   Grade,
   LiabilityFlag,
+  ExposureInputs,
   PolymerSpec,
   Severity,
   Verdict,
@@ -70,6 +71,43 @@ export interface ScreenForm {
   concentration: string;
   temp: string;
   polymer: PolymerForm;
+  // Dosing, for impurity exposure margins. Strings, as typed.
+  doseVolume: string;
+  intervalDays: string;
+  durationDays: string; // '' = not given, assessed as lifetime
+}
+
+export const INTERVALS: [string, string][] = [
+  ['1', 'Daily'],
+  ['7', 'Weekly'],
+  ['14', 'Every 2 weeks'],
+  ['28', 'Every 4 weeks'],
+];
+
+export const DURATIONS: [string, string][] = [
+  ['1', 'Single dose'],
+  ['30', '1 month'],
+  ['365', '1 year'],
+  ['3650', '10 years'],
+  ['', 'Lifetime / unknown'],
+];
+
+// Exposure margins are only computed for residual impurities with a level to
+// assess, so the dosing fields only appear when there is one.
+export function hasImpurities(f: ScreenForm): boolean {
+  return f.polymer.enabled && f.polymer.impurities.some((i) => i.name.trim());
+}
+
+export function toExposureInputs(f: ScreenForm): ExposureInputs | null {
+  if (!hasImpurities(f)) return null;
+  const vol = parseFloat(f.doseVolume);
+  const duration = parseFloat(f.durationDays);
+  return {
+    excipient_concentration: f.concentration.trim(),
+    dose_volume_ml: Number.isFinite(vol) && vol > 0 ? vol : null,
+    dosing_interval_days: parseFloat(f.intervalDays) || 1,
+    treatment_duration_days: Number.isFinite(duration) && duration > 0 ? duration : null,
+  };
 }
 
 // Starting points only: the chemistry is standard, the DP is a typical grade.
@@ -151,6 +189,9 @@ export const DEFAULT_FORM: ScreenForm = {
   dose: '100',
   concentration: '',
   temp: '25°C (room temp)',
+  doseVolume: '1',
+  intervalDays: '14',
+  durationDays: '',
   polymer: presetPolymer('ps80', {
     enabled: false,
     repeatUnit: '',
@@ -192,7 +233,11 @@ export function buildPrompt(f: ScreenForm): string {
     `Protein structure identifier: ${f.structureId.trim() || 'none'}.` +
     // The description itself travels as structured data; this only tells the
     // agent to expect it.
-    (f.polymer.enabled ? ' A structured polymer description was supplied with this request.' : '')
+    (f.polymer.enabled ? ' A structured polymer description was supplied with this request.' : '') +
+    (hasImpurities(f)
+      ? ` Dosing for impurity exposure: ${f.doseVolume || 'unknown'} mL per dose, every ` +
+        `${f.intervalDays} day(s), for ${f.durationDays ? `${f.durationDays} day(s)` : 'an unknown duration'}.`
+      : '')
   );
 }
 

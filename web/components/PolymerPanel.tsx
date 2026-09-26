@@ -193,7 +193,7 @@ export default function PolymerPanel({ excipient, value: p, onChange }: Props) {
 
       <p className="text-xs leading-relaxed text-slate-500">
         Structural findings on a described chain can reach grade C. Polydispersity and branching are not
-        modelled, and an impurity&rsquo;s level is reported, not used to scale severity.
+        modelled. An impurity&rsquo;s level feeds its exposure margin; it never changes a severity.
       </p>
     </div>
   );
