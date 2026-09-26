@@ -1,9 +1,11 @@
 import { signInWithGoogle } from '@/app/actions';
 import { Molecule, Triangle } from '@/components/icons';
+import PasswordForm from '@/components/PasswordForm';
 
 // Auth.js reports why a sign-in failed as ?error=<code>. Only the ones a user can
 // act on get their own wording; anything else is a configuration problem.
 const ERRORS: Record<string, string> = {
+  // Rare now that Google links to a matching password account (auth.ts).
   OAuthAccountNotLinked: 'That email is already signed in with a different method.',
   AccessDenied: 'Sign-in was cancelled or refused.',
   Verification: 'That sign-in link has expired. Try again.',
@@ -22,7 +24,7 @@ function GoogleMark() {
 
 export default function SignIn({ error }: { error?: string }) {
   return (
-    <main className="grid min-h-screen place-items-center bg-slate-50 px-6">
+    <main className="grid min-h-screen place-items-center bg-slate-50 px-6 py-12">
       <div className="w-full max-w-sm">
         <div className="flex items-center gap-2.5">
           <span className="grid h-8 w-8 place-items-center rounded-lg bg-slate-900 text-white">
@@ -52,6 +54,14 @@ export default function SignIn({ error }: { error?: string }) {
             Continue with Google
           </button>
         </form>
+
+        <div className="my-6 flex items-center gap-3 text-xs font-medium uppercase tracking-[0.12em] text-slate-400">
+          <span className="h-px flex-1 bg-slate-200" />
+          or
+          <span className="h-px flex-1 bg-slate-200" />
+        </div>
+
+        <PasswordForm />
       </div>
     </main>
   );

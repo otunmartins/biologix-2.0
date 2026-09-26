@@ -1,5 +1,7 @@
-"""Who is asking. Sign-in happens in the web app (Auth.js, Google); this module
-only answers "which user does this request belong to?" for the API.
+"""Who is asking. Sign-in happens in the web app (Auth.js for Google, and its
+own email-and-password path); this module only answers "which user does this
+request belong to?" for the API. Both ways in end in the same `sessions` row and
+cookie, so nothing here knows or cares which one a user took.
 
 HOW THE TWO HALVES MEET. Auth.js runs with database sessions through
 @auth/pg-adapter, so a signed-in browser carries a cookie holding a random session
@@ -66,6 +68,16 @@ CREATE TABLE IF NOT EXISTS verification_token (
     expires    TIMESTAMPTZ NOT NULL,
     token      TEXT NOT NULL,
     PRIMARY KEY (identifier, token)
+);
+
+-- Email-and-password sign-in (web/lib/password-auth.ts). A table of its own
+-- rather than a column on users: the adapter does SELECT * FROM users and hands
+-- the row to Auth.js, and a password hash has no business travelling there.
+CREATE TABLE IF NOT EXISTS passwords (
+    user_id    INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    hash       TEXT NOT NULL,          -- scrypt$N$r$p$salt$key, see web/lib/passwords.ts
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
 

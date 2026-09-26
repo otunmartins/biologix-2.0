@@ -61,14 +61,29 @@ expired copy on disk if there is one).
 
 ## Sign-in
 
-Everyone signs in with Google (Auth.js, `web/auth.ts`). Anyone with a Google account can sign
-up; each user sees only their own campaigns and queue. `/health` is the only thing open without
-signing in.
+Two ways in, on one page: **Google** (Auth.js, `web/auth.ts`) and **email and password**
+(`web/lib/password-auth.ts`). Anyone can sign up either way; each user sees only their own
+campaigns and queue. `/health` is the only thing open without signing in.
 
 Sessions are rows in the `sessions` table of the same Postgres the API uses. The browser holds
 only a random token, and the API checks it against that table on every request
 (`api/users.py`), so signing out takes effect everywhere at once. The API creates the
 sign-in tables when it starts.
+
+Password sign-in is not an Auth.js provider: Auth.js's credentials provider always issues a JWT
+cookie, which the API cannot check. Instead it verifies the password (scrypt, from Node's
+crypto) and writes the same session row and cookie a Google sign-in gets, so nothing
+downstream can tell them apart. Wrong guesses are limited per email and per address, and an
+unknown email gets the same answer, in the same time, as a wrong password.
+
+**There is no email verification yet** (no mail service), so a password account does not prove
+its owner has that inbox. Two rules follow: an email that already has an account cannot be
+registered again, so nobody can put a password on your Google account; and signing in with
+Google to an email that has a password links to that account and **removes the password**,
+because Google has proved who owns the address and the password may have been set by someone
+else. There is no "forgot password" either: if the address is also a Google account, signing in with
+Google gets you back in; otherwise the password has to be reset by hand in the database.
+Both need a mail service (e.g. Resend) to lift.
 
 **Google credentials** (one time, about five minutes):
 

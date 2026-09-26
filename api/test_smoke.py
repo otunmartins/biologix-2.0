@@ -41,7 +41,7 @@ def fresh_store(module):
         # CASCADE and the order together: candidate references campaign,
         # measurement references biologic, campaign and sessions reference users.
         conn.execute("DROP TABLE IF EXISTS candidate, iteration, campaign, "
-                     "measurement, biologic, sessions, accounts, verification_token, "
+                     "measurement, biologic, passwords, sessions, accounts, verification_token, "
                      "users CASCADE")
     main.db.reset_schema_cache()
     conn.close()
