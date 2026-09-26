@@ -57,6 +57,12 @@ jobs:
             # .env lives on the box and is NOT in the repo - never overwrite it.
             test -f .env || { echo "::error::no .env on the instance; deploy aborted"; exit 1; }
 
+            # Campaigns and measurements live in Postgres. Checked before the reset
+            # so a box without it keeps running the old build instead of a new one
+            # that answers /health and fails every design iteration.
+            grep -qE '^DATABASE_URL=.+' .env \
+              || { echo "::error::DATABASE_URL missing from .env on the instance; deploy aborted"; exit 1; }
+
             git fetch --prune origin
             git reset --hard origin/main
 
@@ -79,6 +85,11 @@ jobs:
               # which is a broken deploy that a plain health check calls healthy.
               grep -q '"model_configured":true' health.json \
                 || { echo "::error::API is up but ANTHROPIC_API_KEY is not configured"; exit 1; }
+              # Same trap with the database: a URL that is set but wrong (the
+              # direct string instead of the pooled one, a dead Neon branch)
+              # still answers 200 here.
+              grep -q '"database":{"reachable":true}' health.json \
+                || { echo "::error::API is up but cannot reach Postgres (see database in /health)"; exit 1; }
               echo "::notice::deploy verified"
               exit 0
             fi
