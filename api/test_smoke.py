@@ -718,8 +718,76 @@ def main_test():
     print(f"ok  m-value: same engine on an unrelated structure ({other['n_residues']} residues), "
           "output JSON-safe")
 
+    # --- biologic profile -----------------------------------------------------
+    PR, D = main.profile, main.design
+
+    INSULIN = "GIVEQCCTSICSLYQLENYCNFVNQHLCGSHLVEALYLVCGERGFFYTPKT"
+    LYSOZYME = ("KVFGRCELAAAMKRHGLDNYRGYSLGNWVCAAKFESNFNTQATNRNTDGSTDYGILQINSRWWCNDGRTPGSRN"
+                "LCNIPCSALLSSDVSDDIMCAKKILDKVGINYWLAHKALCSEKLDQWLCEKL")
+
+    # Different molecules must profile differently; that is the whole point.
+    ins = PR.profile(sequence=INSULIN, ph=7.0)["from_sequence"]
+    lys = PR.profile(sequence=LYSOZYME, ph=6.0)["from_sequence"]
+    assert ins["net_charge_at_ph"] < 0 < lys["net_charge_at_ph"], (ins, lys)
+    assert abs(ins["isoelectric_point"] - 5.4) < 0.5, ins["isoelectric_point"]
+    assert abs(lys["isoelectric_point"] - 8.5) < 0.5, lys["isoelectric_point"]
+    # Opposite net charges must produce opposite constraints.
+    ins_c = " ".join(c["constraint"] for c in PR.profile(sequence=INSULIN, ph=7.0)["constraints"])
+    lys_c = " ".join(c["constraint"] for c in PR.profile(sequence=LYSOZYME, ph=6.0)["constraints"])
+    assert "cationic" in ins_c and "anionic" in lys_c, (ins_c, lys_c)
+    print(f"ok  profile: insulin pI {ins['isoelectric_point']} ({ins['net_charge_at_ph']:+}) rules out "
+          f"cationic; lysozyme pI {lys['isoelectric_point']} ({lys['net_charge_at_ph']:+}) rules out anionic")
+
+    # A structure decides which liabilities are real. Lysozyme's Met is buried.
+    structured = PR.profile(structure_id="1LYZ", ph=6.0)
+    assert "Met" not in structured["exposed_residues"], structured["exposed_residues"]
+    assert "Lys" in structured["exposed_residues"]
+    # Without a structure it must be pessimistic, never permissive: assuming
+    # burial would quietly clear hazards that were simply not modelled.
+    seq_only = PR.profile(sequence=LYSOZYME, ph=6.0)
+    assert set(structured["exposed_residues"]) < set(seq_only["exposed_residues"])
+    assert any("pessimistic" in l for l in seq_only["limits"])
+    print(f"ok  profile: 1LYZ exposure narrows liabilities to {structured['exposed_residues']}; "
+          "sequence alone stays pessimistic")
+
+    # Nothing supplied must be reported, not silently treated as a clean protein.
+    blank = PR.profile()
+    assert blank["from_sequence"] is None and blank["exposed_residues"] == []
+    assert "nothing could be computed" in blank["limits"][0]
+
+    # The profile must actually change the ranking, and do it symmetrically:
+    # an anionic pendant is as wrong for a +ve protein as a cationic one is for
+    # a -ve protein, so the penalties must mirror rather than merely both exist.
+    def best_ionic(q):
+        rows = D.design(D.DesignGoal(target_temp_c=25, net_charge=q, ph=6.0), limit=60)["candidates"]
+        pick = lambda kind: next(c for c in rows if c["charge"] == kind)
+        return pick("anionic"), pick("cationic")
+
+    a_none, c_none = best_ionic(None)
+    a_pos, c_pos = best_ionic(+4.2)
+    a_neg, c_neg = best_ionic(-4.2)
+    assert a_pos["score"] < c_pos["score"], "anionic must cost more against a +ve protein"
+    assert c_neg["score"] < a_neg["score"], "cationic must cost more against a -ve protein"
+    assert (a_pos["score"], c_pos["score"]) == (c_neg["score"], a_neg["score"]),         "the charge penalty must be symmetric in the sign of the protein's charge"
+    # An unknown charge must sit between the two: penalised, but not condemned.
+    assert a_pos["score"] < a_none["score"] < a_neg["score"], "unknown charge must hedge"
+    assert any("complexation" in r for r in a_pos["risks"]), a_pos["risks"]
+    print(f"ok  profile: charge drives scoring — anionic {a_pos['score']} vs cationic "
+          f"{c_pos['score']} against a +ve protein, mirrored for a -ve one, "
+          f"{a_none['score']} when unknown")
+
+    # Buried liabilities must cost less than exposed ones.
+    def peg_score(exposed):
+        g = D.DesignGoal(target_temp_c=25, exposed_residues=exposed, net_charge=4.2, ph=6.0)
+        return [c for c in D.design(g, limit=60)["candidates"]
+                if "Oligo(ethylene" in c["pendant"]][0]["score"]
+    assert peg_score(structured["exposed_residues"]) > peg_score(seq_only["exposed_residues"])
+    print("ok  profile: a buried Met lowers the polyether penalty; an exposed one raises it")
+
     # --- polymer designer -----------------------------------------------------
     D = main.design
+    # Sized from the table so adding a motif cannot quietly shrink coverage.
+    ALL_PAIRS = len(D.BACKBONES) * len(D.PENDANTS)
 
     built = {(b.key, p.key): D.build_chain(b, p) for b in D.BACKBONES for p in D.PENDANTS}
     unbuilt = [k for k, v in built.items() if not v]
@@ -738,7 +806,7 @@ def main_test():
         assert reducing is should_fire, f"{pendant_key}: reducing={reducing}, expected {should_fire}"
     print("ok  designer: glucose reads as reducing, trehalose and sucrose do not (6-O linked)")
 
-    liquid = D.design(D.DesignGoal(target_temp_c=25, format="liquid"), limit=40)
+    liquid = D.design(D.DesignGoal(target_temp_c=25, format="liquid"), limit=ALL_PAIRS)
     ranks = {c["name"]: c["rank"] for c in liquid["candidates"]}
     worst = [c for c in liquid["candidates"] if any("Reducing" in a for a in c["alerts_fired"])]
     assert worst and min(c["rank"] for c in worst) > len(liquid["candidates"]) * 0.6, \
@@ -750,26 +818,26 @@ def main_test():
 
     # Vitrification only applies to a dried product, and only a backbone whose
     # Tg clears the storage temperature can hold the protein in a glass.
-    lyo = D.design(D.DesignGoal(target_temp_c=25, format="lyophilised"), limit=40)["candidates"]
+    lyo = D.design(D.DesignGoal(target_temp_c=25, format="lyophilised"), limit=ALL_PAIRS)["candidates"]
     top_tg = lyo[0]["backbone_tg_c"]
     assert top_tg and top_tg >= 75, f"a low-Tg backbone won a lyophilised goal: {lyo[0]['name']}"
     assert lyo[0]["backbone_tg_c"] == max(c["backbone_tg_c"] or 0 for c in lyo), \
         "the highest-Tg backbone did not win a lyophilised goal"
     # A backbone with little headroom over the storage temperature must say so:
     # residual moisture plasticises a real cake by tens of degrees.
-    hot = D.design(D.DesignGoal(target_temp_c=40, format="lyophilised"), limit=40)["candidates"]
+    hot = D.design(D.DesignGoal(target_temp_c=40, format="lyophilised"), limit=ALL_PAIRS)["candidates"]
     low = next(c for c in hot if (c["backbone_tg_c"] or 0) < 60)
     assert any("plasticise" in r or "not be a glass" in r for r in low["risks"]), low["risks"]
     # Vitrification is a dried-product mechanism: a liquid formulation must not
     # be judged on the glass transition at all.
-    for c in D.design(D.DesignGoal(target_temp_c=25, format="liquid"), limit=40)["candidates"]:
+    for c in D.design(D.DesignGoal(target_temp_c=25, format="liquid"), limit=ALL_PAIRS)["candidates"]:
         assert not any("glass" in r or "plasticise" in r for r in c["risks"]), (c["name"], c["risks"])
     print(f"ok  designer: dried goal favours the highest Tg ({top_tg} C); a 55 C backbone is "
           "warned about at 40 C")
 
     # A protein that exposes the residue an alert attacks makes that alert cost more.
-    plain = D.design(D.DesignGoal(target_temp_c=25), limit=40)["candidates"]
-    met = D.design(D.DesignGoal(target_temp_c=25, exposed_residues=["Met"]), limit=40)["candidates"]
+    plain = D.design(D.DesignGoal(target_temp_c=25), limit=ALL_PAIRS)["candidates"]
+    met = D.design(D.DesignGoal(target_temp_c=25, exposed_residues=["Met"]), limit=ALL_PAIRS)["candidates"]
     def peg_on_vinyl(rows):
         return next(c for c in rows if "Oligo(ethylene glycol)" in c["pendant"]
                     and c["backbone"].startswith("Poly(vinyl)"))

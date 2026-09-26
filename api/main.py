@@ -44,6 +44,7 @@ from exposure import ExposureInputs
 import polymer
 from polymer import PolymerSpec
 import precedent
+import profile
 
 # ---------------------------------------------------------------------------
 # Output schema

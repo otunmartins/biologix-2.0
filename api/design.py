@@ -157,6 +157,22 @@ PENDANTS = [
             "neutral",
             "Polyether chain autoxidises to peroxides on storage, oxidising Met and Trp. "
             "The liability that matters most for extended storage above 2-8 C.", -0.5),
+    Pendant("carboxylate", "Carboxylate (anionic)",
+            "CCC(=O)[O-]",
+            "Polyanions are used deliberately with net-positive proteins to form complexes, and "
+            "they hydrate well. Whether that is stabilisation or complexation depends entirely "
+            "on the protein's charge, which is why this motif is only judged once the charge "
+            "is known.",
+            "anionic",
+            "Binds a net-positive protein electrostatically; that is complexation, and it "
+            "changes the conformational equilibrium rather than merely protecting it."),
+    Pendant("quaternary_ammonium", "Quaternary ammonium (cationic)",
+            "CCC[N+](C)(C)C",
+            "Polycations bind net-negative proteins and are common in delivery formulations.",
+            "cationic",
+            "Binds a net-negative protein electrostatically, and quaternary ammonium surfactant "
+            "motifs carry their own membrane-lytic and tolerability concerns at a parenteral "
+            "route."),
     Pendant("proline", "Proline-like tertiary amide",
             "CC(=O)N1CCCC1",
             "Proline suppresses aggregation and is a known solution stabiliser; the "
@@ -181,6 +197,12 @@ class DesignGoal(BaseModel):
     format: str = Field(default="liquid", pattern="^(liquid|lyophilised)$")
     # Residues the protein actually exposes, from the liability scan if it ran.
     exposed_residues: list[str] = Field(default_factory=list)
+    # Net charge of the biologic at the formulation pH, from profile.py. Decides
+    # which ionic pendants are chemically wrong rather than merely unhelpful:
+    # a polyanion binds a net-positive protein, which is complexation, not
+    # stabilisation. None means unknown, and no charge rule is applied.
+    net_charge: float | None = None
+    ph: float | None = None
     notes: str = Field(default="", max_length=1000)
 
 
@@ -283,15 +305,32 @@ def score(cand: Candidate, goal: DesignGoal) -> Candidate:
         risks.append(f"lipophilic for a stabiliser (cLogP {d['clogp']}); may adsorb to the "
                      "protein rather than being excluded from it")
 
-    # --- zwitterionic hydration --------------------------------------------
+    # --- charge: zwitterions hydrate, opposite charges complex --------------
     if cand.pendant.charge == "zwitterion":
         total += 2.0
         reasons.append("zwitterionic: binds water strongly while carrying no net charge, so "
                        "it suppresses aggregation without electrostatic binding to the protein")
     elif cand.pendant.charge in ("anionic", "cationic"):
-        total -= 1.5
-        risks.append(f"net {cand.pendant.charge} — may bind the protein electrostatically and "
-                     "alter its conformational equilibrium")
+        q = goal.net_charge
+        opposite = (q is not None and
+                    ((q > 1 and cand.pendant.charge == "anionic") or
+                     (q < -1 and cand.pendant.charge == "cationic")))
+        if opposite:
+            # Known to be wrong for THIS protein, not merely unhelpful.
+            total -= 4.0
+            risks.append(
+                f"{cand.pendant.charge} against a protein carrying {q:+.1f} net charge at "
+                f"pH {goal.ph:g}: it would bind electrostatically, which is complexation "
+                "rather than stabilisation")
+        elif q is None:
+            total -= 1.5
+            risks.append(f"net {cand.pendant.charge} — may bind the protein electrostatically; "
+                         "the protein's charge was not supplied, so this could not be checked")
+        else:
+            total -= 0.5
+            risks.append(f"net {cand.pendant.charge}, same sign as the protein ({q:+.1f}), so "
+                         "electrostatic binding is unlikely, but the charge still perturbs the "
+                         "local ionic environment")
 
     # --- vitrification, only for a dried product ---------------------------
     tg = cand.backbone.tg_c
