@@ -81,16 +81,30 @@ def _labelled(smiles: str, labels: list[int]) -> Chem.Mol:
     return mol
 
 
-def build(spec: PolymerSpec, n: int) -> Chem.Mol:
-    """end_a-(repeat)n-end_b, joined head to tail with molzip."""
-    combined = _labelled(spec.end_group_a, [1])
-    for i in range(n):
-        combined = Chem.CombineMols(combined, _labelled(spec.repeat_unit, [i + 1, i + 2]))
-    combined = Chem.CombineMols(combined, _labelled(spec.end_group_b, [n + 1]))
+def build_sequence(units: list[str], end_group_a: str = "[*][H]",
+                   end_group_b: str = "[*][H]") -> Chem.Mol:
+    """end_a-(unit_0)(unit_1)...(unit_k)-end_b, joined head to tail with molzip.
+
+    Each entry in units is a repeat-unit SMILES with exactly two [*]. A copolymer
+    is just a chain whose units are not all the same string, so this is the general
+    case build() specialises. Alerts are substructure-presence tests, so which units
+    appear (not how many times) is what fires them — see design.build_copolymer_chain.
+    """
+    if not units:
+        raise ValueError("build_sequence needs at least one repeat unit")
+    combined = _labelled(end_group_a, [1])
+    for i, unit in enumerate(units):
+        combined = Chem.CombineMols(combined, _labelled(unit, [i + 1, i + 2]))
+    combined = Chem.CombineMols(combined, _labelled(end_group_b, [len(units) + 1]))
     mol = Chem.molzip(combined)
     mol = Chem.RemoveHs(mol)
     Chem.SanitizeMol(mol)
     return mol
+
+
+def build(spec: PolymerSpec, n: int) -> Chem.Mol:
+    """end_a-(repeat)n-end_b, joined head to tail with molzip."""
+    return build_sequence([spec.repeat_unit] * n, spec.end_group_a, spec.end_group_b)
 
 
 def describe(spec: PolymerSpec) -> dict:

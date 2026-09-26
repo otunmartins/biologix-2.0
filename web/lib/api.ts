@@ -102,7 +102,16 @@ export interface Candidate {
   repeat_unit_smiles: string;
   screened_oligomer_smiles: string;
   screened_units: number;
+  // backbone_tg_c is the bare backbone's handbook value, reference only. tg_c is
+  // the Tg for this repeat unit, predicted where the model could see it, and
+  // tg_judged_c is the lower bound the screen actually scored.
   backbone_tg_c: number | null;
+  tg_c: number | null;
+  tg_source: string | null;
+  tg_judged_c: number | null;
+  tg_model_spread_sd: number | null;
+  tg_in_model_domain: boolean | null;
+  tg_note: string;
   charge: string;
   score: number;
   mechanism: string;
@@ -120,6 +129,79 @@ export interface DesignResult {
   candidates: Candidate[];
   n_motif_pairs_considered: number;
   limits: string;
+  verdict: string;
+  max_grade: string;
+}
+
+// ---- active-learning campaigns (mirrors api/active.py, candidates.py) ------
+
+export type CandidateStatus =
+  | 'proposed'
+  | 'benchmarked'
+  | 'queued'
+  | 'simulating'
+  | 'simulated'
+  | 'failed';
+
+export interface CompositionPart {
+  pendant: string;
+  fraction: number;
+  repeat_unit_smiles: string;
+  charge: string;
+}
+
+// A Candidate as stored in a campaign: the design fields plus what only the store
+// knows. `composition` breaks a copolymer into its weighted motifs.
+export interface StoredCandidate extends Candidate {
+  id: string;
+  iteration: number;
+  status: CandidateStatus;
+  composition: CompositionPart[];
+}
+
+export interface IterationMetrics {
+  iteration?: number;
+  batch_size: number;
+  best_score_so_far: number | null;
+  batch_mean_score: number | null;
+  batch_diversity: number | null;
+  // Cross-validated error of the surrogate against the triage proxy — the loop's
+  // own learning curve. Null until there are enough points to fold.
+  surrogate_cv_mae: number | null;
+  frac_alert_free: number | null;
+  n_total: number;
+  seeded: boolean;
+}
+
+// The advisory campaign controller's read of where the run stands.
+export interface Recommendation {
+  action: 'continue' | 'stop';
+  phase: 'seed' | 'explore' | 'exploit' | 'converged';
+  suggest_queue: boolean;
+  top_k_to_queue?: number;
+  reason: string;
+}
+
+export interface QueueSummary {
+  n_queued: number;
+  n_benchmarked: number;
+  n_simulated: number;
+  by_status: Record<string, number>;
+  top: { id: string; name: string; score: number }[];
+  note: string;
+}
+
+export interface IterateResult {
+  campaign_id: string;
+  iteration: number;
+  goal: DesignGoal;
+  candidates: StoredCandidate[];
+  metrics: IterationMetrics;
+  metrics_history: IterationMetrics[];
+  recommendation: Recommendation;
+  queue_summary: QueueSummary;
+  limits: string;
+  orchestration: string;
   verdict: string;
   max_grade: string;
 }
@@ -167,6 +249,50 @@ export async function runDesign(
           : '';
     throw new Error(detail || `Server returned ${res.status}`);
   }
+  return res.json();
+}
+
+// One active-learning iteration. Pass a campaignId to continue a run, else a
+// prompt/goal starts a fresh campaign.
+export async function iterateDesign(
+  args: { campaignId?: string; prompt?: string; goal?: DesignGoal; batchSize?: number },
+  signal?: AbortSignal,
+): Promise<IterateResult> {
+  const res = await fetch(`${API_URL}/design/iterate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ...(args.campaignId ? { campaign_id: args.campaignId } : {}),
+      ...(args.prompt ? { prompt: args.prompt } : {}),
+      ...(args.goal ? { goal: args.goal } : {}),
+      batch_size: args.batchSize ?? 8,
+    }),
+    signal,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    const detail =
+      typeof body?.detail === 'string'
+        ? body.detail
+        : Array.isArray(body?.detail)
+          ? (body.detail as ValidationIssue[]).map((d) => d.msg).join('; ')
+          : '';
+    throw new Error(detail || `Server returned ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function queueCandidates(
+  candidateIds: string[],
+  signal?: AbortSignal,
+): Promise<{ queued: number; queue_summary: QueueSummary }> {
+  const res = await fetch(`${API_URL}/design/queue`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ candidate_ids: candidateIds }),
+    signal,
+  });
+  if (!res.ok) throw new Error(`Server returned ${res.status}`);
   return res.json();
 }
 

@@ -1,18 +1,23 @@
 'use client';
 
 import { useState } from 'react';
-import type { Candidate, DesignResult } from '@/lib/api';
+import type { CandidateStatus, DesignGoal, StoredCandidate } from '@/lib/api';
 import { GradeBox } from './badges';
 import { CheckCircle, Chevron, Flask, Info, Triangle } from './icons';
 
 interface Props {
-  result: DesignResult;
+  goal: DesignGoal;
+  candidates: StoredCandidate[];
+  limits: string;
+  verdict: string;
   // Hands the candidate to the screening form, which is what actually judges it.
-  onScreen: (c: Candidate) => void;
+  onScreen: (c: StoredCandidate) => void;
+  // Sends the candidate to the OpenMM simulation backlog.
+  onQueue: (c: StoredCandidate) => void;
+  queueing: string | null;
 }
 
-function GoalChips({ result: r }: { result: DesignResult }) {
-  const g = r.goal;
+function GoalChips({ goal: g }: { goal: DesignGoal }) {
   const chips = [
     g.protein,
     g.route,
@@ -35,9 +40,41 @@ function GoalChips({ result: r }: { result: DesignResult }) {
   );
 }
 
-function CandidateCard({ c, onScreen }: { c: Candidate; onScreen: () => void }) {
-  const [open, setOpen] = useState(c.rank === 1);
+const STATUS_STYLE: Record<CandidateStatus, [string, string]> = {
+  proposed: ['border-slate-200 bg-slate-100 text-slate-500', 'proposed'],
+  benchmarked: ['border-slate-200 bg-slate-100 text-slate-600', 'benchmarked'],
+  queued: ['border-supported-line bg-supported-soft text-supported', 'queued'],
+  simulating: ['border-supported-line bg-supported-soft text-supported', 'simulating'],
+  simulated: ['border-precedented-line bg-precedented-soft text-precedented', 'simulated'],
+  failed: ['border-alert-line bg-alert-soft text-alert', 'failed'],
+};
+
+function StatusBadge({ status }: { status: CandidateStatus }) {
+  const [cls, label] = STATUS_STYLE[status];
+  return (
+    <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${cls}`}>
+      {label}
+    </span>
+  );
+}
+
+function CandidateCard({
+  c,
+  defaultOpen,
+  onScreen,
+  onQueue,
+  queueing,
+}: {
+  c: StoredCandidate;
+  defaultOpen: boolean;
+  onScreen: () => void;
+  onQueue: () => void;
+  queueing: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
   const clean = c.alerts_fired.length === 0;
+  const isCopolymer = c.composition.length > 1;
+  const queued = c.status !== 'benchmarked';
 
   return (
     <li className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-card">
@@ -48,14 +85,19 @@ function CandidateCard({ c, onScreen }: { c: Candidate; onScreen: () => void }) 
         className="flex w-full items-start gap-3 px-5 py-4 text-left transition hover:bg-slate-50"
       >
         <Chevron className={`mt-1 h-5 w-5 shrink-0 text-slate-400 transition-transform ${open ? 'rotate-90' : ''}`} />
-        <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-slate-900 text-xs font-semibold text-white">
-          {c.rank}
-        </span>
         <span className="min-w-0 flex-1">
-          <span className="block font-semibold text-slate-900">{c.name}</span>
+          <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="font-semibold text-slate-900">{c.name}</span>
+            <StatusBadge status={c.status} />
+          </span>
           <span className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-slate-500">
             <span>triage score {c.score}</span>
-            {c.backbone_tg_c !== null && <span>Tg ≈ {c.backbone_tg_c} °C</span>}
+            {c.tg_c !== null && (
+              <span title={c.tg_note}>
+                Tg ≈ {c.tg_c} °C
+                {c.tg_in_model_domain === false && ' (extrapolated)'}
+              </span>
+            )}
             {c.charge !== 'neutral' && <span>{c.charge}</span>}
             <span className={clean ? 'text-precedented' : 'text-alert'}>
               {clean ? 'no alerts' : `${c.alerts_fired.length} alert${c.alerts_fired.length === 1 ? '' : 's'}`}
@@ -66,8 +108,24 @@ function CandidateCard({ c, onScreen }: { c: Candidate; onScreen: () => void }) 
       </button>
 
       {open && (
-        <div className="space-y-4 border-t border-slate-200 px-5 py-4 md:pl-[4.25rem]">
+        <div className="space-y-4 border-t border-slate-200 px-5 py-4 md:pl-[3.25rem]">
           <p className="text-[15px] leading-relaxed text-slate-700">{c.mechanism}</p>
+
+          {isCopolymer && (
+            <div>
+              <div className="eyebrow mb-1.5">Composition</div>
+              <div className="flex flex-wrap gap-1.5">
+                {c.composition.map((p) => (
+                  <span
+                    key={p.pendant}
+                    className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[13px] text-slate-600"
+                  >
+                    {p.pendant.split(' (')[0]} · {Math.round(p.fraction * 100)}%
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
 
           {c.supports.length > 0 && (
             <ul className="space-y-1.5">
@@ -91,18 +149,12 @@ function CandidateCard({ c, onScreen }: { c: Candidate; onScreen: () => void }) 
             </ul>
           )}
 
-          <div>
-            <div className="eyebrow mb-1.5">Structure screened</div>
-            <div className="space-y-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-              <div className="break-all font-mono text-[12px] text-slate-700">
-                repeat unit: {c.repeat_unit_smiles}
-              </div>
-              <div className="text-xs text-slate-500">
-                screened as a {c.screened_units}-unit chain · MW {c.descriptors.mw} · cLogP{' '}
-                {c.descriptors.clogp} · TPSA {c.descriptors.tpsa} · {c.descriptors.hydroxyls} OH
-              </div>
+          {c.tg_note && (
+            <div>
+              <div className="eyebrow mb-1.5">Glass transition</div>
+              <p className="text-sm leading-relaxed text-slate-600">{c.tg_note}</p>
             </div>
-          </div>
+          )}
 
           <div>
             <div className="eyebrow mb-1.5 flex items-center gap-1.5">
@@ -118,49 +170,92 @@ function CandidateCard({ c, onScreen }: { c: Candidate; onScreen: () => void }) 
             </ul>
           </div>
 
-          <button type="button" className="btn-ghost" onClick={onScreen}>
-            Screen this candidate →
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" className="btn-ghost" onClick={onScreen}>
+              Screen this candidate →
+            </button>
+            <button
+              type="button"
+              className="btn-ghost"
+              onClick={onQueue}
+              disabled={queued || queueing}
+            >
+              {queued ? 'Queued for simulation ✓' : queueing ? 'Queuing…' : 'Queue for simulation'}
+            </button>
+          </div>
         </div>
       )}
     </li>
   );
 }
 
-export default function DesignResults({ result, onScreen }: Props) {
+export default function DesignResults({
+  goal,
+  candidates,
+  limits,
+  verdict,
+  onScreen,
+  onQueue,
+  queueing,
+}: Props) {
+  // Newest iteration first; within an iteration, highest score first.
+  const iterations = Array.from(new Set(candidates.map((c) => c.iteration))).sort((a, b) => b - a);
+  const topId = candidates.find((c) => c.iteration === iterations[0])?.id;
+
   return (
     <div className="space-y-6 px-6 py-7 lg:px-10">
       <header>
         <div className="eyebrow">Candidate polymers</div>
         <h1 className="mt-1.5 text-2xl font-semibold tracking-tight text-slate-900 sm:text-[28px]">
-          {result.candidates.length} candidates for laboratory triage
+          {candidates.length} candidates screened
         </h1>
         <p className="mt-2 text-[15px] text-slate-500">
-          Ranked from {result.n_motif_pairs_considered} motif pairings. Every candidate is grade D,
-          verdict &ldquo;{result.verdict}&rdquo;.
+          Copolymers proposed and screened over {iterations.length} iteration
+          {iterations.length === 1 ? '' : 's'}. Every candidate is grade D, verdict &ldquo;{verdict}&rdquo;.
         </p>
         <div className="mt-3">
-          <GoalChips result={result} />
+          <GoalChips goal={goal} />
         </div>
       </header>
 
       <div className="flex gap-3 rounded-xl border border-gap-line bg-gap-soft px-4 py-3.5 text-[15px] leading-relaxed text-slate-800">
         <Triangle className="mt-0.5 h-5 w-5 shrink-0 text-gap" />
         <p>
-          <b className="font-semibold">A ranking, not a prediction.</b> These are hypotheses to test,
-          ordered by chemistry the app can see. None of them has been shown to stabilise anything.
+          <b className="font-semibold">A ranking, not a prediction.</b> The loop optimises a
+          transparent triage score; the surrogate models that proxy, not stabilisation. None of these
+          has been shown to stabilise anything.
         </p>
       </div>
 
-      <ul className="space-y-3">
-        {result.candidates.map((c) => (
-          <CandidateCard key={c.name} c={c} onScreen={() => onScreen(c)} />
-        ))}
-      </ul>
+      {iterations.map((it) => {
+        const rows = candidates
+          .filter((c) => c.iteration === it)
+          .sort((a, b) => b.score - a.score);
+        return (
+          <section key={it} className="space-y-3">
+            <div className="eyebrow">
+              Iteration {it}
+              {it === iterations[0] && <span className="ml-2 text-supported">newest</span>}
+            </div>
+            <ul className="space-y-3">
+              {rows.map((c) => (
+                <CandidateCard
+                  key={c.id}
+                  c={c}
+                  defaultOpen={c.id === topId}
+                  onScreen={() => onScreen(c)}
+                  onQueue={() => onQueue(c)}
+                  queueing={queueing === c.id}
+                />
+              ))}
+            </ul>
+          </section>
+        );
+      })}
 
       <div className="flex gap-2.5 rounded-xl border border-slate-200 bg-white px-5 py-4 text-xs leading-relaxed text-slate-500 shadow-card">
         <Info className="mt-0.5 h-4 w-4 shrink-0" />
-        <p>{result.limits}</p>
+        <p>{limits}</p>
       </div>
     </div>
   );

@@ -816,24 +816,70 @@ def main_test():
     print(f"ok  designer: top candidate is alert-free ({best['name']}); "
           f"reducing sugars sit at rank {min(c['rank'] for c in worst)}+ of {len(ranks)}")
 
-    # Vitrification only applies to a dried product, and only a backbone whose
-    # Tg clears the storage temperature can hold the protein in a glass.
+    # Vitrification only applies to a dried product, and only a repeat unit whose
+    # Tg clears the storage temperature can hold the protein in a glass. The
+    # assertion is on tg_judged_c, the lower bound the screen actually scores:
+    # backbone_tg_c is the bare backbone's handbook value and is reference only,
+    # so testing it would pass while the decision was driven by something else.
     lyo = D.design(D.DesignGoal(target_temp_c=25, format="lyophilised"), limit=ALL_PAIRS)["candidates"]
-    top_tg = lyo[0]["backbone_tg_c"]
-    assert top_tg and top_tg >= 75, f"a low-Tg backbone won a lyophilised goal: {lyo[0]['name']}"
-    assert lyo[0]["backbone_tg_c"] == max(c["backbone_tg_c"] or 0 for c in lyo), \
-        "the highest-Tg backbone did not win a lyophilised goal"
-    # A backbone with little headroom over the storage temperature must say so:
+    top = lyo[0]
+    assert top["tg_judged_c"] and top["tg_judged_c"] >= 25, \
+        f"a candidate with no glass headroom won a lyophilised goal: {top['name']}"
+    # Every candidate above the winner on judged Tg must have lost for a reason
+    # the report states, not silently.
+    better_tg = [c for c in lyo if (c["tg_judged_c"] or -999) > top["tg_judged_c"]]
+    assert all(c["risks"] for c in better_tg), \
+        "a candidate with more glass headroom ranked lower with nothing said against it"
+    # A repeat unit with little headroom over the storage temperature must say so:
     # residual moisture plasticises a real cake by tens of degrees.
     hot = D.design(D.DesignGoal(target_temp_c=40, format="lyophilised"), limit=ALL_PAIRS)["candidates"]
-    low = next(c for c in hot if (c["backbone_tg_c"] or 0) < 60)
-    assert any("plasticise" in r or "not be a glass" in r for r in low["risks"]), low["risks"]
+    low = next(c for c in hot if (c["tg_judged_c"] or 0) < 40)
+    assert any("plasticise" in r or "not be a glass" in r or "may not be a glass" in r
+               for r in low["risks"]), low["risks"]
     # Vitrification is a dried-product mechanism: a liquid formulation must not
     # be judged on the glass transition at all.
     for c in D.design(D.DesignGoal(target_temp_c=25, format="liquid"), limit=ALL_PAIRS)["candidates"]:
         assert not any("glass" in r or "plasticise" in r for r in c["risks"]), (c["name"], c["risks"])
-    print(f"ok  designer: dried goal favours the highest Tg ({top_tg} C); a 55 C backbone is "
+    print(f"ok  designer: dried goal favours glass headroom (winner judged on "
+          f"{top['tg_judged_c']} C, from its {top['tg_source']}); a candidate with none is "
           "warned about at 40 C")
+
+    # The pendant is half the molecule, and the handbook value for the bare
+    # backbone cannot see it. Where the model can, its prediction is what runs.
+    predicted = [c for c in lyo if c["tg_in_model_domain"]]
+    assert predicted, "the Tg model answered for nothing at all"
+    assert any(abs(c["tg_c"] - c["backbone_tg_c"]) > 30 for c in predicted
+               if c["backbone_tg_c"] is not None), \
+        "no predicted Tg differs from its backbone's handbook value, so the pendant is invisible"
+    # Falling outside the model's domain must not be an advantage. It used to be:
+    # the uncertainty was charged only to candidates the model could speak to,
+    # while an out-of-domain one kept the flattering handbook value at full
+    # confidence and outranked everything that had actually been looked at.
+    for c in lyo:
+        if c["tg_in_model_domain"] is False and c["backbone_tg_c"] is not None:
+            assert c["tg_judged_c"] < c["backbone_tg_c"], (
+                f"{c['name']}: out-of-domain candidate judged on the full handbook value")
+    print(f"ok  designer: Tg predicted per repeat unit for {len(predicted)}/{len(lyo)} candidates; "
+          "an out-of-domain one cannot hide behind its backbone's handbook value")
+
+    # The pickle is a build artefact and gitignored, so a fresh checkout - which
+    # is what the deploy box runs - has no model. That path is the normal one in
+    # production and has to degrade to the handbook table, not fail.
+    real_predict, D._TG_CACHE = D.tg_model.predict, {}
+    try:
+        D.tg_model.predict = lambda _: {"available": False, "reason": "no trained Tg model"}
+        fallback = D.design(D.DesignGoal(target_temp_c=25, format="lyophilised"),
+                            limit=ALL_PAIRS)["candidates"]
+    finally:
+        D.tg_model.predict, D._TG_CACHE = real_predict, {}
+    assert all(c["tg_in_model_domain"] is None for c in fallback), \
+        "a candidate claimed a model domain with no model loaded"
+    assert fallback[0]["tg_judged_c"] and fallback[0]["tg_judged_c"] >= 25, \
+        "the model-less fallback stopped favouring glass headroom"
+    assert all(c["tg_c"] == c["backbone_tg_c"] for c in fallback), \
+        "the fallback did not fall back to the backbone handbook value"
+    print(f"ok  designer: with no trained model the screen still runs on the handbook table "
+          f"({fallback[0]['name'][:40]}... judged on {fallback[0]['tg_judged_c']} C)")
 
     # A protein that exposes the residue an alert attacks makes that alert cost more.
     plain = D.design(D.DesignGoal(target_temp_c=25), limit=ALL_PAIRS)["candidates"]
@@ -863,6 +909,136 @@ def main_test():
     out = D.design(parsed, limit=3)
     assert out["candidates"] and out["goal"]["exposed_residues"] == ["Met"]
     print(f"ok  designer: a parsed goal drives the ranking ({out['candidates'][0]['name']})")
+
+    # --- copolymers -----------------------------------------------------------
+    # A copolymer is a backbone plus a weighted mixture of pendants. The built
+    # chain must carry every motif, so it fires the UNION of the components' alerts:
+    # a trehalose/oligo(ethylene glycol) blend is clean on the sugar but must still
+    # trip the polyether autoxidation alert the glycol brings.
+    treh = next(p for p in D.PENDANTS if p.key == "trehalose")
+    oeg = next(p for p in D.PENDANTS if p.key == "oligoethylene_glycol")
+    glu = next(p for p in D.PENDANTS if p.key == "glucose")
+    goal_lyo = D.DesignGoal(target_temp_c=25, format="lyophilised")
+
+    co = D.evaluate(mab, [(treh, 0.5), (oeg, 0.5)], goal_lyo)
+    co_alerts = co.alerts
+    treh_alerts = D.evaluate(mab, [(treh, 1.0)], goal_lyo).alerts
+    oeg_alerts = D.evaluate(mab, [(oeg, 1.0)], goal_lyo).alerts
+    assert set(co_alerts) == set(treh_alerts) | set(oeg_alerts), (co_alerts, treh_alerts, oeg_alerts)
+    assert any("Polyether" in a for a in co_alerts), "the glycol half must still trip autoxidation"
+    print(f"ok  copolymer: a blend fires the union of its motifs' alerts ({len(co_alerts)})")
+
+    # Fox-blended Tg must sit between the two homopolymer Tgs (blending is in Kelvin,
+    # so it lands between them) and reduce to the component's own Tg for one pendant.
+    treh_tg = D.evaluate(mab, [(treh, 1.0)], goal_lyo).tg["tg_c"]
+    oeg_tg = D.evaluate(mab, [(oeg, 1.0)], goal_lyo).tg["tg_c"]
+    blend_tg = co.tg["tg_c"]
+    assert min(treh_tg, oeg_tg) <= blend_tg <= max(treh_tg, oeg_tg), (treh_tg, oeg_tg, blend_tg)
+    assert co.tg["source"].startswith("Fox blend")
+    solo = D.evaluate(mab, [(treh, 1.0)], goal_lyo)
+    assert solo.tg == D._tg_estimate(mab, D.repeat_unit(mab, treh)), "one pendant must not blend"
+    print(f"ok  copolymer: Fox Tg {blend_tg} C between {treh_tg} and {oeg_tg}; single pendant unchanged")
+
+    # The homopolymer path must be byte-for-byte what it was: evaluate() on a single
+    # 1.0 pendant reproduces the exhaustive designer's scored candidate exactly.
+    homo = D.evaluate(mab, [(treh, 1.0)], goal_lyo)
+    all_pairs = len(D.BACKBONES) * len(D.PENDANTS)
+    ref = next(c for c in D.design(goal_lyo, limit=all_pairs)["candidates"]
+               if c["backbone"] == mab.name and c["pendant"] == treh.name)
+    assert homo.score == ref["score"] and homo.tg["judged_tg_c"] == ref["tg_judged_c"]
+    print(f"ok  copolymer: single-pendant reduces to the homopolymer score exactly ({homo.score})")
+
+    # --- active learning ------------------------------------------------------
+    import random as _random
+    A = main.active
+    rng = _random.Random(0)
+    prior, history = [], []
+    for _ in range(4):
+        prop = A.propose_batch(goal_lyo, prior, k=10, rng=rng)
+        history.append(prop.metrics)
+        for c in prop.candidates:
+            prior.append(A.PriorCandidate(c.backbone.key,
+                                          [(p.key, round(f, 2)) for p, f in c.components], c.score))
+    bests = [m["best_score_so_far"] for m in history]
+    assert bests == sorted(bests), f"best score must never regress across iterations: {bests}"
+    assert bests[-1] > bests[0], f"the loop must actually improve the best score: {bests}"
+    keys = [p.key() for p in prior]
+    assert len(keys) == len(set(keys)), "the loop proposed a duplicate composition"
+    later = [m for m in history if not m["seeded"]]
+    assert later and later[-1]["surrogate_cv_mae"] is not None, "surrogate error must be reported once fit"
+    assert all(m["batch_diversity"] and m["batch_diversity"] > 0 for m in history), "batches must be diverse"
+    print(f"ok  active learning: best score climbs {bests[0]} -> {bests[-1]} over {len(history)} "
+          f"iterations, no duplicates, surrogate CV-MAE {later[-1]['surrogate_cv_mae']}")
+
+    # The surrogate models the TRIAGE PROXY, and the loop says so, loudly.
+    assert "not stabilisation" in A.ACTIVE_LIMITS.lower() or "not a prediction" in A.ACTIVE_LIMITS.lower()
+    print("ok  active learning: the limits state the surrogate models the proxy, not stabilisation")
+
+    # --- campaign store + simulation queue ------------------------------------
+    CS = main.candidates
+    conn = CS.connect(os.path.join(tempfile.mkdtemp(), "campaigns.db"))
+    cid = CS.create_campaign(conn, goal_lyo.model_dump())
+    prior2 = []
+    for it in range(1, 4):
+        loaded = [A.PriorCandidate(p["backbone_key"], p["components"], p["score"])
+                  for p in CS.prior_for(conn, cid)]
+        prop = A.propose_batch(goal_lyo, loaded, k=8, rng=rng)
+        items = [{"payload": D.candidate_dict(c, goal_lyo, i), "backbone_key": c.backbone.key,
+                  "components": [[p.key, round(f, 2)] for p, f in c.components], "score": c.score}
+                 for i, c in enumerate(prop.candidates, 1)]
+        CS.add_candidates(conn, cid, CS.next_iteration(conn, cid), items)
+        CS.record_metrics(conn, cid, it, prop.metrics)
+    allc = CS.candidates_for(conn, cid)
+    assert len(allc) == 24 and CS.next_iteration(conn, cid) == 4, len(allc)
+    assert all(c["status"] == "benchmarked" for c in allc)
+    assert all(c["id"] and c["iteration"] for c in allc), "stored rows must carry id and iteration"
+
+    # Queue the three highest-scoring, and the backlog must come back score-ordered.
+    top3 = sorted(allc, key=lambda c: -c["score"])[:3]
+    assert CS.enqueue(conn, [c["id"] for c in top3]) == 3
+    q = CS.queue(conn)
+    assert [round(c["score"], 2) for c in q] == sorted((round(c["score"], 2) for c in q), reverse=True)
+    assert CS.enqueue(conn, [top3[0]["id"]]) == 0, "re-queuing an already-queued candidate is a no-op"
+    assert CS.queue_summary(conn, cid)["n_queued"] == 3
+    print(f"ok  campaign store: {len(allc)} candidates over 3 iterations, top 3 queued, "
+          "backlog score-ordered, re-queue is a no-op")
+
+    # Provenance and referential integrity, as the measurement store demands.
+    assert all(r["app_version"] for r in conn.execute("SELECT app_version FROM candidate"))
+    try:
+        CS.add_candidates(conn, "no-such-campaign", 1, [{
+            "payload": {}, "backbone_key": mab.key, "components": [[treh.key, 1.0]], "score": 1.0}])
+        raise AssertionError("a candidate with no campaign was accepted")
+    except Exception as e:
+        assert "IntegrityError" in type(e).__name__, e
+    print("ok  campaign store: orphan candidates rejected, every row stamped with a version")
+
+    # --- orchestration (advisory campaign controller) -------------------------
+    OR = main.orchestrator
+    assert OR.recommend([])["phase"] == "seed"
+    seeding = OR.recommend([{"iteration": 1, "best_score_so_far": 1.0, "seeded": True}])
+    assert seeding["action"] == "continue" and seeding["phase"] == "seed"
+    # A best score that stops climbing over PATIENCE iterations reads as converged,
+    # and the controller then advises queuing rather than spending more iterations.
+    flat = [{"iteration": i, "best_score_so_far": 2.60 + 0.001 * i, "seeded": False,
+             "surrogate_cv_mae": 0.9, "batch_diversity": 2.0} for i in range(1, 5)]
+    conv = OR.recommend(flat)
+    assert conv["action"] == "stop" and conv["phase"] == "converged" and conv["suggest_queue"]
+    # A score still climbing must keep the loop going, and never suggest queuing.
+    climbing = [{"iteration": i, "best_score_so_far": 1.0 + 0.5 * i, "seeded": False,
+                 "surrogate_cv_mae": 0.8, "batch_diversity": 2.0} for i in range(1, 4)]
+    cont = OR.recommend(climbing)
+    assert cont["action"] == "continue" and not cont["suggest_queue"]
+    assert cont["phase"] == "exploit", "a low, settled surrogate error should tip toward exploiting"
+    # The best score is naturally flat during the space-filling seed, then jumps once
+    # the surrogate takes over — so a flat stretch that still includes seed iterations
+    # must NOT be called converged, or the run stops right before exploitation pays off.
+    seed_then_flat = [{"iteration": i, "best_score_so_far": 1.96, "seeded": i < 3,
+                       "surrogate_cv_mae": (None if i < 3 else 2.0), "batch_diversity": 2.0}
+                      for i in range(1, 4)]
+    assert OR.recommend(seed_then_flat)["phase"] != "converged", "flat during seeding is not convergence"
+    print(f"ok  orchestration: advises seed -> {cont['phase']} while climbing, "
+          "stop-and-queue once the best score plateaus, never converged mid-seed")
 
     # --- the evidence gate, both directions ----------------------------------
     agent = main.get_agent()

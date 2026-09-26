@@ -5,6 +5,13 @@
 	handle /screen* {
 		reverse_proxy api:8000
 	}
+	# The polymer designer and its active-learning campaign endpoints:
+	# /design, /design/iterate, /design/queue, /design/campaign/<id>. Without the
+	# wildcard these fall through to the web container and 404, which looks like a
+	# broken designer rather than a missing route.
+	handle /design* {
+		reverse_proxy api:8000
+	}
 	handle /health {
 		reverse_proxy api:8000
 	}

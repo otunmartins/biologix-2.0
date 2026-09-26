@@ -39,6 +39,7 @@ from rdkit import Chem
 from rdkit.Chem import Descriptors, rdMolDescriptors
 
 import polymer
+import tg_model
 
 # Representative chain length for screening. Alerts are substructure-presence
 # tests, so a longer chain fires exactly the same ones (see polymer.py).
@@ -49,13 +50,20 @@ SCREEN_UNITS = 4
 # Motif library
 # ---------------------------------------------------------------------------
 #
-# Tg is the homopolymer glass-transition temperature in C, from the polymer
-# handbook literature. It is reported, never computed: a copolymer's real Tg
-# depends on composition, water content and processing, none of which are
-# modelled. It matters because vitrification is the mechanism that protects a
-# DRIED product above fridge temperature — a matrix has to be a glass at the
-# storage temperature to immobilise the protein, which is why PEG (Tg around
-# -60 C) is a poor lyophilisation matrix and PVP (around 175 C) is a good one.
+# Tg is the homopolymer glass-transition temperature in C. It matters because
+# vitrification is the mechanism that protects a DRIED product above fridge
+# temperature — a matrix has to be a glass at the storage temperature to
+# immobilise the protein, which is why PEG (Tg around -60 C) is a poor
+# lyophilisation matrix and PVP (around 175 C) is a good one.
+#
+# The value below is the BACKBONE's handbook value, and it is only a fallback.
+# It cannot see the pendant, so it assigns one number to every candidate on a
+# given backbone — which is wrong in the direction that matters: hanging a
+# sulfobetaine or an oligo(ethylene glycol) off a chain plasticises it heavily,
+# and the handbook value for the bare backbone would score that candidate as if
+# it had the glassiness of the unsubstituted polymer. tg_model.py predicts the
+# assembled repeat unit instead, and is preferred wherever it can answer. See
+# _tg_estimate for which one is used and what happens when neither is trusted.
 
 @dataclass(frozen=True)
 class Backbone:
@@ -223,6 +231,39 @@ def build_chain(backbone: Backbone, pendant: Pendant, units: int = SCREEN_UNITS)
         return None
 
 
+# A composition is a backbone plus a weighted mixture of pendants whose mole
+# fractions sum to 1. A homopolymer is the degenerate single-pendant case, and
+# every function below reduces to the homopolymer result for it — see the
+# active-learning loop (active.py), which searches this larger space.
+Composition = list[tuple[Pendant, float]]
+
+
+def build_copolymer_chain(backbone: Backbone, components: Composition,
+                          units: int = SCREEN_UNITS) -> str | None:
+    """A representative chain carrying every pendant in the mixture.
+
+    Chain length per pendant is proportional to its fraction, floored at one, so
+    each motif appears at least once. Order does not matter: structural alerts are
+    substructure-presence tests and the descriptors are per-heavy-atom ratios, so
+    which motifs are present — not their sequence along the chain — is what the
+    screens see. Sequence (blocky vs random) is therefore NOT modelled, and every
+    result says so.
+    """
+    if len(components) == 1:
+        return build_chain(backbone, components[0][0], units)
+    counts = [max(1, round(frac * units)) for _, frac in components]
+    pools = [[repeat_unit(backbone, p)] * c for (p, _), c in zip(components, counts)]
+    seq: list[str] = []
+    while any(pools):                      # round-robin interleave
+        for pool in pools:
+            if pool:
+                seq.append(pool.pop())
+    try:
+        return Chem.MolToSmiles(polymer.build_sequence(seq))
+    except Exception:
+        return None
+
+
 def descriptors(smiles: str) -> dict:
     """Computed physicochemical properties. Every one is measured off the built
     structure by RDKit — none is estimated, and none predicts stabilisation."""
@@ -254,6 +295,189 @@ def _alerts(smiles: str) -> list[str]:
     return _fired(smiles)
 
 
+# ---------------------------------------------------------------------------
+# Glass transition: predicted for the assembled repeat unit where possible
+# ---------------------------------------------------------------------------
+#
+# WHY THE SCREEN JUDGES A LOWER BOUND AND NOT THE PREDICTION. The two ways to be
+# wrong here do not cost the same. Understate a candidate's Tg and it ranks below
+# something else that the laboratory then measures anyway. Overstate it and the
+# app recommends a matrix that is not a glass at storage temperature, which is
+# the failure the screen exists to catch. So the margin is taken from the
+# prediction MINUS the model's own uncertainty, and a candidate has to clear the
+# storage temperature with that bound - not with its point estimate - to earn
+# vitrification credit.
+#
+# The uncertainty used is the LARGER of the forest's spread on this query and
+# its measured scaffold-split error, because either can be the binding one: the
+# spread catches chemistry the ensemble disagrees about, the scaffold-split MAE
+# catches the error it makes even where the trees agree.
+#
+# EVERY Tg HERE IS UNCERTAIN, INCLUDING THE HANDBOOK ONE. The first version of
+# this charged uncertainty only to candidates the model could speak to, which
+# rewarded falling outside its domain: an out-of-domain candidate kept the bare
+# backbone's flattering handbook value at full confidence and outranked
+# everything the model had actually looked at. A backbone value standing in for a
+# substituted repeat unit is not a safer number, it is an unmeasured one - the
+# in-domain predictions here sit 60-100 C below their backbone's handbook value,
+# because a flexible side chain plasticises a stiff backbone. So the handbook
+# fallback carries at least the model's own measured error, and where an
+# out-of-domain prediction is LOWER than the handbook value, the lower of the two
+# is what gets judged. An extrapolation is allowed to argue a candidate down,
+# never up.
+
+# Floor on any Tg uncertainty: the model's measured error on unfamiliar
+# chemistry, which is the least a number that was never measured for this
+# repeat unit could be wrong by.
+TG_UNCERTAINTY_FLOOR_C = tg_model.PERFORMANCE["scaffold_split"]["mae_c"]
+
+_TG_CACHE: dict[str, dict] = {}
+
+
+def _tg_estimate(backbone: Backbone, repeat_unit_smiles: str) -> dict:
+    """Best available Tg for this candidate, and how much to trust it.
+
+    Cached per repeat unit: the forest costs about 0.15 s a query, the same motif
+    pairs recur on every request, and the answer cannot change between them.
+    """
+    if repeat_unit_smiles in _TG_CACHE:
+        return _TG_CACHE[repeat_unit_smiles]
+
+    lit = backbone.tg_c
+    out = {
+        "tg_c": lit,
+        "source": "backbone literature value" if lit is not None else None,
+        "literature_backbone_tg_c": lit,
+        "spread_sd": None,
+        "uncertainty_c": TG_UNCERTAINTY_FLOOR_C if lit is not None else None,
+        # What the screen actually judges: the estimate less its uncertainty.
+        "judged_tg_c": (round(lit - TG_UNCERTAINTY_FLOOR_C, 1) if lit is not None else None),
+        "in_domain": None,
+        "note": "",
+    }
+
+    p = tg_model.predict(repeat_unit_smiles)
+    if p.get("available"):
+        sd = p["model_spread_sd"]
+        mae = p["expected_error_mae_c"]
+        unc = max(sd, mae)
+        if p["in_domain"]:
+            judged = round(p["tg_c"] - unc, 1)
+            out.update({
+                "tg_c": p["tg_c"],
+                "source": "predicted from the assembled repeat unit",
+                "spread_sd": sd,
+                "uncertainty_c": unc,
+                "judged_tg_c": judged,
+                "in_domain": True,
+                "note": (
+                    f"Tg {p['tg_c']:g} C predicted for this repeat unit by a forest trained on "
+                    f"{p['performance']['n_training_polymers']} experimental polymers "
+                    f"(nearest training polymer {p['nearest_training_similarity']:.2f} similar). "
+                    f"Judged on {judged:g} C, the prediction less its {unc:g} C uncertainty, "
+                    "because overstating the glass is the expensive mistake. Confirm by "
+                    "modulated DSC on the cake."),
+            })
+        else:
+            # An extrapolation cannot carry a stated error, so it does not get to
+            # raise a candidate. It can lower one: it is the only number here that
+            # saw the pendant, and if it says the chain is softer than its bare
+            # backbone, that is the direction worth believing.
+            anchor = p["tg_c"] if lit is None else min(lit, p["tg_c"])
+            out.update({
+                "tg_c": lit if lit is not None else p["tg_c"],
+                "spread_sd": sd,
+                "uncertainty_c": TG_UNCERTAINTY_FLOOR_C,
+                "judged_tg_c": round(anchor - TG_UNCERTAINTY_FLOOR_C, 1),
+                "in_domain": False,
+                "note": (
+                    f"Tg for this repeat unit is outside the model's domain (nearest training "
+                    f"polymer only {p['nearest_training_similarity']:.2f} similar), so its "
+                    f"{p['tg_c']:g} C estimate is an extrapolation. "
+                    + (f"Judged against the lower of it and the {lit:g} C backbone handbook value, "
+                       f"less {TG_UNCERTAINTY_FLOOR_C:g} C: the handbook value cannot see the "
+                       "pendant, so neither number is trusted to raise this candidate."
+                       if lit is not None else
+                       "There is no backbone handbook value either, so the extrapolation is all "
+                       f"there is, less {TG_UNCERTAINTY_FLOOR_C:g} C.")),
+            })
+    elif p.get("reason"):
+        out["note"] = (f"Tg not predicted ({p['reason']}). "
+                       + (f"Judged on the {lit:g} C backbone handbook value less "
+                          f"{TG_UNCERTAINTY_FLOOR_C:g} C, because it cannot see the pendant."
+                          if lit is not None else "No Tg available."))
+
+    _TG_CACHE[repeat_unit_smiles] = out
+    return out
+
+
+def _weight_fractions(backbone: Backbone, components: Composition) -> list[float]:
+    """Mole fractions -> weight fractions, using each repeat unit's molar mass.
+
+    The Fox equation is written in weight fractions, so a heavy sugar pendant
+    pulls the blend toward its own Tg more than its mole fraction alone would."""
+    masses = []
+    for pendant, frac in components:
+        m = Chem.MolFromSmiles(repeat_unit(backbone, pendant))
+        masses.append(frac * (Descriptors.MolWt(m) if m else 100.0))
+    total = sum(masses) or 1.0
+    return [x / total for x in masses]
+
+
+def _blended_tg(backbone: Backbone, components: Composition) -> dict:
+    """Copolymer Tg by the Fox equation, blending the per-component estimates.
+
+    1/Tg = Σ wᵢ/Tgᵢ in Kelvin, applied to both the point estimate and the judged
+    lower bound so the conservative number stays conservative. A single component
+    returns _tg_estimate unchanged. The Fox rule assumes an ideal random copolymer:
+    real sequence, reactivity ratios and composition drift are not modelled.
+    """
+    if len(components) == 1:
+        return _tg_estimate(backbone, repeat_unit(backbone, components[0][0]))
+
+    ests = [_tg_estimate(backbone, repeat_unit(backbone, p)) for p, _ in components]
+    ws = _weight_fractions(backbone, components)
+
+    def fox(key: str) -> float | None:
+        terms = []
+        for w, e in zip(ws, ests):
+            t = e.get(key)
+            if t is None:
+                return None
+            terms.append(w / (t + 273.15))
+        s = sum(terms)
+        return round(1.0 / s - 273.15, 1) if s > 0 else None
+
+    tg, judged = fox("tg_c"), fox("judged_tg_c")
+    domains = [e.get("in_domain") for e in ests]
+    in_domain = True if all(d is True for d in domains) else (
+        False if any(d is False for d in domains) else None)
+
+    if tg is not None:
+        blend = ", ".join(f"{p.name.split(' (')[0]} {w:.2f}"
+                          for (p, _), w in zip(components, ws))
+        note = (
+            f"Tg about {tg:g} C is a Fox-equation blend of the component repeat-unit Tg "
+            f"estimates (weight fractions {blend}), judged on {judged:g} C once each "
+            "component's uncertainty is taken off. The Fox rule assumes an ideal random "
+            "copolymer; the real sequence (blocky vs random), reactivity ratios and "
+            "composition drift are NOT modelled, and the cake Tg must be measured by "
+            "modulated DSC.")
+    else:
+        note = "Tg could not be blended: a component has no Tg estimate."
+
+    return {
+        "tg_c": tg,
+        "source": "Fox blend of component repeat-unit Tg estimates" if tg is not None else None,
+        "literature_backbone_tg_c": backbone.tg_c,
+        "spread_sd": None,
+        "uncertainty_c": (round(tg - judged, 1) if tg is not None and judged is not None else None),
+        "judged_tg_c": judged,
+        "in_domain": in_domain,
+        "note": note,
+    }
+
+
 # Alerts that matter for a molecule meant to sit beside a protein for months,
 # with the residue each one attacks and how hard to penalise it.
 ALERT_PENALTY = {
@@ -273,20 +497,36 @@ ALERT_PENALTY = {
 @dataclass
 class Candidate:
     backbone: Backbone
-    pendant: Pendant
+    # (pendant, mole_fraction) pairs summing to 1. A homopolymer is one pair at 1.0.
+    components: Composition
     smiles: str
     descriptors: dict
     alerts: list[str]
+    tg: dict = field(default_factory=dict)
+    units: int = SCREEN_UNITS
     score: float = 0.0
     reasons: list[str] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)
+
+    @property
+    def pendant(self) -> Pendant:
+        """The (dominant) pendant — convenience for the homopolymer case."""
+        return max(self.components, key=lambda cp: cp[1])[0]
+
+
+def _frac_prefix(frac: float) -> str:
+    """'' for a homopolymer, else a short 'at fraction 0.5, ' lead-in for a message."""
+    return "" if frac >= 0.999 else f"at fraction {frac:g}, "
 
 
 def score(cand: Candidate, goal: DesignGoal) -> Candidate:
     """Transparent additive scoring: every term states its own reason.
 
     This ranks candidates against each other for laboratory triage. It is not a
-    probability, not a predicted Tm shift, and not comparable across runs.
+    probability, not a predicted Tm shift, and not comparable across runs. For a
+    copolymer, composition-dependent terms (charge, motif cautions) are weighted by
+    fraction; alert terms stay presence-based on the built chain. A single-pendant
+    composition reduces this to the homopolymer score exactly.
     """
     reasons, risks, total = [], [], 0.0
 
@@ -306,61 +546,73 @@ def score(cand: Candidate, goal: DesignGoal) -> Candidate:
                      "protein rather than being excluded from it")
 
     # --- charge: zwitterions hydrate, opposite charges complex --------------
-    if cand.pendant.charge == "zwitterion":
-        total += 2.0
-        reasons.append("zwitterionic: binds water strongly while carrying no net charge, so "
-                       "it suppresses aggregation without electrostatic binding to the protein")
-    elif cand.pendant.charge in ("anionic", "cationic"):
-        q = goal.net_charge
-        opposite = (q is not None and
-                    ((q > 1 and cand.pendant.charge == "anionic") or
-                     (q < -1 and cand.pendant.charge == "cationic")))
-        if opposite:
-            # Known to be wrong for THIS protein, not merely unhelpful.
-            total -= 4.0
-            risks.append(
-                f"{cand.pendant.charge} against a protein carrying {q:+.1f} net charge at "
-                f"pH {goal.ph:g}: it would bind electrostatically, which is complexation "
-                "rather than stabilisation")
-        elif q is None:
-            total -= 1.5
-            risks.append(f"net {cand.pendant.charge} — may bind the protein electrostatically; "
-                         "the protein's charge was not supplied, so this could not be checked")
-        else:
-            total -= 0.5
-            risks.append(f"net {cand.pendant.charge}, same sign as the protein ({q:+.1f}), so "
-                         "electrostatic binding is unlikely, but the charge still perturbs the "
-                         "local ionic environment")
+    # Weighted across the mixture: a copolymer half anionic carries half the
+    # complexation penalty. A single pendant at 1.0 gives the homopolymer term.
+    for pendant, frac in cand.components:
+        pre = _frac_prefix(frac)
+        if pendant.charge == "zwitterion":
+            total += 2.0 * frac
+            reasons.append(f"{pre}zwitterionic: binds water strongly while carrying no net "
+                           "charge, so it suppresses aggregation without electrostatic binding "
+                           "to the protein")
+        elif pendant.charge in ("anionic", "cationic"):
+            q = goal.net_charge
+            opposite = (q is not None and
+                        ((q > 1 and pendant.charge == "anionic") or
+                         (q < -1 and pendant.charge == "cationic")))
+            if opposite:
+                # Known to be wrong for THIS protein, not merely unhelpful.
+                total -= 4.0 * frac
+                risks.append(
+                    f"{pre}{pendant.charge} against a protein carrying {q:+.1f} net charge at "
+                    f"pH {goal.ph:g}: it would bind electrostatically, which is complexation "
+                    "rather than stabilisation")
+            elif q is None:
+                total -= 1.5 * frac
+                risks.append(f"{pre}net {pendant.charge} — may bind the protein electrostatically; "
+                             "the protein's charge was not supplied, so this could not be checked")
+            else:
+                total -= 0.5 * frac
+                risks.append(f"{pre}net {pendant.charge}, same sign as the protein ({q:+.1f}), so "
+                             "electrostatic binding is unlikely, but the charge still perturbs the "
+                             "local ionic environment")
 
     # --- vitrification, only for a dried product ---------------------------
-    tg = cand.backbone.tg_c
+    est = cand.tg
+    tg, judged = est["tg_c"], est["judged_tg_c"]
+    what = est["source"] or "Tg"
     if goal.format == "lyophilised":
         target = goal.target_temp_c if goal.target_temp_c is not None else 25.0
-        if tg is None:
-            risks.append("homopolymer Tg not on record; the cake's glass transition must be "
-                         "measured by modulated DSC before this can be judged")
+        if judged is None:
+            risks.append("no Tg available for this repeat unit, from the model or the backbone "
+                         "table; the cake's glass transition must be measured by modulated DSC "
+                         "before this can be judged")
         else:
             # Continuous in the margin, not stepped: water plasticises a real cake
             # by tens of degrees, so headroom above the storage temperature keeps
-            # paying past the point where the dry polymer is merely glassy.
-            margin = tg - target
+            # paying past the point where the dry polymer is merely glassy. The
+            # margin is measured from the lower bound, not the point estimate --
+            # see _tg_estimate for why.
+            margin = judged - target
             total += max(-2.5, min(3.0, margin / 45.0))
             if margin >= 100:
-                reasons.append(f"backbone Tg about {tg:g} C, {margin:g} C above the {target:g} C "
-                               "target — ample headroom for the drop once residual moisture "
-                               "plasticises the cake")
+                reasons.append(f"Tg about {tg:g} C ({what}) clears the {target:g} C target by "
+                               f"{margin:g} C even at the low end of its uncertainty — ample "
+                               "headroom for the drop once residual moisture plasticises the cake")
             elif margin >= 50:
-                reasons.append(f"backbone Tg about {tg:g} C, {margin:g} C above the {target:g} C "
-                               "target — the matrix should stay glassy, though moisture will "
-                               "erode that margin")
+                reasons.append(f"Tg about {tg:g} C ({what}) clears the {target:g} C target by "
+                               f"{margin:g} C at the low end of its uncertainty — the matrix "
+                               "should stay glassy, though moisture will erode that margin")
             elif margin > 0:
-                risks.append(f"backbone Tg about {tg:g} C is only {margin:g} C above the "
-                             f"{target:g} C target; residual moisture could plasticise it below "
-                             "storage temperature")
+                risks.append(f"Tg about {tg:g} C ({what}) is only {margin:g} C above the "
+                             f"{target:g} C target once its uncertainty is taken off; residual "
+                             "moisture could plasticise it below storage temperature")
             else:
-                risks.append(f"backbone Tg about {tg:g} C is at or below the {target:g} C target; "
-                             "the matrix would not be a glass at storage temperature")
-    elif tg is not None and tg < 0:
+                risks.append(f"Tg about {tg:g} C ({what}) is not reliably above the {target:g} C "
+                             "target; the matrix may not be a glass at storage temperature")
+        if est["in_domain"] is False:
+            risks.append(est["note"])
+    elif judged is not None and tg is not None and tg < 0:
         reasons.append(f"low Tg ({tg:g} C) is irrelevant for a liquid product, but would rule "
                        "this out for a dried one")
 
@@ -376,10 +628,15 @@ def score(cand: Candidate, goal: DesignGoal) -> Candidate:
             risks.append(f"{alert}: {why}")
 
     # --- the stated caution on each motif ----------------------------------
-    for motif in (cand.backbone, cand.pendant):
-        if motif.caution:
-            total += motif.penalty
-            risks.append(motif.caution)
+    # The backbone is the whole chain, so its caution is charged in full; a
+    # pendant's caution is charged in proportion to how much of it is present.
+    if cand.backbone.caution:
+        total += cand.backbone.penalty
+        risks.append(cand.backbone.caution)
+    for pendant, frac in cand.components:
+        if pendant.caution:
+            total += pendant.penalty * frac
+            risks.append(pendant.caution)
 
     # --- warmer and longer is harder ---------------------------------------
     if goal.target_temp_c is not None and goal.target_temp_c >= 30:
@@ -422,46 +679,97 @@ def experiments(cand: Candidate, goal: DesignGoal) -> list[str]:
     return plan
 
 
+def evaluate(backbone: Backbone, components: Composition, goal: DesignGoal,
+             units: int = SCREEN_UNITS) -> Candidate | None:
+    """Build, screen and score one composition. Returns None if it will not assemble.
+
+    The single entry point the exhaustive enumerator and the active-learning loop
+    both go through, so a copolymer is judged by exactly the same screens as a
+    homopolymer.
+    """
+    smiles = build_copolymer_chain(backbone, components, units)
+    if not smiles:
+        return None
+    built_units = units if len(components) == 1 else sum(
+        max(1, round(frac * units)) for _, frac in components)
+    cand = Candidate(backbone, components, smiles, descriptors(smiles), _alerts(smiles),
+                     _blended_tg(backbone, components), built_units)
+    return score(cand, goal)
+
+
+def _mechanism(cand: Candidate) -> str:
+    pend = " ".join(p.mechanism for p, _ in cand.components)
+    return f"{cand.backbone.mechanism} {pend}"
+
+
+def candidate_dict(cand: Candidate, goal: DesignGoal, rank: int) -> dict:
+    """The wire shape of a candidate. Homopolymer output is unchanged; a copolymer
+    fills the same keys plus a `composition` breakdown."""
+    comps = cand.components
+    is_homo = len(comps) == 1
+    charges = {p.charge for p, _ in comps}
+    charge = comps[0][0].charge if is_homo else ("mixed" if len(charges) > 1 else charges.pop())
+    dominant = cand.pendant
+
+    if is_homo:
+        pendant_label = comps[0][0].name
+        ru = repeat_unit(cand.backbone, comps[0][0])
+    else:
+        pendant_label = " + ".join(f"{p.name.split(' (')[0]} {frac:g}" for p, frac in comps)
+        ru = " ; ".join(repeat_unit(cand.backbone, p) for p, _ in comps)
+
+    return {
+        "rank": rank,
+        "name": f"{cand.backbone.name} bearing {pendant_label}",
+        "backbone": cand.backbone.name,
+        "pendant": pendant_label,
+        "composition": [
+            {"pendant": p.name, "fraction": round(frac, 3),
+             "repeat_unit_smiles": repeat_unit(cand.backbone, p), "charge": p.charge}
+            for p, frac in comps
+        ],
+        "repeat_unit_smiles": ru,
+        "screened_oligomer_smiles": cand.smiles,
+        "screened_units": cand.units,
+        # backbone_tg_c is the handbook value for the bare backbone, kept for
+        # reference. tg_c is what the screen actually used.
+        "backbone_tg_c": cand.backbone.tg_c,
+        "tg_c": cand.tg["tg_c"],
+        "tg_source": cand.tg["source"],
+        "tg_judged_c": cand.tg["judged_tg_c"],
+        "tg_model_spread_sd": cand.tg["spread_sd"],
+        "tg_in_model_domain": cand.tg["in_domain"],
+        "tg_note": cand.tg["note"],
+        "charge": charge,
+        "score": cand.score,
+        "mechanism": _mechanism(cand),
+        "supports": cand.reasons,
+        "risks": cand.risks,
+        "alerts_fired": cand.alerts,
+        "descriptors": cand.descriptors,
+        "suggested_experiments": experiments(cand, goal),
+        # Handed to the existing screen, which is what actually judges it. A
+        # copolymer has no single repeat unit, so the dominant motif is offered.
+        "screen_as": {
+            "repeat_unit": repeat_unit(cand.backbone, dominant),
+            "end_group_a": "[*][H]",
+            "end_group_b": "[*][H]",
+        },
+    }
+
+
 def enumerate_candidates(goal: DesignGoal, limit: int = 12) -> list[dict]:
     """Every motif pair that assembles, screened, scored and ranked."""
     ranked: list[Candidate] = []
     for backbone in BACKBONES:
         for pendant in PENDANTS:
-            smiles = build_chain(backbone, pendant)
-            if not smiles:
-                continue
-            cand = Candidate(backbone, pendant, smiles, descriptors(smiles), _alerts(smiles))
-            ranked.append(score(cand, goal))
+            cand = evaluate(backbone, [(pendant, 1.0)], goal)
+            if cand is not None:
+                ranked.append(cand)
 
     ranked.sort(key=lambda c: (-c.score, -c.descriptors.get("oh_density", 0.0),
                                c.backbone.key, c.pendant.key))
-    out = []
-    for rank, c in enumerate(ranked[:limit], 1):
-        out.append({
-            "rank": rank,
-            "name": f"{c.backbone.name} bearing {c.pendant.name}",
-            "backbone": c.backbone.name,
-            "pendant": c.pendant.name,
-            "repeat_unit_smiles": repeat_unit(c.backbone, c.pendant),
-            "screened_oligomer_smiles": c.smiles,
-            "screened_units": SCREEN_UNITS,
-            "backbone_tg_c": c.backbone.tg_c,
-            "charge": c.pendant.charge,
-            "score": c.score,
-            "mechanism": f"{c.backbone.mechanism} {c.pendant.mechanism}",
-            "supports": c.reasons,
-            "risks": c.risks,
-            "alerts_fired": c.alerts,
-            "descriptors": c.descriptors,
-            "suggested_experiments": experiments(c, goal),
-            # Handed to the existing screen, which is what actually judges it.
-            "screen_as": {
-                "repeat_unit": repeat_unit(c.backbone, c.pendant),
-                "end_group_a": "[*][H]",
-                "end_group_b": "[*][H]",
-            },
-        })
-    return out
+    return [candidate_dict(c, goal, rank) for rank, c in enumerate(ranked[:limit], 1)]
 
 
 LIMITS = (
@@ -470,9 +778,12 @@ LIMITS = (
     "The ranking is a triage ordering for laboratory work — it is NOT a prediction that a "
     "candidate will stabilise this protein. No molecular dynamics, no free-energy or "
     "preferential-interaction calculation and no Tm prediction was performed; those require "
-    "the compatibility simulation that is not built. Tg values are homopolymer literature "
-    "values, not the Tg of a real copolymer or cake, which depends on composition, moisture "
-    "and processing. Every candidate is grade D and 'Data gap: test' until laboratory data "
+    "the compatibility simulation that is not built. Tg is a HOMOPOLYMER value either predicted "
+    "for the repeat unit from experimental data (scaffold-split error about 36 C, and each "
+    "candidate reports whether it fell inside the model's domain) or taken from the backbone's "
+    "handbook value; neither is the Tg of a real copolymer or cake, which depends on composition, "
+    "moisture and processing and has to be measured by modulated DSC. Every candidate is grade D "
+    "and 'Data gap: test' until laboratory data "
     "exists. Nothing here addresses synthesis feasibility, polydispersity, endotoxin, "
     "immunogenicity or clearance, any of which can rule out a candidate on its own."
 )

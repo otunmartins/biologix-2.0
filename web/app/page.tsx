@@ -7,16 +7,21 @@ import Results from '@/components/Results';
 import ScreenForm, { type Mode } from '@/components/ScreenForm';
 import { GradeBox } from '@/components/badges';
 import { Info, Molecule, Spinner, Triangle } from '@/components/icons';
+import BenchmarkPanel from '@/components/BenchmarkPanel';
 import {
   API_URL,
   getHealth,
-  runDesign,
+  iterateDesign,
+  queueCandidates,
   runScreen,
-  type Candidate,
-  type DesignResult,
+  type DesignGoal,
   type Dossier,
   type Grade,
   type Health,
+  type IterationMetrics,
+  type QueueSummary,
+  type Recommendation,
+  type StoredCandidate,
 } from '@/lib/api';
 import {
   DEFAULT_FORM,
@@ -120,9 +125,9 @@ function EmptyState() {
 
 const DESIGN_STEPS = [
   ['Read the goal', 'A model reads the temperature, duration and format out of your words — and does nothing else.'],
-  ['Enumerate', 'Every backbone is paired with every pendant group from a curated motif table and built as a real structure.'],
-  ['Screen', 'Each chain goes through the same structural alerts and rule table as any other excipient here.'],
-  ['Rank', 'Scored on hydration, glass transition, charge and the alerts that actually fired, for laboratory triage.'],
+  ['Propose', 'Each iteration proposes a batch of copolymers — a backbone with a weighted mixture of pendants — from a curated motif table, built as real structures.'],
+  ['Screen', 'Each chain goes through the same structural alerts and rule table as any other excipient here, and is scored on hydration, glass transition, charge and the alerts that fired.'],
+  ['Learn', 'A surrogate learns which compositions score well and steers the next batch — a triage proxy, not a stabilisation prediction. Promising candidates queue for an OpenMM run.'],
 ] as const;
 
 function DesignEmpty() {
@@ -199,11 +204,23 @@ function LoadingState({ elapsed }: { elapsed: number }) {
 
 type Workflow = 'screen' | 'design';
 
+interface CampaignView {
+  campaignId: string;
+  iteration: number;
+  goal: DesignGoal;
+  candidates: StoredCandidate[];
+  history: IterationMetrics[];
+  recommendation: Recommendation;
+  limits: string;
+  verdict: string;
+}
+
 export default function Home() {
   const [workflow, setWorkflow] = useState<Workflow>('screen');
   const [mode, setMode] = useState<Mode>('form');
   const [designPrompt, setDesignPrompt] = useState('');
-  const [designResult, setDesignResult] = useState<DesignResult | null>(null);
+  const [campaign, setCampaign] = useState<CampaignView | null>(null);
+  const [queueingId, setQueueingId] = useState<string | null>(null);
   const [form, setForm] = useState<Form>(DEFAULT_FORM);
   const [freeText, setFreeText] = useState(
     'Is polysorbate 80 a concern for my antibody given subcutaneously, stored at room temperature?',
@@ -280,6 +297,7 @@ export default function Home() {
     }
   }, [mode, form, freeText]);
 
+  // Start a campaign: iteration 1 from the goal in the user's words.
   const design = useCallback(async () => {
     if (!designPrompt.trim()) return;
     abortRef.current?.abort();
@@ -288,9 +306,19 @@ export default function Home() {
     setLoading(true);
     setElapsed(0);
     setError(null);
-    setDesignResult(null);
+    setCampaign(null);
     try {
-      setDesignResult(await runDesign(designPrompt, null, ctrl.signal));
+      const r = await iterateDesign({ prompt: designPrompt }, ctrl.signal);
+      setCampaign({
+        campaignId: r.campaign_id,
+        iteration: r.iteration,
+        goal: r.goal,
+        candidates: r.candidates,
+        history: r.metrics_history,
+        recommendation: r.recommendation,
+        limits: r.limits,
+        verdict: r.verdict,
+      });
     } catch (e) {
       if ((e as Error).name !== 'AbortError') setError((e as Error).message);
     } finally {
@@ -298,24 +326,72 @@ export default function Home() {
     }
   }, [designPrompt]);
 
+  // The active-learning button: one more batch, appended to what is already shown.
+  const iterateNext = useCallback(async () => {
+    if (!campaign) return;
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setLoading(true);
+    setElapsed(0);
+    setError(null);
+    try {
+      const r = await iterateDesign({ campaignId: campaign.campaignId }, ctrl.signal);
+      setCampaign((prev) =>
+        prev && {
+          ...prev,
+          iteration: r.iteration,
+          candidates: [...prev.candidates, ...r.candidates],
+          history: r.metrics_history,
+          recommendation: r.recommendation,
+        },
+      );
+    } catch (e) {
+      if ((e as Error).name !== 'AbortError') setError((e as Error).message);
+    } finally {
+      if (abortRef.current === ctrl) setLoading(false);
+    }
+  }, [campaign]);
+
+  const queueCandidate = useCallback(async (c: StoredCandidate) => {
+    setQueueingId(c.id);
+    setError(null);
+    try {
+      await queueCandidates([c.id]);
+      setCampaign((prev) =>
+        prev && {
+          ...prev,
+          candidates: prev.candidates.map((x) =>
+            x.id === c.id ? { ...x, status: 'queued' } : x,
+          ),
+        },
+      );
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setQueueingId(null);
+    }
+  }, []);
+
   // Ctrl/Cmd+Enter runs from anywhere, including inside the textareas.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !loading) {
         e.preventDefault();
-        (workflow === 'design' ? design : run)();
+        // In a running campaign, Ctrl+Enter runs the next iteration.
+        (workflow === 'design' ? (campaign ? iterateNext : design) : run)();
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [run, design, workflow, loading]);
+  }, [run, design, iterateNext, campaign, workflow, loading]);
 
   const updateForm = useCallback((patch: Partial<Form>) => setForm((f) => ({ ...f, ...patch })), []);
 
 
   // A candidate is only a hypothesis until the screen judges it, so handing it
   // over switches workflow and fills the polymer description in place.
-  const screenCandidate = useCallback((c: Candidate) => {
+  const screenCandidate = useCallback((c: StoredCandidate) => {
     setForm((f) => ({
       ...f,
       excipient: c.name,
@@ -332,6 +408,28 @@ export default function Home() {
     setDossier(null);
     setError(null);
   }, []);
+
+  // The queue panel is derived from the candidates on screen, so it always reflects
+  // this campaign rather than the global backlog the queue endpoint reports.
+  const queueView: QueueSummary | null = campaign
+    ? (() => {
+        const byStatus: Record<string, number> = {};
+        campaign.candidates.forEach((c) => {
+          byStatus[c.status] = (byStatus[c.status] || 0) + 1;
+        });
+        const queued = campaign.candidates
+          .filter((c) => c.status === 'queued')
+          .sort((a, b) => b.score - a.score);
+        return {
+          n_queued: queued.length,
+          n_benchmarked: byStatus['benchmarked'] || 0,
+          n_simulated: byStatus['simulated'] || 0,
+          by_status: byStatus,
+          top: queued.slice(0, 5).map((c) => ({ id: c.id, name: c.name, score: c.score })),
+          note: '',
+        };
+      })()
+    : null;
 
   return (
     <div className="flex min-h-screen flex-col lg:h-screen">
@@ -394,43 +492,68 @@ export default function Home() {
           )}
         </aside>
 
-        <main className="flex-1 lg:min-h-0 lg:overflow-y-auto">
-          {(api.kind === 'down' || (api.kind === 'up' && !api.health.model_configured) || error) && (
-            <div className="space-y-3 px-6 pt-6 lg:px-10">
-              {api.kind === 'down' && (
-                <Notice tone="alert" title={`API unreachable at ${API_URL}`}>
-                  Start it with <code className="font-mono">uvicorn main:app --port 8000</code> in{' '}
-                  <code className="font-mono">api/</code>.
-                </Notice>
-              )}
-              {api.kind === 'up' && !api.health.model_configured && (
-                <Notice tone="gap" title="API is up, but no model key is configured">
-                  Set <code className="font-mono">ANTHROPIC_API_KEY</code> in the API environment — screens
-                  fail with 503 until you do.
-                </Notice>
-              )}
-              {error && (
-                <Notice tone="alert" title="Screen failed">
-                  {error}
-                </Notice>
-              )}
-            </div>
-          )}
+        <main className="flex flex-1 flex-col lg:min-h-0 lg:flex-row">
+          <div className="flex-1 lg:min-h-0 lg:overflow-y-auto">
+            {(api.kind === 'down' || (api.kind === 'up' && !api.health.model_configured) || error) && (
+              <div className="space-y-3 px-6 pt-6 lg:px-10">
+                {api.kind === 'down' && (
+                  <Notice tone="alert" title={`API unreachable at ${API_URL}`}>
+                    Start it with <code className="font-mono">uvicorn main:app --port 8000</code> in{' '}
+                    <code className="font-mono">api/</code>.
+                  </Notice>
+                )}
+                {api.kind === 'up' && !api.health.model_configured && (
+                  <Notice tone="gap" title="API is up, but no model key is configured">
+                    Set <code className="font-mono">ANTHROPIC_API_KEY</code> in the API environment — screens
+                    fail with 503 until you do.
+                  </Notice>
+                )}
+                {error && (
+                  <Notice tone="alert" title={workflow === 'design' ? 'Design failed' : 'Screen failed'}>
+                    {error}
+                  </Notice>
+                )}
+              </div>
+            )}
 
-          {workflow === 'design' ? (
-            loading ? (
+            {workflow === 'design' ? (
+              // A campaign stays on screen while the next batch loads; only the very
+              // first proposal shows the full skeleton.
+              !campaign && loading ? (
+                <LoadingState elapsed={elapsed} />
+              ) : campaign ? (
+                <DesignResults
+                  goal={campaign.goal}
+                  candidates={campaign.candidates}
+                  limits={campaign.limits}
+                  verdict={campaign.verdict}
+                  onScreen={screenCandidate}
+                  onQueue={queueCandidate}
+                  queueing={queueingId}
+                />
+              ) : (
+                <DesignEmpty />
+              )
+            ) : loading ? (
               <LoadingState elapsed={elapsed} />
-            ) : designResult ? (
-              <DesignResults result={designResult} onScreen={screenCandidate} />
+            ) : dossier ? (
+              <Results dossier={dossier} context={context} onRerun={run} loading={loading} />
             ) : (
-              <DesignEmpty />
-            )
-          ) : loading ? (
-            <LoadingState elapsed={elapsed} />
-          ) : dossier ? (
-            <Results dossier={dossier} context={context} onRerun={run} loading={loading} />
-          ) : (
-            <EmptyState />
+              <EmptyState />
+            )}
+          </div>
+
+          {workflow === 'design' && campaign && (
+            <aside className="shrink-0 border-t border-slate-200 bg-slate-50 lg:min-h-0 lg:w-[360px] lg:border-l lg:border-t-0">
+              <BenchmarkPanel
+                iteration={campaign.iteration}
+                history={campaign.history}
+                recommendation={campaign.recommendation}
+                queue={queueView}
+                loading={loading}
+                onIterate={iterateNext}
+              />
+            </aside>
           )}
         </main>
       </div>

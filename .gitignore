@@ -18,3 +18,4 @@ terraform/*.tfvars
 # the pickle the designer silently falls back to the backbone handbook table.
 tg_data.csv
 measurements.db
+campaigns.db
