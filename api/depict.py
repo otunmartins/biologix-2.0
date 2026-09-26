@@ -26,7 +26,7 @@ RDLogger.DisableLog("rdApp.*")
 
 # The longest thing drawn is a screened oligomer, a few hundred characters.
 MAX_SMILES = 1000
-MIN_SIDE, MAX_SIDE = 60, 800
+MIN_SIDE, MAX_SIDE = 32, 800
 
 
 @lru_cache(maxsize=4096)

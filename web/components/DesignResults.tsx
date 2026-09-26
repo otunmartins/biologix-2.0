@@ -12,13 +12,15 @@ interface Props {
   limits: string;
   verdict: string;
   // Hands the candidate to the screening form, which is what actually judges it.
-  onScreen: (c: StoredCandidate) => void;
+  onScreen?: (c: StoredCandidate) => void;
   // Sends the candidate to the OpenMM simulation backlog.
-  onQueue: (c: StoredCandidate) => void;
-  queueing: string | null;
+  onQueue?: (c: StoredCandidate) => void;
+  queueing?: string | null;
+  // History shows a campaign as it stood; acting on it happens in the workspace.
+  readOnly?: boolean;
 }
 
-function GoalChips({ goal: g }: { goal: DesignGoal }) {
+export function GoalChips({ goal: g }: { goal: DesignGoal }) {
   const chips = [
     g.protein,
     g.route,
@@ -110,12 +112,14 @@ function CandidateCard({
   onScreen,
   onQueue,
   queueing,
+  readOnly,
 }: {
   c: StoredCandidate;
   defaultOpen: boolean;
   onScreen: () => void;
   onQueue: () => void;
   queueing: boolean;
+  readOnly?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   const clean = c.alerts_fired.length === 0;
@@ -208,19 +212,21 @@ function CandidateCard({
             </ul>
           </div>
 
-          <div className="flex flex-wrap gap-2">
-            <button type="button" className="btn-ghost" onClick={onScreen}>
-              Screen this candidate →
-            </button>
-            <button
-              type="button"
-              className="btn-ghost"
-              onClick={onQueue}
-              disabled={queued || queueing}
-            >
-              {queued ? 'Queued for simulation ✓' : queueing ? 'Queuing…' : 'Queue for simulation'}
-            </button>
-          </div>
+          {!readOnly && (
+            <div className="flex flex-wrap gap-2">
+              <button type="button" className="btn-ghost" onClick={onScreen}>
+                Screen this candidate →
+              </button>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={onQueue}
+                disabled={queued || queueing}
+              >
+                {queued ? 'Queued for simulation ✓' : queueing ? 'Queuing…' : 'Queue for simulation'}
+              </button>
+            </div>
+          )}
         </div>
       )}
     </li>
@@ -234,7 +240,8 @@ export default function DesignResults({
   verdict,
   onScreen,
   onQueue,
-  queueing,
+  queueing = null,
+  readOnly = false,
 }: Props) {
   // Newest iteration first; within an iteration, highest score first.
   const iterations = Array.from(new Set(candidates.map((c) => c.iteration))).sort((a, b) => b - a);
@@ -242,19 +249,22 @@ export default function DesignResults({
 
   return (
     <div className="space-y-6 px-6 py-7 lg:px-10">
-      <header>
-        <div className="eyebrow">Candidate polymers</div>
-        <h1 className="mt-1.5 text-2xl font-semibold tracking-tight text-slate-900 sm:text-[28px]">
-          {candidates.length} candidates screened
-        </h1>
-        <p className="mt-2 text-[15px] text-slate-500">
-          Copolymers proposed and screened over {iterations.length} iteration
-          {iterations.length === 1 ? '' : 's'}. Every candidate is grade D, verdict &ldquo;{verdict}&rdquo;.
-        </p>
-        <div className="mt-3">
-          <GoalChips goal={goal} />
-        </div>
-      </header>
+      {/* In history the campaign's own header already says all this. */}
+      {!readOnly && (
+        <header>
+          <div className="eyebrow">Candidate polymers</div>
+          <h1 className="mt-1.5 text-2xl font-semibold tracking-tight text-slate-900 sm:text-[28px]">
+            {candidates.length} candidates screened
+          </h1>
+          <p className="mt-2 text-[15px] text-slate-500">
+            Copolymers proposed and screened over {iterations.length} iteration
+            {iterations.length === 1 ? '' : 's'}. Every candidate is grade D, verdict &ldquo;{verdict}&rdquo;.
+          </p>
+          <div className="mt-3">
+            <GoalChips goal={goal} />
+          </div>
+        </header>
+      )}
 
       <div className="flex gap-3 rounded-xl border border-gap-line bg-gap-soft px-4 py-3.5 text-[15px] leading-relaxed text-slate-800">
         <Triangle className="mt-0.5 h-5 w-5 shrink-0 text-gap" />
@@ -281,9 +291,10 @@ export default function DesignResults({
                   key={c.id}
                   c={c}
                   defaultOpen={c.id === topId}
-                  onScreen={() => onScreen(c)}
-                  onQueue={() => onQueue(c)}
+                  onScreen={() => onScreen?.(c)}
+                  onQueue={() => onQueue?.(c)}
                   queueing={queueing === c.id}
+                  readOnly={readOnly}
                 />
               ))}
             </ul>
