@@ -6,20 +6,26 @@ fully exposed. No amount of theory fixes that. Measurement does. So this is the
 other half of the loop: a user records what their own biologic actually did,
 and the calibration layer fits to it.
 
+POSTGRES, AS PROMISED. This used to be a sqlite file, and the note here said the
+SQL was deliberately portable -- TEXT uuid primary keys, explicit timestamps, no
+SQLite-only types -- so the move would be a connection change rather than a
+migration of the data model. That turned out to be true: the table definitions
+below are unchanged, and what moved is in db.py. The one substantive edit was
+REAL -> DOUBLE PRECISION, because Postgres REAL is four bytes where sqlite's was
+eight. See db.py for the one behavioural difference that does matter: a rejected
+statement poisons the transaction until someone rolls back.
+
 DESIGN NOTES FOR WHAT IS COMING:
 
   Authentication. observed_by is a free-text string and nullable. When auth
   lands it becomes a foreign key to a users table; nothing else changes, and
-  existing rows keep whatever was typed.
+  existing rows keep whatever was typed. observed_by stays as the record of who
+  was named, not of who was authenticated.
 
   OpenMM. A simulated result is an observation like any other, so source
   distinguishes experiment / simulation / literature. Calibration can then
   weight a measured Tm above a computed one instead of pretending they are the
   same evidence, and a GPU run slots in without a schema change.
-
-  Postgres. The SQL below is deliberately portable: TEXT primary keys (uuid4,
-  not autoincrement), explicit timestamps, no SQLite-only types. Moving to RDS
-  is a connection change, not a migration of the data model.
 
 REPRODUCIBILITY IS PART OF THE ROW, NOT A COMMENT. An observation that cannot
 be traced back to its conditions is not evidence. Every row carries the buffer,
@@ -30,15 +36,14 @@ is_calibration_grade returns False and the calibration layer will skip it.
 
 import json
 import os
-import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Literal
 
+import psycopg
 from pydantic import BaseModel, Field, field_validator
 
-DB_PATH = os.environ.get("MEASUREMENT_DB") or os.path.join(
-    os.environ.get("IID_CACHE_DIR") or ".", "measurements.db")
+import db
 
 # What can be recorded. Constrained deliberately: a free-text quantity cannot be
 # compared across runs, and calibration needs to know what it is fitting.
@@ -156,11 +161,11 @@ CREATE TABLE IF NOT EXISTS measurement (
     excipient_smiles       TEXT NOT NULL DEFAULT '',
     concentration          TEXT NOT NULL DEFAULT '',
     quantity               TEXT NOT NULL,
-    value                  REAL NOT NULL,
-    sd                     REAL,
+    value                  DOUBLE PRECISION NOT NULL,
+    sd                     DOUBLE PRECISION,
     n_replicates           INTEGER NOT NULL DEFAULT 1,
     buffer                 TEXT NOT NULL DEFAULT '',
-    ph                     REAL,
+    ph                     DOUBLE PRECISION,
     protein_concentration  TEXT NOT NULL DEFAULT '',
     format                 TEXT NOT NULL DEFAULT '',
     stress                 TEXT NOT NULL DEFAULT '',
@@ -172,7 +177,7 @@ CREATE TABLE IF NOT EXISTS measurement (
     observed_at            TEXT NOT NULL,
     protocol               TEXT NOT NULL DEFAULT '',
     raw_data_ref           TEXT NOT NULL DEFAULT '',
-    predicted_value        REAL,
+    predicted_value        DOUBLE PRECISION,
     prediction_ref         TEXT NOT NULL DEFAULT '',
     -- Reproducibility: which build of this app wrote the row.
     recorded_by_version    TEXT NOT NULL DEFAULT ''
@@ -184,45 +189,43 @@ CREATE INDEX IF NOT EXISTS measurement_by_quantity ON measurement(biologic_id, q
 APP_VERSION = os.environ.get("APP_VERSION", "dev")
 
 
-def connect(path: str | None = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(path or DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(SCHEMA)
+def connect(url: str | None = None) -> psycopg.Connection:
+    conn = db.connect(url)
+    db.init_schema(conn, SCHEMA)
     return conn
 
 
-def add_biologic(conn: sqlite3.Connection, b: Biologic) -> str:
-    conn.execute(
-        "INSERT INTO biologic (id, name, sequence, structure_id, modality, notes, created_at)"
-        " VALUES (?,?,?,?,?,?,?)",
-        (b.id, b.name, b.sequence, b.structure_id, b.modality, b.notes,
-         datetime.now(timezone.utc).isoformat()))
-    conn.commit()
+def add_biologic(conn: psycopg.Connection, b: Biologic) -> str:
+    with db.tx(conn):
+        conn.execute(
+            "INSERT INTO biologic (id, name, sequence, structure_id, modality, notes, created_at)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (b.id, b.name, b.sequence, b.structure_id, b.modality, b.notes,
+             datetime.now(timezone.utc).isoformat()))
     return b.id
 
 
-def add_measurement(conn: sqlite3.Connection, m: Measurement) -> str:
+def add_measurement(conn: psycopg.Connection, m: Measurement) -> str:
     row = m.model_dump()
     row["recorded_by_version"] = APP_VERSION
     cols = ", ".join(row)
-    conn.execute(f"INSERT INTO measurement ({cols}) VALUES ({', '.join('?' * len(row))})",
-                 tuple(row.values()))
-    conn.commit()
+    with db.tx(conn):
+        conn.execute(f"INSERT INTO measurement ({cols}) VALUES ({', '.join(['%s'] * len(row))})",
+                     tuple(row.values()))
     return m.id
 
 
-def measurements_for(conn: sqlite3.Connection, biologic_id: str,
+def measurements_for(conn: psycopg.Connection, biologic_id: str,
                      quantity: str | None = None) -> list[dict]:
-    sql = "SELECT * FROM measurement WHERE biologic_id = ?"
+    sql = "SELECT * FROM measurement WHERE biologic_id = %s"
     args: list = [biologic_id]
     if quantity:
-        sql += " AND quantity = ?"
+        sql += " AND quantity = %s"
         args.append(quantity)
     return [dict(r) for r in conn.execute(sql + " ORDER BY observed_at", args)]
 
 
-def summary(conn: sqlite3.Connection, biologic_id: str) -> dict:
+def summary(conn: psycopg.Connection, biologic_id: str) -> dict:
     """What this biologic has on record, and how much of it can be fitted.
 
     Reported per quantity rather than as one total, because a pile of
@@ -265,9 +268,9 @@ def summary(conn: sqlite3.Connection, biologic_id: str) -> dict:
     }
 
 
-def export(conn: sqlite3.Connection, biologic_id: str) -> str:
+def export(conn: psycopg.Connection, biologic_id: str) -> str:
     """Everything recorded for one biologic, as JSON, for reproduction elsewhere."""
-    bio = conn.execute("SELECT * FROM biologic WHERE id = ?", (biologic_id,)).fetchone()
+    bio = conn.execute("SELECT * FROM biologic WHERE id = %s", (biologic_id,)).fetchone()
     return json.dumps({
         "biologic": dict(bio) if bio else None,
         "measurements": measurements_for(conn, biologic_id),

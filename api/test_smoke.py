@@ -22,6 +22,31 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel  # noqa: E402
 
 import main  # noqa: E402
 
+# The stores are Postgres now, so the suite needs a database of its own: it DROPs
+# and recreates the domain tables so a rerun is never polluted by the last one.
+# Point TEST_DATABASE_URL at a separate Neon branch (or a second local database),
+# never at the one the app uses.
+TEST_DB = os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL", "")
+
+
+def fresh_store(module):
+    """A connection to the test database with this module's tables freshly made."""
+    if not TEST_DB.strip():
+        raise SystemExit(
+            "set TEST_DATABASE_URL (or DATABASE_URL) to a Postgres connection string. "
+            "Locally:  docker run -d --name biologix-pg -e POSTGRES_PASSWORD=devpass "
+            "-e POSTGRES_USER=biologix -e POSTGRES_DB=biologix -p 5432:5432 postgres:16")
+    conn = main.db.connect(TEST_DB)
+    with main.db.tx(conn):
+        # CASCADE and the order together: candidate references campaign,
+        # measurement references biologic.
+        conn.execute("DROP TABLE IF EXISTS candidate, iteration, campaign, "
+                     "measurement, biologic CASCADE")
+    main.db.reset_schema_cache()
+    conn.close()
+    return module.connect(TEST_DB)
+
+
 PS80 = "Polysorbate 80"
 PS80_SMILES = "CCCCCCCCC=CCCCCCCCC(=O)OCCOCCOCCO"  # the surrogate resolve_identity returns
 SEQ = "EVQLVESGGGLVQPGGSLRMWCNKHTYIHWVRQAPGKGLEWVA"
@@ -577,10 +602,9 @@ def main_test():
     print("ok  exposure: the dossier carries the computed margins, not the model's")
 
     # --- measurement store ----------------------------------------------------
-    import tempfile
     MS = main.measurements
 
-    conn = MS.connect(os.path.join(tempfile.mkdtemp(), "t.db"))
+    conn = fresh_store(MS)
     bid = MS.add_biologic(conn, MS.Biologic(name="Test mAb", structure_id="1IGT", modality="mAb"))
 
     full = MS.Measurement(biologic_id=bid, excipient="Trehalose", concentration="0.5 M",
@@ -618,7 +642,7 @@ def main_test():
                                                 quantity="tm_c", value=1.0))
         raise AssertionError("a measurement with no biologic was accepted")
     except Exception as e:
-        assert "IntegrityError" in type(e).__name__, e
+        assert isinstance(e, main.db.IntegrityError), f"{type(e).__name__}: {e}"
     exported = json.loads(MS.export(conn, bid))
     assert exported["biologic"]["name"] == "Test mAb"
     assert all(r["recorded_by_version"] for r in exported["measurements"])
@@ -976,7 +1000,7 @@ def main_test():
 
     # --- campaign store + simulation queue ------------------------------------
     CS = main.candidates
-    conn = CS.connect(os.path.join(tempfile.mkdtemp(), "campaigns.db"))
+    conn = fresh_store(CS)
     cid = CS.create_campaign(conn, goal_lyo.model_dump())
     prior2 = []
     for it in range(1, 4):
@@ -1010,7 +1034,7 @@ def main_test():
             "payload": {}, "backbone_key": mab.key, "components": [[treh.key, 1.0]], "score": 1.0}])
         raise AssertionError("a candidate with no campaign was accepted")
     except Exception as e:
-        assert "IntegrityError" in type(e).__name__, e
+        assert isinstance(e, main.db.IntegrityError), f"{type(e).__name__}: {e}"
     print("ok  campaign store: orphan candidates rejected, every row stamped with a version")
 
     # --- orchestration (advisory campaign controller) -------------------------

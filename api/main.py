@@ -36,6 +36,7 @@ from rdkit import Chem
 import accessibility
 import active
 import candidates
+import db
 import orchestrator
 import design
 import exposure
@@ -1021,7 +1022,26 @@ def health():
         "precedent_lookup": PRECEDENT_LOOKUP_AVAILABLE,
         "precedent_index": precedent.index_status(),
         "tg_model": tg_model.available(),
+        # Fourth thing to check, and the one that now fails loudest: campaigns and
+        # measurements live in Postgres, so a box that cannot reach it answers
+        # /health but fails every design iteration.
+        "database": _database_status(),
     }
+
+
+def _database_status() -> dict:
+    """Reachable or not, and why not. Never raises — /health must always answer."""
+    try:
+        conn = db.connect()
+    except Exception as e:
+        return {"reachable": False, "error": f"{type(e).__name__}: {e}"}
+    try:
+        conn.execute("SELECT 1")
+        return {"reachable": True}
+    except Exception as e:
+        return {"reachable": False, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        conn.close()
 
 
 @app.post("/design")

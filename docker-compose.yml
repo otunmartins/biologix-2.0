@@ -25,6 +25,9 @@ services:
       - WEB_ORIGIN=${WEB_ORIGIN}
       - IID_CACHE_DIR=/cache
       - OPENFDA_API_KEY=${OPENFDA_API_KEY:-}
+      # Postgres (Neon). The volume below no longer holds application data —
+      # campaigns and measurements are in Postgres; /cache is only the FDA file.
+      - DATABASE_URL=${DATABASE_URL}
     volumes:
       # The FDA Inactive Ingredient file is fetched once and reused for 30 days.
       # Without this it lands in the container's /tmp and is re-downloaded after

@@ -5,3 +5,4 @@ rdkit
 biopython
 httpx
 scikit-learn
+psycopg[binary]
