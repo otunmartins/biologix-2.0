@@ -182,6 +182,8 @@ export interface SimulationResult {
   smoke: boolean;
   // A short CPU run: not converged, never recorded as a measurement.
   preview?: boolean;
+  // The worker saved the last frame for the 3D view (absent on older runs).
+  has_snapshot?: boolean;
   notes: string[];
 }
 
@@ -528,6 +530,114 @@ export async function getMySimulation(
   return res.json();
 }
 
+// ---- the Results tab: screens, candidates and simulations, with their metrics ----
+// Shapes are api/results.py's; what each score means is written there.
+
+export type GammaCall = 'excluded' | 'accumulated' | 'unclear';
+
+export interface ExcipientResult {
+  excipient: string;
+  latest_id: string;
+  latest_at: string;
+  protein: string;
+  route: string;
+  n_screens: number;
+  // Share of endpoints Precedented or Supported: how much is known, not safety.
+  coverage: number | null;
+  worst_verdict: string | null;
+  n_endpoints: number;
+  n_gaps: number;
+  n_alerts: number;
+  n_high_liabilities: number;
+}
+
+export interface CampaignResult {
+  id: string;
+  created_at: string;
+  ended_at: string | null;
+  prompt: string;
+  protein: string;
+  format: string;
+  target_temp_c: number | null;
+  n_candidates: number;
+  n_iterations: number;
+  best_score: number | null;
+  median_score: number | null;
+  alert_free: number | null;
+  n_sent: number;
+  n_simulated: number;
+  best_by_iteration: number[];
+  top: { id: string; name: string; score: number; status: CandidateStatus } | null;
+}
+
+export interface SimulationRun {
+  id: string;
+  campaign_id: string;
+  name: string;
+  protein: string;
+  triage_score: number;
+  gamma23: number;
+  gamma23_se: number | null;
+  call: GammaCall;
+  preview: boolean;
+  production_ns: number | null;
+  finished_at: string | null;
+}
+
+export interface MyResults {
+  screens: {
+    total: number;
+    ok: number;
+    failed: number;
+    needs_testing: number;
+    coverage_mean: number | null;
+    worst_verdict: Record<string, number>;
+    endpoint_verdicts: Record<string, number>;
+    grades: Record<string, number>;
+    liabilities: Record<'high' | 'moderate' | 'low', number>;
+    excipients: ExcipientResult[];
+  };
+  design: {
+    campaigns: number;
+    candidates: number;
+    iterations: number;
+    by_status: Record<CandidateStatus, number>;
+    alert_free: number | null;
+    tg_in_domain: number | null;
+    per_campaign: CampaignResult[];
+  };
+  simulations: {
+    by_state: Record<'waiting' | 'running' | 'done' | 'failed', number>;
+    calls: Record<GammaCall, number>;
+    runs: SimulationRun[];
+  };
+  cpu_preview_ns: number;
+}
+
+// The 3D view (MolViewer): a run's last frame as PDB text, or the biologic's
+// structure as mmCIF, both through the API so the session cookie travels.
+async function getText(path: string, signal?: AbortSignal): Promise<string> {
+  const res = await call(path, { signal });
+  if (!res.ok) throw new Error(await detailOf(res));
+  return res.text();
+}
+
+export function getSimulationSnapshot(id: string, signal?: AbortSignal): Promise<string> {
+  return getText(`/design/my-simulations/${encodeURIComponent(id)}/snapshot.pdb`, signal);
+}
+
+export function getStructureModel(structureId: string, signal?: AbortSignal): Promise<string> {
+  return getText(`/structure/model/${encodeURIComponent(structureId)}`, signal);
+}
+
+export function getConformer(smiles: string, signal?: AbortSignal): Promise<string> {
+  return getText(`/structure/conformer?${new URLSearchParams({ smiles })}`, signal);
+}
+
+export function getMyResults(signal?: AbortSignal): Promise<MyResults> {
+  return getJson('/design/my-results', signal);
+}
+
 // Denies a waiting or approved job, or stops a running one. True when it stopped a run.
 export async function declineSimulation(id: string, reason: string): Promise<boolean> {
   const res = await call(`/design/simulations/${encodeURIComponent(id)}/decline`, {
@@ -566,8 +676,13 @@ export interface AdminStats {
     simulations: number[];
     active_users: number[];
     users_cumulative: number[];
+    events: number[];
   };
   screens: {
+    // Share of each screen's endpoints that are Precedented or Supported.
+    coverage_mean: number | null;
+    coverage: Bin[];
+    liabilities: Record<'high' | 'moderate' | 'low', number>;
     worst_verdict: Record<string, number>;
     endpoint_verdicts: Record<string, number>;
     grades: Record<string, number>;
@@ -577,6 +692,9 @@ export interface AdminStats {
     duration_p90_s: number | null;
   };
   polymers: {
+    candidates_per_campaign: Bin[];
+    iterations_per_campaign: Bin[];
+    alert_free: number | null;
     by_backbone: Record<string, number>;
     by_status: Record<string, number>;
     by_format: Record<string, number>;
@@ -589,7 +707,11 @@ export interface AdminStats {
     gamma23: Bin[];
     gamma23_excluded: number;
     gamma23_accumulated: number;
+    calls: Record<GammaCall, number>;
+    previews: number;
   };
+  // Event kinds in the period: what kind of thing happened, never what.
+  events: Record<HistoryEvent['kind'], number>;
 }
 
 export async function getAdminStats(days: number, signal?: AbortSignal): Promise<AdminStats> {

@@ -8,7 +8,7 @@ import { getMySimulation, getMySimulations, type HistoryEvent, type MySimulation
 import { ago, fullStamp } from '@/lib/when';
 
 // Every simulation the signed-in user has sent off, across all their campaigns,
-// and one at a time in full. The list refreshes itself while anything is
+// and one at a time in full: the Simulations section of the Results tab. The list refreshes itself while anything is
 // waiting or running; an open simulation refreshes itself while it runs.
 
 type Filter = 'all' | 'active' | 'done' | 'failed';
@@ -41,7 +41,7 @@ function TierChip({ tier }: { tier: 'gpu' | 'cpu' | null | undefined }) {
   );
 }
 
-function Detail({
+export function SimulationDetail({
   id,
   onClose,
   onOpenCampaign,
@@ -126,7 +126,7 @@ function Detail({
           {s && (
             <>
               {s.simulation ? (
-                <SimulationPanel sim={s.simulation} status={s.status} />
+                <SimulationPanel sim={s.simulation} status={s.status} candidateId={s.id} />
               ) : (
                 <p className="text-sm text-slate-600">
                   Queued before structures were asked for. Queue it again from its campaign with the biologic’s PDB ID
@@ -162,7 +162,6 @@ function Detail({
 
 export default function SimulationsView({ onOpenCampaign }: { onOpenCampaign: (campaignId: string) => void }) {
   const [sims, setSims] = useState<MySimulation[] | null>(null);
-  const [previewNs, setPreviewNs] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
   const [open, setOpen] = useState<string | null>(null);
@@ -171,7 +170,6 @@ export default function SimulationsView({ onOpenCampaign }: { onOpenCampaign: (c
     try {
       const r = await getMySimulations(signal);
       setSims(r.simulations);
-      setPreviewNs(r.cpu_preview_ns);
       setError(null);
     } catch (e) {
       if ((e as Error).name !== 'AbortError') setError((e as Error).message);
@@ -214,17 +212,7 @@ export default function SimulationsView({ onOpenCampaign }: { onOpenCampaign: (c
   );
 
   return (
-    <div className="mx-auto w-full max-w-4xl space-y-5 px-4 py-7 sm:px-6 lg:px-10">
-      <div>
-        <div className="eyebrow">OpenMM</div>
-        <h1 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">Simulations</h1>
-        <p className="mt-2 text-sm leading-relaxed text-slate-600">
-          Every candidate you have sent for simulation. An admin approves each one, as a full GPU run or, when no GPU
-          is available, a short CPU preview{previewNs !== null && ` (${previewNs} ns)`} that is not converged and never
-          counts as a measurement. Results are grade D either way until an experiment agrees.
-        </p>
-      </div>
-
+    <div className="space-y-4">
       <div className="flex flex-wrap gap-2" role="tablist" aria-label="Filter simulations">
         {(
           [
@@ -314,7 +302,7 @@ export default function SimulationsView({ onOpenCampaign }: { onOpenCampaign: (c
       )}
 
       {open && (
-        <Detail
+        <SimulationDetail
           id={open}
           onClose={() => setOpen(null)}
           onOpenCampaign={(cid) => {

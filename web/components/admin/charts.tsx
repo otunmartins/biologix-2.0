@@ -539,3 +539,115 @@ export function Columns({
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Forest plot: one estimate per row with a ±2 SE bar, on a shared axis about
+// zero. Colour is the call the bar supports (diverging pair, gray when the bar
+// crosses zero); the label and the call's word carry it too, never colour alone.
+// ---------------------------------------------------------------------------
+
+export interface ForestRow {
+  id: string;
+  label: string;
+  sub?: string;
+  value: number;
+  se: number | null;
+  color: string;
+  // Drawn hollow: an estimate to hold more loosely (a CPU preview).
+  hollow?: boolean;
+  tip: TipRow[];
+}
+
+export function ForestPlot({
+  rows,
+  unit,
+  onPick,
+}: {
+  rows: ForestRow[];
+  unit: string;
+  onPick?: (id: string) => void;
+}) {
+  const [tip, setTip] = useState<{ k: number; y: number } | null>(null);
+  const [ref, w] = useWidth<HTMLDivElement>();
+  if (!rows.length) return <p className="text-sm text-[color:var(--ink-muted)]">Nothing finished yet.</p>;
+  const reach = Math.max(1, ...rows.map((r) => Math.abs(r.value) + 2 * (r.se ?? 0)));
+  const step = reach <= 2 ? 0.5 : reach <= 5 ? 1 : reach <= 10 ? 2 : Math.ceil(reach / 5);
+  const lim = Math.ceil(reach / step) * step;
+  const pct = (v: number) => ((v + lim) / (2 * lim)) * 100;
+  const ticks: number[] = [];
+  for (let t = -lim; t <= lim + 1e-9; t += step) ticks.push(Math.round(t * 100) / 100);
+  const every = Math.ceil(ticks.length / 7);
+  return (
+    <div ref={ref} className="relative" onPointerLeave={() => setTip(null)}>
+      <ul>
+        {rows.map((r, k) => {
+          const lo = r.se !== null ? pct(r.value - 2 * r.se) : null;
+          const hi = r.se !== null ? pct(r.value + 2 * r.se) : null;
+          const show = (e: { currentTarget: HTMLElement }) => setTip({ k, y: e.currentTarget.offsetTop });
+          return (
+            <li key={r.id}>
+              <button
+                type="button"
+                onClick={() => onPick?.(r.id)}
+                onPointerEnter={show}
+                onFocus={show}
+                onBlur={() => setTip(null)}
+                aria-label={`${r.label}: ${r.value} ${r.se !== null ? `± ${r.se}` : ''} ${unit}`}
+                className={`grid w-full grid-cols-[minmax(0,2fr)_minmax(0,3fr)] items-center gap-3 rounded-md px-1 py-1.5 text-left outline-none transition hover:bg-slate-50 focus-visible:bg-slate-50 ${
+                  tip && tip.k !== k ? 'opacity-60' : ''
+                }`}
+              >
+                <span className="min-w-0">
+                  <span className="block truncate text-[13px] text-[color:var(--ink-1)]">{r.label}</span>
+                  {r.sub && <span className="block truncate text-[11px] text-[color:var(--ink-muted)]">{r.sub}</span>}
+                </span>
+                <span className="relative block h-5">
+                  <span className="absolute -bottom-1.5 -top-1.5 w-px bg-[color:var(--axis)]" style={{ left: `${pct(0)}%` }} aria-hidden="true" />
+                  {lo !== null && hi !== null && (
+                    <span
+                      className="absolute top-1/2 h-[2px] -translate-y-1/2 rounded"
+                      style={{ left: `${lo}%`, width: `${Math.max(0.5, hi - lo)}%`, background: r.color }}
+                      aria-hidden="true"
+                    />
+                  )}
+                  <span
+                    className="absolute top-1/2 h-[10px] w-[10px] -translate-x-1/2 -translate-y-1/2 rounded-full"
+                    style={{
+                      left: `${pct(r.value)}%`,
+                      background: r.hollow ? 'var(--surface-1)' : r.color,
+                      border: `2px solid ${r.color}`,
+                      boxShadow: '0 0 0 2px var(--surface-1)',
+                    }}
+                    aria-hidden="true"
+                  />
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+      <div className="grid grid-cols-[minmax(0,2fr)_minmax(0,3fr)] gap-3 px-1" aria-hidden="true">
+        <span />
+        <div className="relative mt-1 h-4 border-t border-[color:var(--axis)]">
+          {ticks.map((t) =>
+            Math.round(t / step) % every === 0 ? (
+              <span
+                key={t}
+                className="absolute top-0.5 -translate-x-1/2 text-[10px] tabular-nums text-[color:var(--ink-muted)]"
+                style={{ left: `${pct(t)}%` }}
+              >
+                {t > 0 ? `+${t}` : t < 0 ? `−${Math.abs(t)}` : '0'}
+              </span>
+            ) : null,
+          )}
+        </div>
+      </div>
+      {tip && (
+        <TooltipBox
+          tip={{ x: w * 0.4 + 8, y: tip.y + 36, title: rows[tip.k].label, rows: rows[tip.k].tip }}
+          width={w}
+        />
+      )}
+    </div>
+  );
+}

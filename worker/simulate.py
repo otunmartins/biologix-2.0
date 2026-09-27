@@ -40,6 +40,7 @@ from dataclasses import dataclass
 import numpy as np
 
 import analysis
+import snapshot
 
 AVOGADRO = 6.02214076e23
 
@@ -356,6 +357,24 @@ def run(job: dict, s: Settings, progress=lambda msg: None, should_stop=lambda: F
                      f"{np.mean(acc.gamma):+.2f}")
 
     out = acc.result()
+
+    # The last frame, protein and polymer only, for the 3D view. A picture must
+    # never cost a result, so a failure here is a note, not a failed run.
+    snap = None
+    try:
+        def resseq(r, k):
+            digits = "".join(ch for ch in str(r.id) if ch.isdigit())
+            return int(digits) if digits else k + 1
+        rnum = {r: resseq(r, k) for k, r in enumerate(protein_res)}
+        protein_atoms = [(i, atoms[i].name, atoms[i].residue.name, atoms[i].residue.chain.id,
+                          rnum[atoms[i].residue], atoms[i].element.symbol) for i in prot_heavy]
+        chains = [[(i, atoms[i].name, atoms[i].element.symbol)
+                   for i in poly_heavy[k * heavy_per_chain:(k + 1) * heavy_per_chain]]
+                  for k in range(n_chains)]
+        snap = snapshot.pdb(xyz=np.asarray(xyz), box=np.diag(vecs), protein=protein_atoms,
+                            polymer_chains=chains)
+    except Exception as e:  # noqa: BLE001
+        notes.append(f"no 3D snapshot saved ({type(e).__name__}: {e})"[:300])
     return {
         **out,
         "production_ns": s.production_ns,
@@ -368,6 +387,7 @@ def run(job: dict, s: Settings, progress=lambda msg: None, should_stop=lambda: F
         "wall_seconds": round(time.time() - t0, 1),
         "smoke": s.smoke,
         "preview": s.preview,
+        "snapshot_pdb": snap,
         "notes": notes[:18] + ([f"CPU preview: {s.production_ns:g} ns, not converged; a full GPU "
                                 "run is needed before this number means much"]
                                if s.preview else []) + [f"{n_res} protein residues; C-alpha atoms restrained to the "

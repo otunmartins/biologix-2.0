@@ -49,6 +49,10 @@ def fresh_store(module):
     return module.connect(TEST_DB)
 
 
+# A two-atom stand-in for a run's last frame (worker/snapshot.py writes the real one).
+SNAP = ("ATOM      1  CA  LYS A  45       0.000   0.000   0.000  1.00  0.00           C\n"
+        "HETATM    2  C1  POL P   1       4.000   0.000   0.000  1.00  0.00           C\nEND\n")
+
 PS80 = "Polysorbate 80"
 PS80_SMILES = "CCCCCCCCC=CCCCCCCCC(=O)OCCOCCOCCO"  # the surrogate resolve_identity returns
 SEQ = "EVQLVESGGGLVQPGGSLRMWCNKHTYIHWVRQAPGKGLEWVA"
@@ -1538,7 +1542,8 @@ def main_test():
                                      "equilibration_ns": main.CPU_PREVIEW_EQUIL_NS}, j["settings"]
             before = conn.execute("SELECT COUNT(*) AS n FROM measurement").fetchone()["n"]
             r = client.post(f"/worker/jobs/{spare['id']}/result", headers=W,
-                            json={"worker": "cpu1", "result": {**result, "production_ns": 1.0}})
+                            json={"worker": "cpu1", "result": {**result, "production_ns": 1.0,
+                                                               "snapshot_pdb": SNAP}})
             assert r.status_code == 200 and r.json()["measurement_id"] is None, \
                 "a CPU preview is never a measurement, even if the worker forgets to say so"
             assert conn.execute("SELECT COUNT(*) AS n FROM measurement").fetchone()["n"] == before
@@ -1565,6 +1570,57 @@ def main_test():
             print("ok  simulations tab: lists only your runs, active first; each opens with its "
                   "own history; someone else's is a 404")
 
+            # The Results tab: screens, candidates and simulations, each with its metrics.
+            assert client.get("/design/my-results").status_code == 401
+            res = client.get("/design/my-results", headers=as_("tok-alice")).json()
+            n = lambda sql, *a: conn.execute(sql, a).fetchone()["n"]
+            assert res["screens"]["total"] == n("SELECT COUNT(*) AS n FROM screen_run WHERE owner_id=%s", alice)
+            assert res["design"]["candidates"] == n(
+                "SELECT COUNT(*) AS n FROM candidate c JOIN campaign cp ON cp.id=c.campaign_id "
+                "WHERE cp.owner_id=%s", alice) > 0
+            assert sum(res["design"]["by_status"].values()) == res["design"]["candidates"]
+            assert {c["id"] for c in res["design"]["per_campaign"]} >= {cid, cid2}
+            assert all(c["best_score"] is None or c["best_score"] >= c["median_score"]
+                       for c in res["design"]["per_campaign"])
+            runs = {x["id"]: x for x in res["simulations"]["runs"]}
+            assert spare["id"] in runs and runs[spare["id"]]["preview"] is True
+            assert all(not json.loads(r["sim_result"]).get("smoke") for r in conn.execute(
+                "SELECT sim_result FROM candidate WHERE id = ANY(%s)", (list(runs),))), \
+                "smoke tests are not results"
+            assert sum(res["simulations"]["calls"].values()) == len(runs)
+            g = [x["gamma23"] for x in res["simulations"]["runs"]]
+            assert g == sorted(g), "most excluded first"
+            R = main.results
+            assert R.gamma_call(-2.4, 0.3) == "excluded" and R.gamma_call(2.4, 0.3) == "accumulated"
+            assert R.gamma_call(-0.4, 0.3) == "unclear" and R.gamma_call(-5.0, None) == "unclear"
+            bobs_view = client.get("/design/my-results", headers=as_("tok-bob")).json()
+            assert cid not in {c["id"] for c in bobs_view["design"]["per_campaign"]}
+            assert spare["id"] not in {x["id"] for x in bobs_view["simulations"]["runs"]}
+            print("ok  results tab: your screens, candidates and simulations with their metrics; "
+                  "smoke tests left out; nobody else's work")
+
+            # The 3D view: the run's last frame, kept apart from its result, only for its owner.
+            stored = conn.execute("SELECT sim_result FROM candidate WHERE id=%s", (spare["id"],)).fetchone()
+            assert "snapshot_pdb" not in stored["sim_result"] and json.loads(stored["sim_result"])["has_snapshot"]
+            r = client.get(f"/design/my-simulations/{spare['id']}/snapshot.pdb", headers=as_("tok-alice"))
+            assert r.status_code == 200 and r.text == SNAP, r.text[:200]
+            assert client.get(f"/design/my-simulations/{spare['id']}/snapshot.pdb",
+                              headers=as_("tok-bob")).status_code == 404, "someone else's run"
+            assert client.get(f"/design/my-simulations/{spare['id']}/snapshot.pdb").status_code == 401
+            assert "HETATM" not in client.get("/design/my-simulations", headers=as_("tok-alice")).text, \
+                "the lists do not carry the snapshot"
+            assert client.get("/structure/model/1L2Y").status_code == 401, "not an open proxy"
+            r = client.get("/structure/model/1l2y", headers=as_("tok-alice"))
+            assert r.status_code == 200 and r.text.startswith("data_1L2Y"), r.text[:100]
+            assert client.get("/structure/model/..%2Fetc", headers=as_("tok-alice")).status_code in (404, 422)
+            assert client.get("/structure/conformer", params={"smiles": "OCCO"}).status_code == 401
+            r = client.get("/structure/conformer", params={"smiles": "OCC(O)CO"}, headers=as_("tok-alice"))
+            assert r.status_code == 200 and "V2000" in r.text and " H " not in r.text, r.text[:200]
+            assert client.get("/structure/conformer", params={"smiles": "not(a)smiles"},
+                              headers=as_("tok-alice")).status_code == 422
+            print("ok  3d view: the last frame is stored apart from the result and served only to "
+                  "its owner; structures come through the API behind sign-in")
+
             # The admin dashboard: counts across every user, and none of their content.
             assert client.get("/design/admin/stats", headers=as_("tok-bob")).status_code == 403
             assert client.get("/design/admin/stats").status_code == 401
@@ -1580,6 +1636,19 @@ def main_test():
             assert sum(st["screens"]["grades"].values()) > 0 and set(st["screens"]["grades"]) == set("ABCDE")
             assert sum(b["n"] for b in st["simulations"]["gamma23"]) >= 1, "the -2.4 result is binned"
             assert st["simulations"]["by_tier"].get("cpu", 0) >= 1
+            assert sum(st["simulations"]["calls"].values()) == sum(b["n"] for b in st["simulations"]["gamma23"])
+            assert st["simulations"]["previews"] >= 1, "the CPU preview is counted"
+            assert sum(b["n"] for b in st["screens"]["coverage"]) == n(
+                "SELECT COUNT(DISTINCT id) AS n FROM screen_run, jsonb_array_elements(dossier->'endpoints') e "
+                "WHERE dossier IS NOT NULL")
+            assert st["screens"]["coverage_mean"] is not None and 0 <= st["screens"]["coverage_mean"] <= 1
+            assert set(st["screens"]["liabilities"]) == {"high", "moderate", "low"}
+            assert sum(b["n"] for b in st["polymers"]["candidates_per_campaign"]) == n(
+                "SELECT COUNT(DISTINCT campaign_id) AS n FROM candidate")
+            assert 0 <= st["polymers"]["alert_free"] <= 1
+            assert set(st["events"]) == set(main.stats.EVENT_KINDS), "only the app's own event kinds"
+            assert sum(st["events"].values()) == sum(st["series"]["events"]) == n(
+                "SELECT COUNT(*) AS n FROM event"), "every test event is today and has a known kind"
             text = r.text
             for secret in (PS80, SEQ, "IgG1 mAb", "keep my mAb stable", "Trp-cage", "1L2Y", "1IGT",
                            "alice@example.org", "bob@example.org"):

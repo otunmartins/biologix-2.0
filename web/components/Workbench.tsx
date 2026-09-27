@@ -10,12 +10,13 @@ import { Info, Molecule, Spinner, Triangle } from '@/components/icons';
 import BenchmarkPanel from '@/components/BenchmarkPanel';
 import UserMenu, { type SessionUser } from '@/components/UserMenu';
 import HistoryView from '@/components/history/HistoryView';
-import SimulationsView from '@/components/SimulationsView';
+import ResultsView from '@/components/ResultsView';
 import {
   API_URL,
   endCampaign,
   getCampaign,
   getHealth,
+  getScreenRecord,
   iterateDesign,
   queueCandidates,
   runScreen,
@@ -214,7 +215,7 @@ function LoadingState({ elapsed }: { elapsed: number }) {
   );
 }
 
-type Workflow = 'screen' | 'design' | 'simulations' | 'history';
+type Workflow = 'screen' | 'design' | 'results' | 'history';
 
 interface CampaignView {
   campaignId: string;
@@ -609,7 +610,7 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
             [
               ['screen', 'Screen'],
               ['design', 'Design'],
-              ['simulations', 'Simulations'],
+              ['results', 'Results'],
               ['history', 'History'],
             ] as const
           ).map(([w, label]) => (
@@ -635,8 +636,11 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
         </div>
       </header>
 
-      {workflow === 'simulations' ? (
-        <SimulationsView onOpenCampaign={(id) => getCampaign(id).then(openCampaign).catch((e) => setError((e as Error).message))} />
+      {workflow === 'results' ? (
+        <ResultsView
+          onOpenCampaign={(id) => getCampaign(id).then(openCampaign).catch((e) => setError((e as Error).message))}
+          onOpenScreen={(id) => getScreenRecord(id).then(openScreen).catch((e) => setError((e as Error).message))}
+        />
       ) : workflow === 'history' ? (
         <HistoryView onOpenScreen={openScreen} onRerunScreen={rerunScreen} onOpenCampaign={openCampaign} />
       ) : (

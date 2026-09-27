@@ -18,6 +18,7 @@ Run standalone:
   uvicorn main:app --reload --port 8000
 """
 
+import functools
 import json
 import os
 import re
@@ -56,6 +57,7 @@ import polymer
 from polymer import PolymerSpec
 import precedent
 import profile
+import results
 import runpod
 import stats
 import users
@@ -1164,6 +1166,26 @@ def structure_svg(
                     headers={"Cache-Control": "public, max-age=604800, immutable"})
 
 
+@app.get("/structure/conformer")
+def structure_conformer(
+    request: Request,
+    smiles: str = Query(..., min_length=1, max_length=depict.MAX_SMILES),
+    user_id: int = Depends(users.current_user),
+):
+    """A 3D model of one molecule (a candidate's screened chain) for the 3D view.
+    Signed-in, unlike the 2D drawing: embedding a long chain in 3D costs seconds,
+    not milliseconds. Cached, and counted against the same per-client budget."""
+    client = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+              or (request.client.host if request.client else "unknown"))
+    if not _render_budget.allow(client):
+        raise HTTPException(status_code=429, detail="too many drawings; try again in a minute")
+    block = depict.conformer_molblock(smiles)
+    if block is None:
+        raise HTTPException(status_code=422, detail="could not build a 3D model of this structure")
+    return Response(block, media_type="chemical/x-mdl-molfile",
+                    headers={"Cache-Control": "private, max-age=604800"})
+
+
 @app.post("/design")
 async def design_candidates(req: DesignRequest, user_id: int = Depends(users.current_user)):
     """Rank polymer candidates for stabilising a biologic above fridge temperature.
@@ -1529,6 +1551,17 @@ def my_simulations(user_id: int = Depends(users.current_user)):
         conn.close()
 
 
+@app.get("/design/my-results")
+def my_results(user_id: int = Depends(users.current_user)):
+    """The Results tab: the user's screens, the candidates their campaigns
+    generated, and their simulations, each summarised with its metrics."""
+    conn = history.connect()
+    try:
+        return {**results.for_user(conn, owner_id=user_id), "cpu_preview_ns": CPU_PREVIEW_NS}
+    finally:
+        conn.close()
+
+
 @app.get("/design/my-simulations/{job_id}")
 def my_simulation(job_id: str, user_id: int = Depends(users.current_user)):
     """One simulation with its own slice of the campaign's history: queued,
@@ -1550,6 +1583,42 @@ def my_simulation(job_id: str, user_id: int = Depends(users.current_user)):
         return {"simulation": sim, "events": events, "cpu_preview_ns": CPU_PREVIEW_NS}
     finally:
         conn.close()
+
+
+@app.get("/design/my-simulations/{job_id}/snapshot.pdb")
+def my_simulation_snapshot(job_id: str, user_id: int = Depends(users.current_user)):
+    """The last frame of one of your runs, protein and polymer, for the 3D view."""
+    conn = candidates.connect()
+    try:
+        pdb = candidates.snapshot_for(conn, job_id, owner_id=user_id)
+    finally:
+        conn.close()
+    if pdb is None:
+        raise HTTPException(status_code=404, detail="no snapshot for this simulation")
+    return Response(pdb, media_type="chemical/x-pdb", headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.get("/structure/model/{structure_id}")
+def structure_model(structure_id: str, user_id: int = Depends(users.current_user)):
+    """A biologic's 3D structure as mmCIF, from RCSB or AlphaFold DB -- the same
+    fetch the liability scan and the simulation use -- for the 3D view. Behind
+    sign-in so it is not an open proxy; cached, since a structure does not change."""
+    sid = structure_id.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{4,20}", sid):
+        raise HTTPException(status_code=422, detail="not a PDB ID or UniProt accession")
+    try:
+        cif, source, predicted = accessibility.fetch_cached(sid.upper())
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"could not fetch {sid}: {type(e).__name__}") from e
+    # The first model only, as PDB; the mmCIF itself when PDB cannot hold it.
+    pdb = _first_model(sid.upper(), cif)
+    return Response(pdb or cif, media_type="chemical/x-pdb" if pdb else "chemical/x-mmcif",
+                    headers={"Cache-Control": "private, max-age=86400", "X-Structure-Source": source})
+
+
+@functools.lru_cache(maxsize=16)
+def _first_model(sid: str, cif: str) -> str | None:
+    return accessibility.first_model_pdb(cif)
 
 
 @app.post("/design/simulations/{job_id}/decline")
@@ -1644,6 +1713,9 @@ class SimulationResult(BaseModel):
     # A short CPU run, not converged. Kept on the candidate, never a measurement.
     preview: bool = False
     notes: list[str] = Field(default_factory=list, max_length=20)
+    # The last frame, protein and polymer heavy atoms only, as PDB text
+    # (worker/snapshot.py): the 3D view. Stored apart from the result.
+    snapshot_pdb: str | None = Field(default=None, max_length=8_000_000)
 
 
 class WorkerReport(WorkerHello):
@@ -1776,7 +1848,8 @@ def worker_result(job_id: str, report: WorkerReport, request: Request):
     body = report.result
     conn = history.connect()
     try:
-        done = candidates.finish(conn, job_id, report.worker, result=body.model_dump())
+        result = body.model_dump(exclude={"snapshot_pdb"}) | {"has_snapshot": bool(body.snapshot_pdb)}
+        done = candidates.finish(conn, job_id, report.worker, result=result, snapshot=body.snapshot_pdb)
         if done is None:
             raise HTTPException(status_code=409, detail="job is not held by this worker")
         # Decided by what was approved, not by what the worker says: a CPU

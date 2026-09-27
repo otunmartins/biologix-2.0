@@ -5,7 +5,7 @@ done - screens, polymers, simulations, who is active - but not WHAT anyone
 screened. So every query here aggregates, and none selects an excipient, a
 protein, a prompt, a SMILES or a dossier's text. The distributions are over
 the app's own vocabulary (verdicts, grades, routes, the designer's backbone
-table, formats), never over free text a user typed. test_smoke.py checks the
+table, formats, the history log's event kinds), never over free text a user typed. test_smoke.py checks the
 whole response for a screened excipient's name and structure.
 
 Users have no sign-up timestamp (the Auth.js users table carries none), so a
@@ -18,11 +18,23 @@ from datetime import date, datetime, timedelta, timezone
 
 import psycopg
 
+import results
+
 VERDICTS = ["Precedented", "Supported without precedent", "Data gap: test", "Alert: avoid"]
 GRADES = ["A", "B", "C", "D", "E"]
 # Gamma23 histogram edges, chains per protein; symmetric about zero.
 GAMMA_EDGES = [-8, -4, -2, -1, -0.5, 0, 0.5, 1, 2, 4, 8]
 TEMP_EDGES = [-80, 0, 10, 20, 30, 40, 50, 60]
+# Evidence coverage per screen, as a fraction; the last bin is exactly 100%.
+COVERAGE_EDGES = [0.2, 0.4, 0.6, 0.8, 1.0]
+CANDIDATE_EDGES = [5, 10, 20, 40, 80]
+ITERATION_EDGES = [2, 3, 4, 6, 10]
+# The event kinds the history log writes (history.py, main.py): app vocabulary,
+# so counting them says what kind of thing happened and nothing about what.
+EVENT_KINDS = ["screen.completed", "screen.failed", "campaign.started", "campaign.iterated",
+               "campaign.ended", "campaign.reopened", "candidate.queued", "candidate.approved",
+               "candidate.declined", "candidate.simulating", "candidate.simulated",
+               "candidate.simulation_failed", "candidate.requeued", "candidate.stopped"]
 
 
 def _one(conn, sql: str, args=()) -> int | float:
@@ -141,7 +153,19 @@ def dashboard(conn: psycopg.Connection, days: int = 90) -> dict:
     durations = [r["s"] for r in conn.execute(
         "SELECT EXTRACT(EPOCH FROM finished_at - created_at) AS s FROM screen_run "
         "WHERE status='ok' ORDER BY 1")]
+    # Share of each finished screen's endpoints that some evidence speaks for
+    # (results.py's evidence coverage), computed in SQL from verdict labels only.
+    coverage = [float(r["c"]) for r in conn.execute(
+        "SELECT AVG(CASE WHEN e->>'verdict' = ANY(%s) THEN 1.0 ELSE 0.0 END) AS c "
+        "FROM screen_run, jsonb_array_elements(dossier->'endpoints') e "
+        "WHERE dossier IS NOT NULL GROUP BY screen_run.id", (sorted(results.SUPPORTED),))]
+    liabilities = _counts(conn, "SELECT f->>'severity' AS k, COUNT(*) AS n FROM screen_run, "
+                                "jsonb_array_elements(dossier->'liabilities') f "
+                                "WHERE dossier IS NOT NULL GROUP BY 1")
     screens = {
+        "coverage_mean": round(sum(coverage) / len(coverage), 3) if coverage else None,
+        "coverage": _histogram(coverage, COVERAGE_EDGES),
+        "liabilities": {k: liabilities.get(k, 0) for k in results.SEVERITIES},
         "worst_verdict": {v: 0 for v in VERDICTS} | _counts(
             conn, "SELECT worst_verdict AS k, COUNT(*) AS n FROM screen_run "
                   "WHERE worst_verdict IS NOT NULL GROUP BY 1"),
@@ -158,7 +182,14 @@ def dashboard(conn: psycopg.Connection, days: int = 90) -> dict:
     goal_temps = [float(r["t"]) for r in conn.execute(
         "SELECT (goal::jsonb->>'target_temp_c') AS t FROM campaign "
         "WHERE goal::jsonb->>'target_temp_c' IS NOT NULL")]
+    per_campaign = conn.execute(
+        "SELECT COUNT(*) AS n, COUNT(DISTINCT iteration) AS it FROM candidate GROUP BY campaign_id").fetchall()
+    alert_free = _one(conn, "SELECT COUNT(*) AS v FROM candidate WHERE "
+                            "COALESCE(jsonb_array_length(payload::jsonb->'alerts_fired'), 0) = 0")
     polymers = {
+        "candidates_per_campaign": _histogram([r["n"] for r in per_campaign], CANDIDATE_EDGES),
+        "iterations_per_campaign": _histogram([r["it"] for r in per_campaign], ITERATION_EDGES),
+        "alert_free": round(alert_free / totals["polymers"], 3) if totals["polymers"] else None,
         "by_backbone": _counts(conn, "SELECT backbone_key AS k, COUNT(*) AS n FROM candidate "
                                      "GROUP BY 1 ORDER BY 2 DESC"),
         "by_status": _counts(conn, "SELECT status AS k, COUNT(*) AS n FROM candidate GROUP BY 1"),
@@ -170,10 +201,15 @@ def dashboard(conn: psycopg.Connection, days: int = 90) -> dict:
             "FROM candidate")] if totals["polymers"] else [],
     }
 
-    gammas = [float(r["g"]) for r in conn.execute(
-        "SELECT (sim_result::jsonb->>'gamma23') AS g FROM candidate "
-        "WHERE status='simulated' AND sim_result IS NOT NULL "
-        "AND COALESCE((sim_result::jsonb->>'smoke')::boolean, false) = false")]
+    finished = conn.execute(
+        "SELECT (sim_result::jsonb->>'gamma23')::float AS g, (sim_result::jsonb->>'gamma23_se')::float AS se, "
+        "  COALESCE((sim_result::jsonb->>'preview')::boolean, false) OR sim_tier='cpu' AS preview "
+        "FROM candidate WHERE status='simulated' AND sim_result IS NOT NULL "
+        "AND COALESCE((sim_result::jsonb->>'smoke')::boolean, false) = false").fetchall()
+    gammas = [r["g"] for r in finished]
+    calls = {"excluded": 0, "accumulated": 0, "unclear": 0}
+    for r in finished:
+        calls[results.gamma_call(r["g"], r["se"])] += 1
     simulations = {
         "by_status": {k: totals[f"simulations_{k}"] for k in ("waiting", "approved", "running", "done")}
         | {"failed": _one(conn, "SELECT COUNT(*) AS v FROM candidate WHERE status='failed' "
@@ -183,8 +219,18 @@ def dashboard(conn: psycopg.Connection, days: int = 90) -> dict:
         "gamma23": _histogram(gammas, GAMMA_EDGES),
         "gamma23_excluded": sum(1 for g in gammas if g < 0),
         "gamma23_accumulated": sum(1 for g in gammas if g > 0),
+        # The candidate card's two-standard-error reading of each run.
+        "calls": calls,
+        "previews": sum(1 for r in finished if r["preview"]),
     }
+
+    # What kinds of thing happened: event types per day and over the period.
+    series["events"] = _daily(conn, "SELECT at::date AS d, COUNT(*) AS n FROM event "
+                                    "WHERE at::date >= %s GROUP BY 1", start, days)
+    got = _counts(conn, "SELECT kind AS k, COUNT(*) AS n FROM event WHERE at::date >= %s "
+                        "GROUP BY 1", (start,))
+    events = {k: got.get(k, 0) for k in EVENT_KINDS}
 
     return {"generated_at": now.isoformat(), "window_days": days, "totals": totals,
             "previous": previous, "series": series, "screens": screens,
-            "polymers": polymers, "simulations": simulations}
+            "polymers": polymers, "simulations": simulations, "events": events}

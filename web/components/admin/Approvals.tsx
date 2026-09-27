@@ -223,9 +223,12 @@ export default function Approvals({ onWaiting }: { onWaiting?: (n: number) => vo
                     </div>
                   </div>
                   <div className="flex shrink-0 flex-wrap gap-2">
-                    {waiting && (
-                      <button type="button" disabled={busy === j.id} onClick={() => setChoosing(j)}
-                        className={`${btn} ${j.simulation?.approved_at ? 'border border-slate-300 text-slate-700 hover:bg-slate-50' : 'bg-slate-900 text-white hover:bg-slate-700'}`}>
+                    {/* Always there for a queued job, so every row reads Approve / Deny. A job
+                        with no structure cannot run, so its Approve is shown but disabled. */}
+                    {j.status === 'queued' && (
+                      <button type="button" disabled={busy === j.id || !waiting} onClick={() => setChoosing(j)}
+                        title={waiting ? undefined : 'Cannot run until the user names the biologic’s PDB ID or UniProt accession'}
+                        className={`${btn} disabled:cursor-not-allowed${j.simulation?.approved_at ? 'border border-slate-300 text-slate-700 hover:bg-slate-50' : 'bg-slate-900 text-white hover:bg-slate-700'}`}>
                         {j.simulation?.approved_at ? 'Switch' : 'Approve'}
                       </button>
                     )}

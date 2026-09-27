@@ -18,6 +18,7 @@ Limits worth knowing:
 """
 
 import re
+from functools import lru_cache
 from io import StringIO
 
 import httpx
@@ -81,6 +82,35 @@ def _fetch(structure_id: str) -> tuple[str, str, bool]:
         f"AlphaFold DB {entry.get('modelEntityId', sid.upper())} v{version} (predicted)",
         True,
     )
+
+
+@lru_cache(maxsize=16)
+def fetch_cached(structure_id: str) -> tuple[str, str, bool]:
+    """_fetch, remembered: the 3D view asks for the same few structures again and again."""
+    return _fetch(structure_id)
+
+
+def first_model_pdb(cif_text: str) -> str | None:
+    """The first model of an mmCIF entry as PDB text, for the 3D view: an NMR
+    entry holds dozens of models that a viewer would otherwise draw on top of
+    each other. None when PDB format cannot hold it (a huge complex, two-letter
+    chain ids), and the caller falls back to the mmCIF."""
+    from Bio.PDB import PDBIO, Select
+
+    class First(Select):
+        def accept_model(self, model):
+            return model.serial_num == first
+
+    try:
+        structure = MMCIFParser(QUIET=True).get_structure("s", StringIO(cif_text))
+        first = next(structure.get_models()).serial_num
+        out = StringIO()
+        io = PDBIO()
+        io.set_structure(structure)
+        io.save(out, First())
+        return out.getvalue()
+    except Exception:
+        return None
 
 
 def _compute(structure_id: str) -> dict:

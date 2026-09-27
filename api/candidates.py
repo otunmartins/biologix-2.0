@@ -112,6 +112,14 @@ ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_approved_by INTEGER REFERENCE
 -- Which kind of worker the admin approved it for: 'gpu' (the full run) or 'cpu'
 -- (a short preview when no GPU is available). Only a worker of that kind claims it.
 ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_tier TEXT;
+-- The last frame of a finished run, protein and polymer only, as PDB text: what
+-- the 3D view draws. Its own table so the lists of runs, which read candidate
+-- rows by the hundred, never carry a few hundred kilobytes each.
+CREATE TABLE IF NOT EXISTS sim_snapshot (
+    candidate_id TEXT PRIMARY KEY REFERENCES candidate(id),
+    pdb          TEXT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 # A job whose worker has not checked in for this long is presumed dead (the box
@@ -263,6 +271,7 @@ def enqueue_rows(conn: psycopg.Connection, candidate_ids: list[str], *,
                 "RETURNING id, campaign_id, score, payload",
                 (now, structure_id, cid, structure_id, owner_id)).fetchone()
             if row:
+                conn.execute("DELETE FROM sim_snapshot WHERE candidate_id=%s", (row["id"],))
                 queued.append({"id": row["id"], "campaign_id": row["campaign_id"],
                                "score": row["score"],
                                "name": json.loads(row["payload"]).get("name", "")})
@@ -348,7 +357,8 @@ def heartbeat(conn: psycopg.Connection, candidate_id: str, worker: str,
 
 
 def finish(conn: psycopg.Connection, candidate_id: str, worker: str, *,
-           result: dict | None = None, error: str | None = None) -> dict | None:
+           result: dict | None = None, error: str | None = None,
+           snapshot: str | None = None) -> dict | None:
     """Record the outcome of the job this worker holds: 'simulated' with its
     result, or 'failed' with why. None if it does not hold the job."""
     status = "failed" if error else "simulated"
@@ -362,10 +372,24 @@ def finish(conn: psycopg.Connection, candidate_id: str, worker: str, *,
              (error or "")[:2000] or None, _now(), candidate_id, worker)).fetchone()
         if row is None:
             return None
+        if snapshot and status == "simulated":
+            conn.execute("INSERT INTO sim_snapshot (candidate_id, pdb) VALUES (%s,%s) "
+                         "ON CONFLICT (candidate_id) DO UPDATE SET pdb=EXCLUDED.pdb, created_at=now()",
+                         (candidate_id, snapshot))
         camp = conn.execute("SELECT goal, owner_id FROM campaign WHERE id=%s",
                             (row["campaign_id"],)).fetchone()
     return {"candidate": _hydrate(row), "goal": json.loads(camp["goal"]),
             "owner_id": camp["owner_id"], "campaign_id": row["campaign_id"]}
+
+
+def snapshot_for(conn: psycopg.Connection, candidate_id: str, *, owner_id: int) -> str | None:
+    """The 3D snapshot of one of this user's runs, or None if there is none or
+    the run is someone else's."""
+    row = conn.execute(
+        "SELECT s.pdb FROM sim_snapshot s JOIN candidate c ON c.id=s.candidate_id "
+        "JOIN campaign cp ON cp.id=c.campaign_id WHERE s.candidate_id=%s AND cp.owner_id=%s",
+        (candidate_id, owner_id)).fetchone()
+    return row["pdb"] if row else None
 
 
 # ---------------------------------------------------------------------------
