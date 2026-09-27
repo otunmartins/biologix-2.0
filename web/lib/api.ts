@@ -180,6 +180,8 @@ export interface SimulationResult {
   n_atoms: number;
   wall_seconds: number;
   smoke: boolean;
+  // A short CPU run: not converged, never recorded as a measurement.
+  preview?: boolean;
   notes: string[];
 }
 
@@ -195,7 +197,11 @@ export interface SimulationJob {
   error: string | null;
   // Set once an admin has released the run to the worker; until then it waits.
   approved_at: string | null;
+  // What it was approved as: the full GPU run, or a short CPU preview.
+  tier: SimTier | null;
 }
+
+export type SimTier = 'gpu' | 'cpu';
 
 export interface StoredCandidate extends Candidate {
   id: string;
@@ -478,11 +484,41 @@ export async function getSimulations(
   return res.json();
 }
 
-// Returns what RunPod said about starting the worker's pod.
-export async function approveSimulation(id: string): Promise<string> {
-  const res = await call(`/design/simulations/${encodeURIComponent(id)}/approve`, { method: 'POST' });
+// Returns what happened to the worker: RunPod starting the GPU pod, or that a
+// CPU preview needs none.
+export async function approveSimulation(id: string, tier: SimTier): Promise<string> {
+  const res = await call(`/design/simulations/${encodeURIComponent(id)}/approve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tier }),
+  });
   if (!res.ok) throw new Error(await detailOf(res));
   return (await res.json()).pod;
+}
+
+// ---- the signed-in user's own simulations (the Simulations tab) ----
+
+export interface MySimulation extends StoredCandidate {
+  campaign_id: string;
+  updated_at: string;
+  campaign: { protein: string; format: string; target_temp_c: number | null };
+}
+
+export async function getMySimulations(
+  signal?: AbortSignal,
+): Promise<{ simulations: MySimulation[]; cpu_preview_ns: number }> {
+  const res = await call('/design/my-simulations', { signal });
+  if (!res.ok) throw new Error(await detailOf(res));
+  return res.json();
+}
+
+export async function getMySimulation(
+  id: string,
+  signal?: AbortSignal,
+): Promise<{ simulation: MySimulation; events: HistoryEvent[]; cpu_preview_ns: number }> {
+  const res = await call(`/design/my-simulations/${encodeURIComponent(id)}`, { signal });
+  if (!res.ok) throw new Error(await detailOf(res));
+  return res.json();
 }
 
 export async function declineSimulation(id: string, reason: string): Promise<void> {

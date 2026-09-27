@@ -1442,6 +1442,18 @@ class Decline(BaseModel):
     reason: str = Field(default="declined by an admin", min_length=1, max_length=500)
 
 
+class Approve(BaseModel):
+    # 'gpu': the full run on the RunPod GPU. 'cpu': a short preview on a CPU
+    # worker, for when no GPU is available; not converged, never a measurement.
+    tier: Literal["gpu", "cpu"] = "gpu"
+
+
+# How long a CPU preview runs. A full 20 ns run takes days on a CPU; this is
+# enough to see where the polymer sits, not to converge Gamma23.
+CPU_PREVIEW_NS = float(os.environ.get("SIM_CPU_PREVIEW_NS", "1.0"))
+CPU_PREVIEW_EQUIL_NS = float(os.environ.get("SIM_CPU_PREVIEW_EQUIL_NS", "0.1"))
+
+
 @app.get("/design/simulations")
 def simulations_view(admin_id: int = Depends(users.current_admin)):
     """Every user's simulations that are waiting or running."""
@@ -1453,16 +1465,57 @@ def simulations_view(admin_id: int = Depends(users.current_admin)):
 
 
 @app.post("/design/simulations/{job_id}/approve")
-def simulation_approve(job_id: str, admin_id: int = Depends(users.current_admin)):
+def simulation_approve(job_id: str, body: Approve | None = None,
+                       admin_id: int = Depends(users.current_admin)):
+    tier = (body or Approve()).tier
     conn = history.connect()
     try:
-        job = candidates.approve(conn, job_id, admin_id)
+        job = candidates.approve(conn, job_id, admin_id, tier)
         if job is None:
             raise HTTPException(status_code=409, detail="not a queued, unapproved job with a structure")
-        _log_sim(conn, job, "candidate.approved", {})
+        _log_sim(conn, job, "candidate.approved", {"tier": tier})
     finally:
         conn.close()
-    return {"ok": True, "pod": runpod.start_pod()}
+    # Only a GPU run needs the RunPod pod; a CPU preview goes to a CPU worker.
+    pod = runpod.start_pod() if tier == "gpu" else "not needed: a CPU worker runs this preview"
+    return {"ok": True, "tier": tier, "pod": pod}
+
+
+# ---------------------------------------------------------------------------
+# A user's own simulations (the Simulations tab)
+# ---------------------------------------------------------------------------
+
+@app.get("/design/my-simulations")
+def my_simulations(user_id: int = Depends(users.current_user)):
+    conn = candidates.connect()
+    try:
+        return {"simulations": candidates.simulations_for(conn, owner_id=user_id),
+                "cpu_preview_ns": CPU_PREVIEW_NS}
+    finally:
+        conn.close()
+
+
+@app.get("/design/my-simulations/{job_id}")
+def my_simulation(job_id: str, user_id: int = Depends(users.current_user)):
+    """One simulation with its own slice of the campaign's history: queued,
+    approved, each attempt, and how it ended. 404 for someone else's."""
+    conn = history.connect()
+    try:
+        sim = candidates.simulation(conn, job_id, owner_id=user_id)
+        if sim is None:
+            raise HTTPException(status_code=404, detail="no such simulation")
+
+        def about(e: dict) -> bool:
+            d = e.get("data") or {}
+            if isinstance(d, str):
+                d = json.loads(d)
+            return (d.get("candidate") or {}).get("id") == job_id or \
+                any(c.get("id") == job_id for c in d.get("candidates") or [])
+        events = [e for e in history.events_for(conn, sim["campaign_id"], owner_id=user_id)
+                  if e["kind"].startswith("candidate.") and about(e)]
+        return {"simulation": sim, "events": events, "cpu_preview_ns": CPU_PREVIEW_NS}
+    finally:
+        conn.close()
 
 
 @app.post("/design/simulations/{job_id}/decline")
@@ -1501,6 +1554,16 @@ class WorkerHello(BaseModel):
     # Names the worker in the job record, so a result can be traced to the box
     # and build that produced it.
     worker: str = Field(min_length=1, max_length=120)
+
+
+class WorkerClaim(WorkerHello):
+    # The OpenMM platform it will run on. CUDA, OpenCL or HIP take GPU jobs; CPU
+    # takes CPU previews. A worker from before this field existed is a GPU worker.
+    platform: str = Field(default="CUDA", max_length=20)
+
+    @property
+    def tier(self) -> str:
+        return "cpu" if self.platform.strip().upper() in ("CPU", "REFERENCE") else "gpu"
 
 
 class WorkerProgress(WorkerHello):
@@ -1542,6 +1605,8 @@ class SimulationResult(BaseModel):
     # never written to the measurement store: it is a check of the pipeline, not
     # an observation.
     smoke: bool = False
+    # A short CPU run, not converged. Kept on the candidate, never a measurement.
+    preview: bool = False
     notes: list[str] = Field(default_factory=list, max_length=20)
 
 
@@ -1594,7 +1659,7 @@ def _log_sim(conn, job: dict, kind: str, data: dict) -> None:
 
 
 @app.post("/worker/claim")
-def worker_claim(hello: WorkerHello, request: Request):
+def worker_claim(hello: WorkerClaim, request: Request):
     """The next job, or 204 when the queue is empty. Jobs whose worker went
     silent are requeued first. The target structure is fetched here (RCSB or
     AlphaFold, the same code the liability scan uses) and handed over whole, so
@@ -1613,7 +1678,7 @@ def worker_claim(hello: WorkerHello, request: Request):
         # A job whose structure cannot be fetched fails and the next is tried, so
         # one bad accession never blocks the queue.
         for _ in range(10):
-            job = candidates.claim_next(conn, hello.worker)
+            job = candidates.claim_next(conn, hello.worker, hello.tier)
             if job is None:
                 return Response(status_code=204)
             cand = job["candidate"]
@@ -1627,8 +1692,14 @@ def worker_claim(hello: WorkerHello, request: Request):
                     _log_sim(conn, done, "candidate.simulation_failed", {"error": err})
                 continue
             _log_sim(conn, job, "candidate.simulating", {"worker": hello.worker, "structure_id": sid,
-                                                        "attempt": cand["simulation"]["attempts"]})
+                                                        "attempt": cand["simulation"]["attempts"],
+                                                        "tier": hello.tier, "platform": hello.platform})
             goal = job["goal"]
+            # The API, not the worker, decides how long a run is: a CPU preview is
+            # short whatever the worker's own defaults say.
+            settings = ({"tier": "cpu", "production_ns": CPU_PREVIEW_NS,
+                         "equilibration_ns": CPU_PREVIEW_EQUIL_NS}
+                        if hello.tier == "cpu" else {"tier": "gpu"})
             return {
                 "job_id": cand["id"],
                 "candidate": {k: cand.get(k) for k in (
@@ -1641,6 +1712,7 @@ def worker_claim(hello: WorkerHello, request: Request):
                 "protein": goal.get("protein", ""),
                 "structure": {"id": sid, "source": source, "predicted": predicted, "mmcif": cif},
                 "attempt": cand["simulation"]["attempts"],
+                "settings": settings,
             }
         return Response(status_code=204)
     finally:
@@ -1669,10 +1741,14 @@ def worker_result(job_id: str, report: WorkerReport, request: Request):
         done = candidates.finish(conn, job_id, report.worker, result=body.model_dump())
         if done is None:
             raise HTTPException(status_code=409, detail="job is not held by this worker")
-        mid = None if body.smoke else _record_simulation(done, body)
+        # Decided by what was approved, not by what the worker says: a CPU
+        # preview never becomes a measurement even if a worker forgets the flag.
+        preview = body.preview or done["candidate"]["simulation"].get("tier") == "cpu"
+        mid = None if (body.smoke or preview) else _record_simulation(done, body)
         _log_sim(conn, done, "candidate.simulated", {
             "gamma23": body.gamma23, "gamma23_se": body.gamma23_se,
-            "production_ns": body.production_ns, "measurement_id": mid, "smoke": body.smoke})
+            "production_ns": body.production_ns, "measurement_id": mid, "smoke": body.smoke,
+            "preview": preview})
         return {"ok": True, "measurement_id": mid}
     finally:
         conn.close()

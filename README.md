@@ -541,9 +541,30 @@ request, not a run:
   fresh approval.
 - **One at a time.** A user can have one simulation waiting or running; queueing another is
   refused with the name of the one in the way. Admins are exempt, since they approve their own.
+- **GPU run or CPU preview, chosen at approval.** A full GPU run is 20 ns on the RunPod GPU.
+  When no GPU is available, approve it as a **CPU preview** instead: the API sends a short run
+  (`SIM_CPU_PREVIEW_NS`, default 1 ns) to a CPU worker. A preview is not converged, is labelled
+  as such everywhere, and is never written to the measurement store, whatever the worker reports.
+  Each worker states its OpenMM platform when it asks for work and only gets jobs of its kind.
 - **The GPU runs only while there is approved work.** Approving starts the RunPod pod (when the
   API has `RUNPOD_API_KEY` and `RUNPOD_POD_ID`), and the worker stops it after
   `IDLE_STOP_MINUTES` with nothing to claim.
+
+**Following them: the Simulations tab.** Every user sees their own simulations across all
+campaigns (waiting, running, done, failed), and each opens with its result and its own slice of
+history: queued, approved (and as what), each attempt, and how it ended.
+
+**A CPU worker on your own machine**, for previews with no GPU. It reuses the worker image and
+reaches the API on the host:
+
+```bash
+docker run -d --name biologix-cpu-worker --restart unless-stopped \
+  -e API_URL=http://host.docker.internal:8000 -e WORKER_TOKEN=<the API's token> \
+  -e WORKER_NAME=local-cpu ghcr.io/otunmartins/biologix-worker:latest
+docker logs -f biologix-cpu-worker     # "running on CPU (takes CPU previews)"
+```
+
+On the server, the compose `worker` profile does the same (`COMPOSE_PROFILES=worker`).
 
 **Turning it on: a RunPod GPU pod.** The EC2 box has no GPU (AWS's G-instance quota is not
 available on this account), so the worker runs on RunPod and reaches the API through its public

@@ -11,6 +11,7 @@ import BenchmarkPanel from '@/components/BenchmarkPanel';
 import UserMenu, { type SessionUser } from '@/components/UserMenu';
 import HistoryView from '@/components/history/HistoryView';
 import Approvals from '@/components/Approvals';
+import SimulationsView from '@/components/SimulationsView';
 import {
   API_URL,
   endCampaign,
@@ -215,7 +216,7 @@ function LoadingState({ elapsed }: { elapsed: number }) {
   );
 }
 
-type Workflow = 'screen' | 'design' | 'history' | 'approvals';
+type Workflow = 'screen' | 'design' | 'simulations' | 'history' | 'approvals';
 
 interface CampaignView {
   campaignId: string;
@@ -486,6 +487,7 @@ export default function Workbench({ user }: { user: SessionUser }) {
                   simulation: {
                     structure_id: sid, attempts: 0, started_at: null, heartbeat_at: null,
                     finished_at: null, progress: null, result: null, error: null, approved_at: null,
+                    tier: null,
                   },
                 }
               : x,
@@ -613,6 +615,7 @@ export default function Workbench({ user }: { user: SessionUser }) {
             [
               ['screen', 'Screen'],
               ['design', 'Design'],
+              ['simulations', 'Simulations'],
               ['history', 'History'],
               ...(isAdmin ? ([['approvals', 'Approvals']] as const) : []),
             ] as const
@@ -641,6 +644,8 @@ export default function Workbench({ user }: { user: SessionUser }) {
 
       {workflow === 'approvals' ? (
         <Approvals />
+      ) : workflow === 'simulations' ? (
+        <SimulationsView onOpenCampaign={(id) => getCampaign(id).then(openCampaign).catch((e) => setError((e as Error).message))} />
       ) : workflow === 'history' ? (
         <HistoryView onOpenScreen={openScreen} onRerunScreen={rerunScreen} onOpenCampaign={openCampaign} />
       ) : (

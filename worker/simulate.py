@@ -59,6 +59,7 @@ class Settings:
     max_residues: int = 1500
     platform: str = ""               # "", "CUDA", "OpenCL", "CPU"
     smoke: bool = False
+    preview: bool = False            # a short CPU run: not converged, never a measurement
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -366,6 +367,9 @@ def run(job: dict, s: Settings, progress=lambda msg: None, should_stop=lambda: F
         "n_atoms": len(atoms),
         "wall_seconds": round(time.time() - t0, 1),
         "smoke": s.smoke,
-        "notes": notes[:20] + [f"{n_res} protein residues; C-alpha atoms restrained to the "
+        "preview": s.preview,
+        "notes": notes[:18] + ([f"CPU preview: {s.production_ns:g} ns, not converged; a full GPU "
+                                "run is needed before this number means much"]
+                               if s.preview else []) + [f"{n_res} protein residues; C-alpha atoms restrained to the "
                                "starting structure (native state)"],
     }

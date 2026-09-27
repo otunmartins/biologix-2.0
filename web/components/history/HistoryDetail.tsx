@@ -185,7 +185,8 @@ function describe(e: HistoryEvent): { title: string; body: string | null; tone: 
         title: `Simulated ${d.candidate?.name ?? 'a candidate'}`,
         body:
           `Γ23 = ${d.gamma23}${d.gamma23_se != null ? ` ± ${d.gamma23_se}` : ''} over ${d.production_ns} ns` +
-          (d.smoke ? ' (pipeline smoke test, not a measurement)' : ''),
+          (d.smoke ? ' (pipeline smoke test, not a measurement)' : '') +
+          (d.preview ? ' (CPU preview, not converged; not a measurement)' : ''),
         tone: 'good',
       };
     case 'candidate.simulation_failed':
@@ -193,7 +194,7 @@ function describe(e: HistoryEvent): { title: string; body: string | null; tone: 
     case 'candidate.approved':
       return {
         title: `Approved: ${d.candidate?.name ?? 'a candidate'}`,
-        body: 'Released to the simulation worker.',
+        body: d.tier === 'cpu' ? 'As a CPU preview: a short run on a CPU worker.' : 'As a full GPU run.',
         tone: 'info',
       };
     case 'candidate.declined':
@@ -213,7 +214,7 @@ function describe(e: HistoryEvent): { title: string; body: string | null; tone: 
 
 const TONE_DOT = { neutral: 'bg-slate-400', good: 'bg-precedented', info: 'bg-supported', bad: 'bg-alert' } as const;
 
-function EventTimeline({ events }: { events: HistoryEvent[] }) {
+export function EventTimeline({ events }: { events: HistoryEvent[] }) {
   return (
     <ol className="relative space-y-4 border-l border-slate-200 pl-5">
       {events.map((e, i) => {

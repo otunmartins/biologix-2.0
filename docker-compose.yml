@@ -64,10 +64,10 @@ services:
       - iid_cache:/cache
     restart: unless-stopped
 
-  # The OpenMM simulation worker (worker/), for trying it locally on a CPU:
-  # `docker compose --profile worker up`. Off by default because it is a
-  # multi-GB image. Real runs happen on a RunPod GPU pod using the published
-  # image, which reaches the API through its public URL instead.
+  # A CPU simulation worker (worker/): it takes the runs an admin approved as CPU
+  # previews. `docker compose --profile worker up`, or COMPOSE_PROFILES=worker in
+  # .env. Off by default because it is a multi-GB image. Full GPU runs happen on
+  # a RunPod pod using the published image, which reaches the API by its public URL.
   worker:
     build: ./worker
     profiles: ["worker"]

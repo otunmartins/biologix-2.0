@@ -1494,6 +1494,55 @@ def main_test():
             assert "candidate.approved" in evs and "candidate.declined" in evs, evs
             print("ok  approval: only an admin sees every job and approves or declines; approving "
                   "releases it to the worker; a declined job tells the user why")
+
+            # --- CPU fallback: a short preview when no GPU is available ------------
+            spare = next(c for c in CS.candidates_for(conn, cid2) + CS.candidates_for(conn, cid)
+                         if c["status"] == "benchmarked")
+            assert client.post("/design/queue", headers=as_("tok-alice"),
+                               json={"candidate_ids": [spare["id"]], "structure_id": "1L2Y"}).json()["queued"] == 1
+            r = client.post(f"/design/simulations/{spare['id']}/approve", json={"tier": "tpu"},
+                            headers=as_("tok-alice"))
+            assert r.status_code == 422, "only gpu or cpu"
+            r = client.post(f"/design/simulations/{spare['id']}/approve", json={"tier": "cpu"},
+                            headers=as_("tok-alice"))
+            assert r.status_code == 200 and r.json()["tier"] == "cpu", r.text
+            assert r.json()["pod"].startswith("not needed"), "a CPU preview must not start the GPU pod"
+            assert client.post("/worker/claim", json={"worker": "gpu1", "platform": "CUDA"},
+                               headers=W).status_code == 204, "a GPU worker must not take a CPU preview"
+            assert client.post("/worker/claim", json={"worker": "gpu0"},
+                               headers=W).status_code == 204, "nor an old worker that names no platform"
+            j = client.post("/worker/claim", json={"worker": "cpu1", "platform": "CPU"}, headers=W).json()
+            assert j["job_id"] == spare["id"]
+            assert j["settings"] == {"tier": "cpu", "production_ns": main.CPU_PREVIEW_NS,
+                                     "equilibration_ns": main.CPU_PREVIEW_EQUIL_NS}, j["settings"]
+            before = conn.execute("SELECT COUNT(*) AS n FROM measurement").fetchone()["n"]
+            r = client.post(f"/worker/jobs/{spare['id']}/result", headers=W,
+                            json={"worker": "cpu1", "result": {**result, "production_ns": 1.0}})
+            assert r.status_code == 200 and r.json()["measurement_id"] is None, \
+                "a CPU preview is never a measurement, even if the worker forgets to say so"
+            assert conn.execute("SELECT COUNT(*) AS n FROM measurement").fetchone()["n"] == before
+            print("ok  cpu fallback: an admin approves a run for CPU or GPU; each goes only to that "
+                  "kind of worker; a CPU run is a short preview and never a measurement")
+
+            # The Simulations tab: your own runs, each with its own slice of history.
+            mine = client.get("/design/my-simulations", headers=as_("tok-alice")).json()["simulations"]
+            done = next(m for m in mine if m["id"] == spare["id"])
+            assert done["status"] == "simulated" and done["simulation"]["tier"] == "cpu"
+            goal_of = {cid: goal_lyo.protein, cid2: "Trp-cage"}
+            assert done["campaign"]["protein"] == goal_of[done["campaign_id"]], done["campaign"]
+            rank = [{"simulating": 0, "queued": 1}.get(m["status"], 2) for m in mine]
+            assert rank == sorted(rank) and 1 in rank, ("active runs list first", rank)
+            assert all(m["id"] not in (b0, b1) for m in mine), "bob's runs are not alice's"
+            d = client.get(f"/design/my-simulations/{spare['id']}", headers=as_("tok-alice")).json()
+            kinds = [e["kind"] for e in d["events"]]
+            assert kinds[0] == "candidate.queued" and "candidate.approved" in kinds and \
+                kinds[-1] == "candidate.simulated", kinds
+            assert next(e for e in d["events"] if e["kind"] == "candidate.approved")["data"]["tier"] == "cpu"
+            assert next(e for e in d["events"] if e["kind"] == "candidate.simulated")["data"]["preview"] is True
+            assert client.get(f"/design/my-simulations/{spare['id']}", headers=as_("tok-bob")).status_code == 404
+            assert client.get("/design/my-simulations").status_code == 401
+            print("ok  simulations tab: lists only your runs, active first; each opens with its "
+                  "own history; someone else's is a 404")
         finally:
             main.accessibility._fetch = real_fetch
             os.environ.pop("WORKER_TOKEN", None)

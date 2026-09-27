@@ -109,6 +109,9 @@ ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_error TEXT;
 -- clears the approval: what was approved was that job, not the candidate.
 ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_approved_at TIMESTAMPTZ;
 ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_approved_by INTEGER REFERENCES users(id);
+-- Which kind of worker the admin approved it for: 'gpu' (the full run) or 'cpu'
+-- (a short preview when no GPU is available). Only a worker of that kind claims it.
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_tier TEXT;
 """
 
 # A job whose worker has not checked in for this long is presumed dead (the box
@@ -123,6 +126,9 @@ MAX_ATTEMPTS = 3
 ACTIVE = ("queued", "simulating")
 # pg_advisory_xact_lock's first key, naming this lock; the second is the owner.
 _QUEUE_LOCK = 5316
+# The two kinds of run. 'gpu' is the full simulation; 'cpu' is a short preview for
+# when no GPU is available -- a CPU would take days over the full length.
+TIERS = ("gpu", "cpu")
 
 
 class QueueFull(Exception):
@@ -250,7 +256,7 @@ def enqueue_rows(conn: psycopg.Connection, candidate_ids: list[str], *,
             row = conn.execute(
                 "UPDATE candidate SET status='queued', updated_at=%s, sim_structure_id=%s, "
                 "sim_attempts=0, sim_error=NULL, sim_result=NULL, sim_progress=NULL, "
-                "sim_approved_at=NULL, sim_approved_by=NULL "
+                "sim_approved_at=NULL, sim_approved_by=NULL, sim_tier=NULL "
                 "WHERE id=%s AND (status IN ('benchmarked', 'failed') "
                 "     OR (status='queued' AND sim_structure_id='' AND %s <> '')) "
                 "AND campaign_id IN (SELECT id FROM campaign WHERE owner_id=%s) "
@@ -304,21 +310,22 @@ def requeue_stale(conn: psycopg.Connection) -> list[dict]:
     return rows
 
 
-def claim_next(conn: psycopg.Connection, worker: str) -> dict | None:
-    """Atomically take the highest-scoring approved job that has a target structure.
+def claim_next(conn: psycopg.Connection, worker: str, tier: str = "gpu") -> dict | None:
+    """Atomically take the highest-scoring job approved for this kind of worker
+    ('gpu' or 'cpu') that has a target structure.
     SKIP LOCKED lets several workers pull from one queue without ever taking the
     same job. Returns the candidate, its campaign's goal and its owner, or None."""
     with db.tx(conn):
         row = conn.execute(
             "WITH nxt AS ("
             "  SELECT id FROM candidate WHERE status='queued' AND sim_structure_id <> '' "
-            "  AND sim_approved_at IS NOT NULL "
+            "  AND sim_approved_at IS NOT NULL AND sim_tier=%s "
             "  ORDER BY score DESC, updated_at LIMIT 1 FOR UPDATE SKIP LOCKED) "
             "UPDATE candidate c SET status='simulating', sim_worker=%s, sim_started_at=now(), "
             "  sim_heartbeat_at=now(), sim_attempts=c.sim_attempts+1, sim_error=NULL, "
             "  sim_progress=NULL, updated_at=%s "
             "FROM nxt WHERE c.id=nxt.id RETURNING c.*",
-            (worker, _now())).fetchone()
+            (tier, worker, _now())).fetchone()
         if row is None:
             return None
         camp = conn.execute("SELECT goal, owner_id FROM campaign WHERE id=%s",
@@ -373,14 +380,18 @@ def _job_info(conn: psycopg.Connection, row: dict) -> dict:
             "owner_id": camp["owner_id"] if camp else None}
 
 
-def approve(conn: psycopg.Connection, candidate_id: str, admin_id: int) -> dict | None:
-    """Let the worker run this job. None unless it is queued, not yet approved,
-    and has a structure to run against (one without could not be claimed)."""
+def approve(conn: psycopg.Connection, candidate_id: str, admin_id: int,
+            tier: str = "gpu") -> dict | None:
+    """Let a worker of this tier run this job. None unless it is queued, not yet
+    approved, and has a structure to run against (one without could not be claimed)."""
+    if tier not in TIERS:
+        raise ValueError(f"tier must be one of {TIERS}")
     with db.tx(conn):
         row = conn.execute(
-            "UPDATE candidate SET sim_approved_at=now(), sim_approved_by=%s, updated_at=%s "
+            "UPDATE candidate SET sim_approved_at=now(), sim_approved_by=%s, sim_tier=%s, "
+            "  updated_at=%s "
             "WHERE id=%s AND status='queued' AND sim_approved_at IS NULL AND sim_structure_id <> '' "
-            "RETURNING *", (admin_id, _now(), candidate_id)).fetchone()
+            "RETURNING *", (admin_id, tier, _now(), candidate_id)).fetchone()
         return _job_info(conn, row) if row else None
 
 
@@ -391,7 +402,7 @@ def decline(conn: psycopg.Connection, candidate_id: str, reason: str) -> dict | 
     with db.tx(conn):
         row = conn.execute(
             "UPDATE candidate SET status='failed', sim_error=%s, sim_approved_at=NULL, "
-            "  sim_approved_by=NULL, updated_at=%s "
+            "  sim_approved_by=NULL, sim_tier=NULL, updated_at=%s "
             "WHERE id=%s AND status='queued' RETURNING *",
             (f"Not approved: {reason}"[:2000], _now(), candidate_id)).fetchone()
         return _job_info(conn, row) if row else None
@@ -409,6 +420,36 @@ def all_active(conn: psycopg.Connection, limit: int = 200) -> list[dict]:
         "LIMIT %s", (list(ACTIVE), limit)).fetchall()
     return [{**_hydrate(r), "campaign_id": r["campaign_id"], "owner_email": r["owner_email"]}
             for r in rows]
+
+
+def simulations_for(conn: psycopg.Connection, *, owner_id: int, limit: int = 200) -> list[dict]:
+    """Every candidate of this user's that was ever sent for simulation, with the
+    campaign it belongs to: running first, then waiting, then the rest newest first."""
+    rows = conn.execute(
+        "SELECT c.*, cp.goal AS campaign_goal FROM candidate c "
+        "JOIN campaign cp ON cp.id=c.campaign_id "
+        "WHERE cp.owner_id=%s AND c.status IN ('queued','simulating','simulated','failed') "
+        "  AND (c.sim_structure_id <> '' OR c.sim_attempts > 0 OR c.sim_error IS NOT NULL "
+        "       OR c.status='queued') "
+        "ORDER BY CASE c.status WHEN 'simulating' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, "
+        "  c.updated_at DESC LIMIT %s", (owner_id, limit)).fetchall()
+    return [_with_campaign(r) for r in rows]
+
+
+def simulation(conn: psycopg.Connection, candidate_id: str, *, owner_id: int) -> dict | None:
+    """One of this user's simulations, or None if absent or someone else's."""
+    row = conn.execute(
+        "SELECT c.*, cp.goal AS campaign_goal FROM candidate c "
+        "JOIN campaign cp ON cp.id=c.campaign_id WHERE c.id=%s AND cp.owner_id=%s",
+        (candidate_id, owner_id)).fetchone()
+    return _with_campaign(row) if row else None
+
+
+def _with_campaign(row: dict) -> dict:
+    goal = json.loads(row["campaign_goal"]) if row.get("campaign_goal") else {}
+    return {**_hydrate(row), "campaign_id": row["campaign_id"], "updated_at": row["updated_at"],
+            "campaign": {"protein": goal.get("protein", ""), "format": goal.get("format", ""),
+                         "target_temp_c": goal.get("target_temp_c")}}
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +480,7 @@ def _hydrate(row: dict) -> dict:
             "result": json.loads(row["sim_result"]) if row.get("sim_result") else None,
             "error": row.get("sim_error"),
             "approved_at": _iso(row.get("sim_approved_at")),
+            "tier": row.get("sim_tier"),
         }
     return c
 

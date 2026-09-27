@@ -136,17 +136,24 @@ function readGamma(g: number, se: number | null): { label: string; body: string;
   };
 }
 
-function SimulationPanel({ sim, status }: { sim: SimulationJob; status: CandidateStatus }) {
+const TIER_LABEL = { gpu: 'GPU run', cpu: 'CPU preview' } as const;
+
+export function SimulationPanel({ sim, status }: { sim: SimulationJob; status: CandidateStatus }) {
   const r = sim.result;
   return (
     <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
-      <div className="eyebrow mb-1.5">OpenMM simulation · against {sim.structure_id || 'no structure yet'}</div>
+      <div className="eyebrow mb-1.5">
+        OpenMM simulation · against {sim.structure_id || 'no structure yet'}
+        {sim.tier && ` · ${TIER_LABEL[sim.tier]}`}
+      </div>
       {status === 'queued' && (
         <p className="text-sm leading-relaxed text-slate-600">
           {sim.structure_id && !sim.approved_at
-            ? 'Waiting for approval. Each simulation takes hours of GPU time, so an admin approves it before it runs.'
+            ? 'Waiting for approval. Each simulation takes hours of compute, so an admin approves it, as a full GPU run or a short CPU preview, before it runs.'
+            : sim.structure_id && sim.tier === 'cpu'
+            ? 'Approved as a CPU preview. Waiting for a CPU worker; approved runs go highest triage score first.'
             : sim.structure_id
-            ? 'Approved. Waiting for the simulation worker; approved runs go highest triage score first.'
+            ? 'Approved as a GPU run. Waiting for the GPU worker; approved runs go highest triage score first.'
             : 'Queued before structures were asked for. Queue it again with the biologic’s PDB ID or UniProt accession to run it.'}
           {sim.error && <span className="mt-1 block text-slate-500">{sim.error}</span>}
         </p>
@@ -175,6 +182,11 @@ function SimulationPanel({ sim, status }: { sim: SimulationJob; status: Candidat
               {r.smoke && (
                 <span className="rounded-full border border-gap-line bg-gap-soft px-2 py-0.5 text-[11px] font-semibold text-gap">
                   smoke test, not a measurement
+                </span>
+              )}
+              {(r.preview || sim.tier === 'cpu') && !r.smoke && (
+                <span className="rounded-full border border-gap-line bg-gap-soft px-2 py-0.5 text-[11px] font-semibold text-gap">
+                  CPU preview, not converged
                 </span>
               )}
             </div>
