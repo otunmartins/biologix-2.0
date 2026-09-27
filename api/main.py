@@ -34,11 +34,22 @@ from pydantic_ai.exceptions import UserError
 from rdkit import Chem
 
 import accessibility
+import active
+import candidates
+import db
+import orchestrator
+import design
 import exposure
+import interactions
+import calibration
+import measurements
+import tg_model
+from design import DesignGoal
 from exposure import ExposureInputs
 import polymer
 from polymer import PolymerSpec
 import precedent
+import profile
 
 # ---------------------------------------------------------------------------
 # Output schema
@@ -182,6 +193,33 @@ class Dossier(BaseModel):
             e.evidence_grade not in ("A", "B") for e in self.endpoints
         ) or any(l.severity == "high" for l in self.liabilities)
         return self
+
+
+class DesignRequest(BaseModel):
+    """Either describe the problem in your own words, or hand over a parsed goal.
+
+    goal wins when both are given, so a caller that already knows the numbers
+    never pays for a model round trip to restate them.
+    """
+
+    prompt: str = Field(default="", max_length=4000)
+    goal: DesignGoal | None = None
+    limit: int = Field(default=12, ge=1, le=40)
+
+
+class IterateRequest(BaseModel):
+    """Run one active-learning iteration. Start a campaign by giving a goal or a
+    prompt; continue one by giving its campaign_id (the goal is read from the store).
+    """
+
+    campaign_id: str | None = None
+    prompt: str = Field(default="", max_length=4000)
+    goal: DesignGoal | None = None
+    batch_size: int = Field(default=8, ge=1, le=20)
+
+
+class QueueRequest(BaseModel):
+    candidate_ids: list[str] = Field(min_length=1, max_length=200)
 
 
 class ScreenRequest(BaseModel):
@@ -837,6 +875,42 @@ Exposure margins, when present, cover residual impurities only, against a generi
 never the excipient itself. Precedent plus structural alerts is a triage, not a safety assessment.
 """
 
+DESIGN_PROMPT = """You extract a formulation goal from what the user wrote. That is your only job.
+
+Fill the fields from their words and nothing else:
+  protein   - what they are formulating, in their words
+  route     - route of administration if stated, else ""
+  target_temp_c      - the storage temperature they need to survive, in Celsius. "room
+              temperature" is 25, "ambient" 25, "warehouse"/"tropical"/"Zone IV" 30.
+              Leave null if they gave none - do NOT invent one.
+  duration_months    - how long it must hold, null if unstated
+  format    - "lyophilised" if they mention lyophilised, freeze-dried, dried, powder or a
+              cake; otherwise "liquid"
+  exposed_residues   - only residues they explicitly say are exposed or liable (Met, Trp,
+              Cys, Lys, His, Asn). Empty list if they did not say. Never guess from the
+              protein's name.
+  notes     - anything else that constrains the formulation, briefly
+
+You do NOT suggest polymers, excipients or mechanisms. Something else does that, from a
+curated table. Inventing a temperature or a residue here silently changes which candidates
+are ranked, so leave a field empty rather than filling it with a plausible value."""
+
+_design_agent: Agent | None = None
+
+
+def get_design_agent() -> Agent:
+    global _design_agent
+    if _design_agent is None:
+        _design_agent = Agent(
+            "anthropic:claude-sonnet-5",
+            output_type=DesignGoal,
+            system_prompt=DESIGN_PROMPT,
+            model_settings={"max_tokens": 1000},
+            retries=2,
+        )
+    return _design_agent
+
+
 _agent: Agent | None = None
 
 
@@ -928,7 +1002,8 @@ app = FastAPI(title="Excipient Screen API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[os.environ.get("WEB_ORIGIN", "http://localhost:3000")],
-    allow_methods=["POST"],
+    # GET as well as POST since the campaign and queue views are reads.
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -938,12 +1013,184 @@ def health():
     # model_configured is the first thing you want to know when the box is up
     # but every screen is failing; the precedent index is the second, since a
     # box that can't reach fda.gov quietly grades everything as a data gap.
+    # tg_model is the third and fails the same quiet way: the pickle is a build
+    # artefact and is not in the repo, so a box without it falls back to the
+    # backbone handbook table and still answers every request.
     return {
         "ok": True,
         "model_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
         "precedent_lookup": PRECEDENT_LOOKUP_AVAILABLE,
         "precedent_index": precedent.index_status(),
+        "tg_model": tg_model.available(),
+        # Fourth thing to check, and the one that now fails loudest: campaigns and
+        # measurements live in Postgres, so a box that cannot reach it answers
+        # /health but fails every design iteration.
+        "database": _database_status(),
     }
+
+
+def _database_status() -> dict:
+    """Reachable or not, and why not. Never raises — /health must always answer."""
+    try:
+        conn = db.connect()
+    except Exception as e:
+        return {"reachable": False, "error": f"{type(e).__name__}: {e}"}
+    try:
+        conn.execute("SELECT 1")
+        return {"reachable": True}
+    except Exception as e:
+        return {"reachable": False, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        conn.close()
+
+
+@app.post("/design")
+async def design_candidates(req: DesignRequest):
+    """Rank polymer candidates for stabilising a biologic above fridge temperature.
+
+    The model, if it is used at all, only reads the goal out of the user's words.
+    Every candidate, its chemistry, its alerts and its ranking come from
+    design.py deterministically - so this endpoint cannot invent a stabiliser.
+    """
+    goal = req.goal
+    if goal is None:
+        if not req.prompt.strip():
+            raise HTTPException(status_code=422, detail="give either a prompt or a goal")
+        try:
+            agent = get_design_agent()
+        except UserError as e:
+            raise HTTPException(status_code=503, detail=f"agent not configured: {e}") from e
+        try:
+            goal = (await agent.run(req.prompt)).output
+        except Exception as e:
+            raise HTTPException(
+                status_code=502, detail=f"could not read the goal from that prompt: {e}") from e
+
+    result = design.design(goal, req.limit)
+    # Said once here as well as in every candidate, because this is the claim
+    # most likely to be over-read: a ranking is not a prediction.
+    result["verdict"] = "Data gap: test"
+    result["max_grade"] = "D"
+    return result
+
+
+async def _resolve_goal(prompt: str, goal: DesignGoal | None) -> DesignGoal:
+    """A parsed goal wins; otherwise the model reads one out of the prompt. Same
+    contract as /design, so a caller pays for a model round trip only when it has
+    not already done the parsing itself."""
+    if goal is not None:
+        return goal
+    if not prompt.strip():
+        raise HTTPException(status_code=422, detail="give either a prompt or a goal")
+    try:
+        agent = get_design_agent()
+    except UserError as e:
+        raise HTTPException(status_code=503, detail=f"agent not configured: {e}") from e
+    try:
+        return (await agent.run(prompt)).output
+    except Exception as e:
+        raise HTTPException(
+            status_code=502, detail=f"could not read the goal from that prompt: {e}") from e
+
+
+@app.post("/design/iterate")
+async def design_iterate(req: IterateRequest):
+    """One active-learning iteration over the copolymer space.
+
+    Starts a campaign from a goal/prompt, or continues one by campaign_id, proposing
+    a fresh batch that is screened and stored. Every candidate stays grade D — the
+    loop optimises the transparent triage proxy, not stabilisation (see active.py).
+    """
+    conn = candidates.connect()
+    try:
+        if req.campaign_id:
+            state = candidates.campaign_state(conn, req.campaign_id)
+            if state is None:
+                raise HTTPException(status_code=404, detail="no such campaign")
+            goal = DesignGoal(**state["goal"])
+            campaign_id = req.campaign_id
+            prior = [active.PriorCandidate(p["backbone_key"], p["components"], p["score"])
+                     for p in candidates.prior_for(conn, campaign_id)]
+        else:
+            goal = await _resolve_goal(req.prompt, req.goal)
+            campaign_id = candidates.create_campaign(conn, goal.model_dump())
+            prior = []
+
+        proposal = active.propose_batch(goal, prior, k=req.batch_size)
+        iteration = candidates.next_iteration(conn, campaign_id)
+
+        items = []
+        for rank, cand in enumerate(proposal.candidates, 1):
+            items.append({
+                "payload": design.candidate_dict(cand, goal, rank),
+                "backbone_key": cand.backbone.key,
+                "components": [[p.key, round(f, 2)] for p, f in cand.components],
+                "score": cand.score,
+            })
+        stored = candidates.add_candidates(conn, campaign_id, iteration, items)
+        candidates.record_metrics(conn, campaign_id, iteration, proposal.metrics)
+
+        history = candidates.metrics_history(conn, campaign_id)
+        return {
+            "campaign_id": campaign_id,
+            "iteration": iteration,
+            "goal": goal.model_dump(),
+            "candidates": stored,
+            "metrics": proposal.metrics,
+            "metrics_history": history,
+            # The advisory campaign controller's read of where the run stands.
+            "recommendation": orchestrator.recommend(history),
+            "queue_summary": candidates.queue_summary(conn, campaign_id),
+            "limits": active.ACTIVE_LIMITS,
+            "orchestration": orchestrator.ORCHESTRATION_NOTE,
+            "verdict": "Data gap: test",
+            "max_grade": "D",
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/design/queue")
+def design_queue(req: QueueRequest):
+    """Send benchmarked candidates to the OpenMM simulation backlog. A position in
+    the queue is a triage decision, not evidence — nothing here upgrades a grade."""
+    conn = candidates.connect()
+    try:
+        n = candidates.enqueue(conn, req.candidate_ids)
+        return {"queued": n, "queue_summary": candidates.queue_summary(conn)}
+    finally:
+        conn.close()
+
+
+@app.get("/design/campaign/{campaign_id}")
+def design_campaign(campaign_id: str):
+    conn = candidates.connect()
+    try:
+        state = candidates.campaign_state(conn, campaign_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail="no such campaign")
+        state["limits"] = active.ACTIVE_LIMITS
+        state["recommendation"] = orchestrator.recommend(state["metrics_history"])
+        state["orchestration"] = orchestrator.ORCHESTRATION_NOTE
+        return state
+    finally:
+        conn.close()
+
+
+@app.get("/design/queue")
+def design_queue_view(limit: int = 50):
+    """The simulation backlog a future GPU worker pulls, highest triage score first,
+    across every campaign. A finished run is recorded through the measurement store
+    as a source='simulation' observation, closing the loop against a real label."""
+    conn = candidates.connect()
+    try:
+        return {
+            "queue": candidates.queue(conn, limit=limit),
+            "summary": candidates.queue_summary(conn),
+            "note": active.ACTIVE_LIMITS,
+        }
+    finally:
+        conn.close()
 
 
 @app.post("/screen", response_model=Dossier)

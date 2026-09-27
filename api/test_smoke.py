@@ -10,6 +10,7 @@ must be accepted once the precedent tool has actually returned a route match.
 """
 
 import asyncio
+import json
 import os
 
 # The Anthropic provider wants a key at construction time. Nothing is ever sent —
@@ -20,6 +21,31 @@ from pydantic_ai.messages import ModelResponse, ToolCallPart  # noqa: E402
 from pydantic_ai.models.function import AgentInfo, FunctionModel  # noqa: E402
 
 import main  # noqa: E402
+
+# The stores are Postgres now, so the suite needs a database of its own: it DROPs
+# and recreates the domain tables so a rerun is never polluted by the last one.
+# Point TEST_DATABASE_URL at a separate Neon branch (or a second local database),
+# never at the one the app uses.
+TEST_DB = os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL", "")
+
+
+def fresh_store(module):
+    """A connection to the test database with this module's tables freshly made."""
+    if not TEST_DB.strip():
+        raise SystemExit(
+            "set TEST_DATABASE_URL (or DATABASE_URL) to a Postgres connection string. "
+            "Locally:  docker run -d --name biologix-pg -e POSTGRES_PASSWORD=devpass "
+            "-e POSTGRES_USER=biologix -e POSTGRES_DB=biologix -p 5432:5432 postgres:16")
+    conn = main.db.connect(TEST_DB)
+    with main.db.tx(conn):
+        # CASCADE and the order together: candidate references campaign,
+        # measurement references biologic.
+        conn.execute("DROP TABLE IF EXISTS candidate, iteration, campaign, "
+                     "measurement, biologic CASCADE")
+    main.db.reset_schema_cache()
+    conn.close()
+    return module.connect(TEST_DB)
+
 
 PS80 = "Polysorbate 80"
 PS80_SMILES = "CCCCCCCCC=CCCCCCCCC(=O)OCCOCCOCCO"  # the surrogate resolve_identity returns
@@ -574,6 +600,469 @@ def main_test():
         ctx, main.Dossier(**{**_dossier("C", "Data gap: test"), "exposure": {"made": "up"}}))
     assert d.exposure == biweekly
     print("ok  exposure: the dossier carries the computed margins, not the model's")
+
+    # --- measurement store ----------------------------------------------------
+    MS = main.measurements
+
+    conn = fresh_store(MS)
+    bid = MS.add_biologic(conn, MS.Biologic(name="Test mAb", structure_id="1IGT", modality="mAb"))
+
+    full = MS.Measurement(biologic_id=bid, excipient="Trehalose", concentration="0.5 M",
+                          quantity="delta_tm_c", value=4.6, sd=0.3, n_replicates=3,
+                          buffer="20 mM histidine", ph=6.0, method="nanoDSF",
+                          predicted_value=5.9)
+    MS.add_measurement(conn, full)
+    assert full.is_calibration_grade()[0]
+
+    # A row missing its conditions is kept and counted, never silently dropped,
+    # but it must not be fitted against: the number is not comparable.
+    thin = MS.Measurement(biologic_id=bid, excipient="Sucrose", quantity="delta_tm_c", value=3.1)
+    MS.add_measurement(conn, thin)
+    ok, missing = thin.is_calibration_grade()
+    assert not ok and "no buffer" in missing and "no pH" in missing, missing
+
+    # A simulated result is an observation with a different provenance, so an
+    # OpenMM run can be recorded without pretending it is a measurement.
+    MS.add_measurement(conn, MS.Measurement(
+        biologic_id=bid, excipient="Trehalose", concentration="0.5 M", quantity="m_value",
+        value=980.0, buffer="20 mM histidine", ph=6.0, method="alchemical FEP",
+        source="simulation", simulation_detail="OpenMM 8.1, CHARMM36m"))
+
+    s = MS.summary(conn, bid)
+    assert s["n_measurements"] == 3 and s["n_calibration_grade"] == 2, s
+    assert s["n_paired_with_prediction"] == 1
+    assert s["by_quantity"]["m_value"]["sources"] == {"simulation": 1}
+    assert s["why_rows_are_not_calibration_grade"], "blockers must be reported, not just counted"
+    print(f"ok  measurements: {s['n_measurements']} rows, {s['n_calibration_grade']} fit-able; "
+          "incomplete rows kept with their reasons")
+
+    # Referential integrity, and provenance stamped on every row.
+    try:
+        MS.add_measurement(conn, MS.Measurement(biologic_id="missing", excipient="x",
+                                                quantity="tm_c", value=1.0))
+        raise AssertionError("a measurement with no biologic was accepted")
+    except Exception as e:
+        assert isinstance(e, main.db.IntegrityError), f"{type(e).__name__}: {e}"
+    exported = json.loads(MS.export(conn, bid))
+    assert exported["biologic"]["name"] == "Test mAb"
+    assert all(r["recorded_by_version"] for r in exported["measurements"])
+    assert all(r["observed_at"] for r in exported["measurements"])
+    print("ok  measurements: orphans rejected, every row stamped with version and timestamp, "
+          "export round-trips")
+
+    # --- calibration ----------------------------------------------------------
+    CAL = main.calibration
+
+    # With nothing recorded, the posterior must BE the prior, not a fitted-looking number.
+    empty = CAL.calibrate([])
+    assert empty["posterior"]["factor"] == CAL.PRIOR_MEAN and not empty["usable"]
+    assert "IS the prior" in empty["note"]
+
+    # A known factor must be recovered from consistent data.
+    truth = 0.42
+    clean = [{"excipient": f"x{i}", "quantity": "m_value", "predicted_value": p,
+              "value": truth * p, "sd": 20.0, "source": "experiment"}
+             for i, p in enumerate([-3200, -1500, 900, 2100, 1700, -800])]
+    fit = CAL.calibrate(clean)
+    assert abs(fit["posterior"]["factor"] - truth) < 0.01, fit["posterior"]
+    assert abs(fit["least_squares"]["factor"] - truth) < 0.01
+    assert fit["r_squared"] > 0.99 and fit["loo_rmse"] is not None
+    print(f"ok  calibration: recovers a known factor ({fit['posterior']['factor']} vs {truth}), "
+          f"R2={fit['r_squared']}")
+
+    # Confidence must grow with evidence, not with a single precise point.
+    widths = []
+    for k in (1, 2, 6):
+        lo, hi = CAL.calibrate(clean[:k])["posterior"]["credible_95"]
+        widths.append(hi - lo)
+    assert widths[0] > widths[1] > widths[2], widths
+    assert widths[0] > 0.2, "one measurement must not look like a calibration"
+    print(f"ok  calibration: interval narrows with evidence ({widths[0]:.2f} -> {widths[2]:.3f}); "
+          "a single point stays wide")
+
+    # Excipients that disagree about f mean the one-factor model does not hold.
+    # Tight error bars on each point must NOT buy confidence in that case.
+    contradictory = [{"excipient": c, "quantity": "m_value", "predicted_value": 1000,
+                      "value": v, "sd": 5.0}
+                     for c, v in [("a", 900), ("b", 200), ("c", 1500), ("d", 1100)]]
+    bad = CAL.calibrate(contradictory)
+    lo, hi = bad["posterior"]["credible_95"]
+    assert hi - lo > 0.5, (lo, hi)
+    assert lo < 1.0 < hi, "contradictory data must not resolve a correction"
+    assert bad["r_squared"] < 0.5
+    print(f"ok  calibration: disagreeing excipients keep the interval wide ([{lo:.2f},{hi:.2f}]) "
+          "despite tight per-point error bars")
+
+    # Statistics are gated on the n they need, never reported on too few points.
+    two = CAL.calibrate(clean[:2])
+    assert two["r_squared"] is None and two["loo_rmse"] is None
+    assert "needs 3 pairs" in two["interpretation"] or "R^2 needs" in two["interpretation"]
+
+    # Applying the factor must carry BOTH uncertainties.
+    applied = CAL.apply_factor(-3253.6, 432.3, fit)
+    assert applied["interval_95"][0] < applied["calibrated"] < applied["interval_95"][1]
+    # Lysozyme urea: uncalibrated -3254, measured near -1300. The correction must land there.
+    assert applied["interval_95"][0] < -1300 < applied["interval_95"][1], applied
+    print(f"ok  calibration: corrected lysozyme urea to {applied['calibrated']} "
+          f"{applied['interval_95']}, bracketing the measured -1300")
+
+    # --- interaction potentials -> m-value ------------------------------------
+    I = main.interactions
+
+    urea = I.m_value("1LYZ", "urea")
+    assert urea["available"] and urea["m_value_cal_per_mol_molal"] < 0, urea
+    assert urea["direction"] == "destabilising"
+    # The backbone amide carries the effect, which is the whole basis of the
+    # transfer model: osmolytes act on the peptide backbone, not the side chains.
+    assert urea["by_group"][0]["group"] == "amide_O", urea["by_group"][:2]
+    # Protecting osmolytes must come out the other way.
+    for protecting in ("proline", "glycine betaine"):
+        assert I.m_value("1LYZ", protecting)["m_value_cal_per_mol_molal"] > 0, protecting
+    print(f"ok  m-value: urea destabilises 1LYZ ({urea['m_value_cal_per_mol_molal']} cal/mol/m, "
+          f"backbone amide O dominant); proline and betaine stabilise")
+
+    # Published uncertainties are propagated, not decoration: proline's larger
+    # errors leave its sign unresolved where urea's does not.
+    assert urea["interval_95"][1] < 0, "urea's interval should exclude zero"
+    assert I.m_value("1LYZ", "proline")["direction"] == "not resolved from zero"
+    print("ok  m-value: alpha uncertainties propagate — proline's sign is not resolved, urea's is")
+
+    # A solute with no published alphas is refused rather than estimated.
+    assert I.m_value("1LYZ", "trehalose")["available"] is False
+    assert "never estimated" in I.m_value("1LYZ", "trehalose")["note"]
+    print("ok  m-value: an unparameterised solute is refused, never inferred by analogy")
+
+    # Protein-agnostic: the same machinery on a different fold, and the result
+    # must be JSON-safe for the API.
+    import json as _json
+    other = I.m_value("P01857", "urea")
+    assert other["available"] and other["n_residues"] != urea["n_residues"]
+    assert _json.dumps(other)
+    assert other["excluded_area_no_alpha"] >= 0
+    print(f"ok  m-value: same engine on an unrelated structure ({other['n_residues']} residues), "
+          "output JSON-safe")
+
+    # --- biologic profile -----------------------------------------------------
+    PR, D = main.profile, main.design
+
+    INSULIN = "GIVEQCCTSICSLYQLENYCNFVNQHLCGSHLVEALYLVCGERGFFYTPKT"
+    LYSOZYME = ("KVFGRCELAAAMKRHGLDNYRGYSLGNWVCAAKFESNFNTQATNRNTDGSTDYGILQINSRWWCNDGRTPGSRN"
+                "LCNIPCSALLSSDVSDDIMCAKKILDKVGINYWLAHKALCSEKLDQWLCEKL")
+
+    # Different molecules must profile differently; that is the whole point.
+    ins = PR.profile(sequence=INSULIN, ph=7.0)["from_sequence"]
+    lys = PR.profile(sequence=LYSOZYME, ph=6.0)["from_sequence"]
+    assert ins["net_charge_at_ph"] < 0 < lys["net_charge_at_ph"], (ins, lys)
+    assert abs(ins["isoelectric_point"] - 5.4) < 0.5, ins["isoelectric_point"]
+    assert abs(lys["isoelectric_point"] - 8.5) < 0.5, lys["isoelectric_point"]
+    # Opposite net charges must produce opposite constraints.
+    ins_c = " ".join(c["constraint"] for c in PR.profile(sequence=INSULIN, ph=7.0)["constraints"])
+    lys_c = " ".join(c["constraint"] for c in PR.profile(sequence=LYSOZYME, ph=6.0)["constraints"])
+    assert "cationic" in ins_c and "anionic" in lys_c, (ins_c, lys_c)
+    print(f"ok  profile: insulin pI {ins['isoelectric_point']} ({ins['net_charge_at_ph']:+}) rules out "
+          f"cationic; lysozyme pI {lys['isoelectric_point']} ({lys['net_charge_at_ph']:+}) rules out anionic")
+
+    # A structure decides which liabilities are real. Lysozyme's Met is buried.
+    structured = PR.profile(structure_id="1LYZ", ph=6.0)
+    assert "Met" not in structured["exposed_residues"], structured["exposed_residues"]
+    assert "Lys" in structured["exposed_residues"]
+    # Without a structure it must be pessimistic, never permissive: assuming
+    # burial would quietly clear hazards that were simply not modelled.
+    seq_only = PR.profile(sequence=LYSOZYME, ph=6.0)
+    assert set(structured["exposed_residues"]) < set(seq_only["exposed_residues"])
+    assert any("pessimistic" in l for l in seq_only["limits"])
+    print(f"ok  profile: 1LYZ exposure narrows liabilities to {structured['exposed_residues']}; "
+          "sequence alone stays pessimistic")
+
+    # Nothing supplied must be reported, not silently treated as a clean protein.
+    blank = PR.profile()
+    assert blank["from_sequence"] is None and blank["exposed_residues"] == []
+    assert "nothing could be computed" in blank["limits"][0]
+
+    # The profile must actually change the ranking, and do it symmetrically:
+    # an anionic pendant is as wrong for a +ve protein as a cationic one is for
+    # a -ve protein, so the penalties must mirror rather than merely both exist.
+    def best_ionic(q):
+        rows = D.design(D.DesignGoal(target_temp_c=25, net_charge=q, ph=6.0), limit=60)["candidates"]
+        pick = lambda kind: next(c for c in rows if c["charge"] == kind)
+        return pick("anionic"), pick("cationic")
+
+    a_none, c_none = best_ionic(None)
+    a_pos, c_pos = best_ionic(+4.2)
+    a_neg, c_neg = best_ionic(-4.2)
+    assert a_pos["score"] < c_pos["score"], "anionic must cost more against a +ve protein"
+    assert c_neg["score"] < a_neg["score"], "cationic must cost more against a -ve protein"
+    assert (a_pos["score"], c_pos["score"]) == (c_neg["score"], a_neg["score"]),         "the charge penalty must be symmetric in the sign of the protein's charge"
+    # An unknown charge must sit between the two: penalised, but not condemned.
+    assert a_pos["score"] < a_none["score"] < a_neg["score"], "unknown charge must hedge"
+    assert any("complexation" in r for r in a_pos["risks"]), a_pos["risks"]
+    print(f"ok  profile: charge drives scoring — anionic {a_pos['score']} vs cationic "
+          f"{c_pos['score']} against a +ve protein, mirrored for a -ve one, "
+          f"{a_none['score']} when unknown")
+
+    # Buried liabilities must cost less than exposed ones.
+    def peg_score(exposed):
+        g = D.DesignGoal(target_temp_c=25, exposed_residues=exposed, net_charge=4.2, ph=6.0)
+        return [c for c in D.design(g, limit=60)["candidates"]
+                if "Oligo(ethylene" in c["pendant"]][0]["score"]
+    assert peg_score(structured["exposed_residues"]) > peg_score(seq_only["exposed_residues"])
+    print("ok  profile: a buried Met lowers the polyether penalty; an exposed one raises it")
+
+    # --- polymer designer -----------------------------------------------------
+    D = main.design
+    # Sized from the table so adding a motif cannot quietly shrink coverage.
+    ALL_PAIRS = len(D.BACKBONES) * len(D.PENDANTS)
+
+    built = {(b.key, p.key): D.build_chain(b, p) for b in D.BACKBONES for p in D.PENDANTS}
+    unbuilt = [k for k, v in built.items() if not v]
+    assert not unbuilt, f"motif pairs that do not assemble: {unbuilt}"
+    print(f"ok  designer: all {len(built)} motif pairs assemble into a screenable chain")
+
+    # The regiochemistry claim the whole motif table rests on. Sugars are linked
+    # through the 6-OH, so the anomeric centre keeps its real character: glucose
+    # stays reducing and would glycate Lys, trehalose and sucrose do not. Attach
+    # them through the anomeric carbon instead and this silently inverts.
+    mab = next(b for b in D.BACKBONES if b.key == "methacrylamide")
+    for pendant_key, should_fire in [("glucose", True), ("trehalose", False), ("sucrose", False)]:
+        pend = next(p for p in D.PENDANTS if p.key == pendant_key)
+        fired = main._fired(D.build_chain(mab, pend))
+        reducing = any("Reducing sugar" in a for a in fired)
+        assert reducing is should_fire, f"{pendant_key}: reducing={reducing}, expected {should_fire}"
+    print("ok  designer: glucose reads as reducing, trehalose and sucrose do not (6-O linked)")
+
+    liquid = D.design(D.DesignGoal(target_temp_c=25, format="liquid"), limit=ALL_PAIRS)
+    ranks = {c["name"]: c["rank"] for c in liquid["candidates"]}
+    worst = [c for c in liquid["candidates"] if any("Reducing" in a for a in c["alerts_fired"])]
+    assert worst and min(c["rank"] for c in worst) > len(liquid["candidates"]) * 0.6, \
+        "a reducing-sugar candidate ranked too highly"
+    best = liquid["candidates"][0]
+    assert not best["alerts_fired"], best["alerts_fired"]
+    print(f"ok  designer: top candidate is alert-free ({best['name']}); "
+          f"reducing sugars sit at rank {min(c['rank'] for c in worst)}+ of {len(ranks)}")
+
+    # Vitrification only applies to a dried product, and only a repeat unit whose
+    # Tg clears the storage temperature can hold the protein in a glass. The
+    # assertion is on tg_judged_c, the lower bound the screen actually scores:
+    # backbone_tg_c is the bare backbone's handbook value and is reference only,
+    # so testing it would pass while the decision was driven by something else.
+    lyo = D.design(D.DesignGoal(target_temp_c=25, format="lyophilised"), limit=ALL_PAIRS)["candidates"]
+    top = lyo[0]
+    assert top["tg_judged_c"] and top["tg_judged_c"] >= 25, \
+        f"a candidate with no glass headroom won a lyophilised goal: {top['name']}"
+    # Every candidate above the winner on judged Tg must have lost for a reason
+    # the report states, not silently.
+    better_tg = [c for c in lyo if (c["tg_judged_c"] or -999) > top["tg_judged_c"]]
+    assert all(c["risks"] for c in better_tg), \
+        "a candidate with more glass headroom ranked lower with nothing said against it"
+    # A repeat unit with little headroom over the storage temperature must say so:
+    # residual moisture plasticises a real cake by tens of degrees.
+    hot = D.design(D.DesignGoal(target_temp_c=40, format="lyophilised"), limit=ALL_PAIRS)["candidates"]
+    low = next(c for c in hot if (c["tg_judged_c"] or 0) < 40)
+    assert any("plasticise" in r or "not be a glass" in r or "may not be a glass" in r
+               for r in low["risks"]), low["risks"]
+    # Vitrification is a dried-product mechanism: a liquid formulation must not
+    # be judged on the glass transition at all.
+    for c in D.design(D.DesignGoal(target_temp_c=25, format="liquid"), limit=ALL_PAIRS)["candidates"]:
+        assert not any("glass" in r or "plasticise" in r for r in c["risks"]), (c["name"], c["risks"])
+    print(f"ok  designer: dried goal favours glass headroom (winner judged on "
+          f"{top['tg_judged_c']} C, from its {top['tg_source']}); a candidate with none is "
+          "warned about at 40 C")
+
+    # The pendant is half the molecule, and the handbook value for the bare
+    # backbone cannot see it. Where the model can, its prediction is what runs.
+    predicted = [c for c in lyo if c["tg_in_model_domain"]]
+    assert predicted, "the Tg model answered for nothing at all"
+    assert any(abs(c["tg_c"] - c["backbone_tg_c"]) > 30 for c in predicted
+               if c["backbone_tg_c"] is not None), \
+        "no predicted Tg differs from its backbone's handbook value, so the pendant is invisible"
+    # Falling outside the model's domain must not be an advantage. It used to be:
+    # the uncertainty was charged only to candidates the model could speak to,
+    # while an out-of-domain one kept the flattering handbook value at full
+    # confidence and outranked everything that had actually been looked at.
+    for c in lyo:
+        if c["tg_in_model_domain"] is False and c["backbone_tg_c"] is not None:
+            assert c["tg_judged_c"] < c["backbone_tg_c"], (
+                f"{c['name']}: out-of-domain candidate judged on the full handbook value")
+    print(f"ok  designer: Tg predicted per repeat unit for {len(predicted)}/{len(lyo)} candidates; "
+          "an out-of-domain one cannot hide behind its backbone's handbook value")
+
+    # The pickle is a build artefact and gitignored, so a fresh checkout - which
+    # is what the deploy box runs - has no model. That path is the normal one in
+    # production and has to degrade to the handbook table, not fail.
+    real_predict, D._TG_CACHE = D.tg_model.predict, {}
+    try:
+        D.tg_model.predict = lambda _: {"available": False, "reason": "no trained Tg model"}
+        fallback = D.design(D.DesignGoal(target_temp_c=25, format="lyophilised"),
+                            limit=ALL_PAIRS)["candidates"]
+    finally:
+        D.tg_model.predict, D._TG_CACHE = real_predict, {}
+    assert all(c["tg_in_model_domain"] is None for c in fallback), \
+        "a candidate claimed a model domain with no model loaded"
+    assert fallback[0]["tg_judged_c"] and fallback[0]["tg_judged_c"] >= 25, \
+        "the model-less fallback stopped favouring glass headroom"
+    assert all(c["tg_c"] == c["backbone_tg_c"] for c in fallback), \
+        "the fallback did not fall back to the backbone handbook value"
+    print(f"ok  designer: with no trained model the screen still runs on the handbook table "
+          f"({fallback[0]['name'][:40]}... judged on {fallback[0]['tg_judged_c']} C)")
+
+    # A protein that exposes the residue an alert attacks makes that alert cost more.
+    plain = D.design(D.DesignGoal(target_temp_c=25), limit=ALL_PAIRS)["candidates"]
+    met = D.design(D.DesignGoal(target_temp_c=25, exposed_residues=["Met"]), limit=ALL_PAIRS)["candidates"]
+    def peg_on_vinyl(rows):
+        return next(c for c in rows if "Oligo(ethylene glycol)" in c["pendant"]
+                    and c["backbone"].startswith("Poly(vinyl)"))
+    assert peg_on_vinyl(met)["score"] < peg_on_vinyl(plain)["score"], \
+        "exposed Met did not raise the polyether cost"
+    assert any("exposes Met" in r for r in peg_on_vinyl(met)["risks"])
+    print("ok  designer: an exposed-Met protein penalises polyether candidates further")
+
+    assert "no molecular dynamics" in D.LIMITS.lower().replace("-", " ") or "molecular dynamics" in D.LIMITS
+    print("ok  designer: the limits state plainly that no simulation was run")
+
+    # The parsing agent reads the goal and nothing else. Scripted, so no key needed.
+    def design_script(messages, info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {
+            "protein": "IgG1 mAb", "route": "subcutaneous", "target_temp_c": 30.0,
+            "duration_months": 6.0, "format": "lyophilised",
+            "exposed_residues": ["Met"], "notes": "tropical distribution"})])
+
+    dagent = main.get_design_agent()
+    with dagent.override(model=FunctionModel(design_script)):
+        parsed = asyncio.run(dagent.run("mAb for Zone IV, freeze dried, 6 months")).output
+    assert parsed.format == "lyophilised" and parsed.target_temp_c == 30.0
+    out = D.design(parsed, limit=3)
+    assert out["candidates"] and out["goal"]["exposed_residues"] == ["Met"]
+    print(f"ok  designer: a parsed goal drives the ranking ({out['candidates'][0]['name']})")
+
+    # --- copolymers -----------------------------------------------------------
+    # A copolymer is a backbone plus a weighted mixture of pendants. The built
+    # chain must carry every motif, so it fires the UNION of the components' alerts:
+    # a trehalose/oligo(ethylene glycol) blend is clean on the sugar but must still
+    # trip the polyether autoxidation alert the glycol brings.
+    treh = next(p for p in D.PENDANTS if p.key == "trehalose")
+    oeg = next(p for p in D.PENDANTS if p.key == "oligoethylene_glycol")
+    glu = next(p for p in D.PENDANTS if p.key == "glucose")
+    goal_lyo = D.DesignGoal(target_temp_c=25, format="lyophilised")
+
+    co = D.evaluate(mab, [(treh, 0.5), (oeg, 0.5)], goal_lyo)
+    co_alerts = co.alerts
+    treh_alerts = D.evaluate(mab, [(treh, 1.0)], goal_lyo).alerts
+    oeg_alerts = D.evaluate(mab, [(oeg, 1.0)], goal_lyo).alerts
+    assert set(co_alerts) == set(treh_alerts) | set(oeg_alerts), (co_alerts, treh_alerts, oeg_alerts)
+    assert any("Polyether" in a for a in co_alerts), "the glycol half must still trip autoxidation"
+    print(f"ok  copolymer: a blend fires the union of its motifs' alerts ({len(co_alerts)})")
+
+    # Fox-blended Tg must sit between the two homopolymer Tgs (blending is in Kelvin,
+    # so it lands between them) and reduce to the component's own Tg for one pendant.
+    treh_tg = D.evaluate(mab, [(treh, 1.0)], goal_lyo).tg["tg_c"]
+    oeg_tg = D.evaluate(mab, [(oeg, 1.0)], goal_lyo).tg["tg_c"]
+    blend_tg = co.tg["tg_c"]
+    assert min(treh_tg, oeg_tg) <= blend_tg <= max(treh_tg, oeg_tg), (treh_tg, oeg_tg, blend_tg)
+    assert co.tg["source"].startswith("Fox blend")
+    solo = D.evaluate(mab, [(treh, 1.0)], goal_lyo)
+    assert solo.tg == D._tg_estimate(mab, D.repeat_unit(mab, treh)), "one pendant must not blend"
+    print(f"ok  copolymer: Fox Tg {blend_tg} C between {treh_tg} and {oeg_tg}; single pendant unchanged")
+
+    # The homopolymer path must be byte-for-byte what it was: evaluate() on a single
+    # 1.0 pendant reproduces the exhaustive designer's scored candidate exactly.
+    homo = D.evaluate(mab, [(treh, 1.0)], goal_lyo)
+    all_pairs = len(D.BACKBONES) * len(D.PENDANTS)
+    ref = next(c for c in D.design(goal_lyo, limit=all_pairs)["candidates"]
+               if c["backbone"] == mab.name and c["pendant"] == treh.name)
+    assert homo.score == ref["score"] and homo.tg["judged_tg_c"] == ref["tg_judged_c"]
+    print(f"ok  copolymer: single-pendant reduces to the homopolymer score exactly ({homo.score})")
+
+    # --- active learning ------------------------------------------------------
+    import random as _random
+    A = main.active
+    rng = _random.Random(0)
+    prior, history = [], []
+    for _ in range(4):
+        prop = A.propose_batch(goal_lyo, prior, k=10, rng=rng)
+        history.append(prop.metrics)
+        for c in prop.candidates:
+            prior.append(A.PriorCandidate(c.backbone.key,
+                                          [(p.key, round(f, 2)) for p, f in c.components], c.score))
+    bests = [m["best_score_so_far"] for m in history]
+    assert bests == sorted(bests), f"best score must never regress across iterations: {bests}"
+    assert bests[-1] > bests[0], f"the loop must actually improve the best score: {bests}"
+    keys = [p.key() for p in prior]
+    assert len(keys) == len(set(keys)), "the loop proposed a duplicate composition"
+    later = [m for m in history if not m["seeded"]]
+    assert later and later[-1]["surrogate_cv_mae"] is not None, "surrogate error must be reported once fit"
+    assert all(m["batch_diversity"] and m["batch_diversity"] > 0 for m in history), "batches must be diverse"
+    print(f"ok  active learning: best score climbs {bests[0]} -> {bests[-1]} over {len(history)} "
+          f"iterations, no duplicates, surrogate CV-MAE {later[-1]['surrogate_cv_mae']}")
+
+    # The surrogate models the TRIAGE PROXY, and the loop says so, loudly.
+    assert "not stabilisation" in A.ACTIVE_LIMITS.lower() or "not a prediction" in A.ACTIVE_LIMITS.lower()
+    print("ok  active learning: the limits state the surrogate models the proxy, not stabilisation")
+
+    # --- campaign store + simulation queue ------------------------------------
+    CS = main.candidates
+    conn = fresh_store(CS)
+    cid = CS.create_campaign(conn, goal_lyo.model_dump())
+    prior2 = []
+    for it in range(1, 4):
+        loaded = [A.PriorCandidate(p["backbone_key"], p["components"], p["score"])
+                  for p in CS.prior_for(conn, cid)]
+        prop = A.propose_batch(goal_lyo, loaded, k=8, rng=rng)
+        items = [{"payload": D.candidate_dict(c, goal_lyo, i), "backbone_key": c.backbone.key,
+                  "components": [[p.key, round(f, 2)] for p, f in c.components], "score": c.score}
+                 for i, c in enumerate(prop.candidates, 1)]
+        CS.add_candidates(conn, cid, CS.next_iteration(conn, cid), items)
+        CS.record_metrics(conn, cid, it, prop.metrics)
+    allc = CS.candidates_for(conn, cid)
+    assert len(allc) == 24 and CS.next_iteration(conn, cid) == 4, len(allc)
+    assert all(c["status"] == "benchmarked" for c in allc)
+    assert all(c["id"] and c["iteration"] for c in allc), "stored rows must carry id and iteration"
+
+    # Queue the three highest-scoring, and the backlog must come back score-ordered.
+    top3 = sorted(allc, key=lambda c: -c["score"])[:3]
+    assert CS.enqueue(conn, [c["id"] for c in top3]) == 3
+    q = CS.queue(conn)
+    assert [round(c["score"], 2) for c in q] == sorted((round(c["score"], 2) for c in q), reverse=True)
+    assert CS.enqueue(conn, [top3[0]["id"]]) == 0, "re-queuing an already-queued candidate is a no-op"
+    assert CS.queue_summary(conn, cid)["n_queued"] == 3
+    print(f"ok  campaign store: {len(allc)} candidates over 3 iterations, top 3 queued, "
+          "backlog score-ordered, re-queue is a no-op")
+
+    # Provenance and referential integrity, as the measurement store demands.
+    assert all(r["app_version"] for r in conn.execute("SELECT app_version FROM candidate"))
+    try:
+        CS.add_candidates(conn, "no-such-campaign", 1, [{
+            "payload": {}, "backbone_key": mab.key, "components": [[treh.key, 1.0]], "score": 1.0}])
+        raise AssertionError("a candidate with no campaign was accepted")
+    except Exception as e:
+        assert isinstance(e, main.db.IntegrityError), f"{type(e).__name__}: {e}"
+    print("ok  campaign store: orphan candidates rejected, every row stamped with a version")
+
+    # --- orchestration (advisory campaign controller) -------------------------
+    OR = main.orchestrator
+    assert OR.recommend([])["phase"] == "seed"
+    seeding = OR.recommend([{"iteration": 1, "best_score_so_far": 1.0, "seeded": True}])
+    assert seeding["action"] == "continue" and seeding["phase"] == "seed"
+    # A best score that stops climbing over PATIENCE iterations reads as converged,
+    # and the controller then advises queuing rather than spending more iterations.
+    flat = [{"iteration": i, "best_score_so_far": 2.60 + 0.001 * i, "seeded": False,
+             "surrogate_cv_mae": 0.9, "batch_diversity": 2.0} for i in range(1, 5)]
+    conv = OR.recommend(flat)
+    assert conv["action"] == "stop" and conv["phase"] == "converged" and conv["suggest_queue"]
+    # A score still climbing must keep the loop going, and never suggest queuing.
+    climbing = [{"iteration": i, "best_score_so_far": 1.0 + 0.5 * i, "seeded": False,
+                 "surrogate_cv_mae": 0.8, "batch_diversity": 2.0} for i in range(1, 4)]
+    cont = OR.recommend(climbing)
+    assert cont["action"] == "continue" and not cont["suggest_queue"]
+    assert cont["phase"] == "exploit", "a low, settled surrogate error should tip toward exploiting"
+    # The best score is naturally flat during the space-filling seed, then jumps once
+    # the surrogate takes over — so a flat stretch that still includes seed iterations
+    # must NOT be called converged, or the run stops right before exploitation pays off.
+    seed_then_flat = [{"iteration": i, "best_score_so_far": 1.96, "seeded": i < 3,
+                       "surrogate_cv_mae": (None if i < 3 else 2.0), "batch_diversity": 2.0}
+                      for i in range(1, 4)]
+    assert OR.recommend(seed_then_flat)["phase"] != "converged", "flat during seeding is not convergence"
+    print(f"ok  orchestration: advises seed -> {cont['phase']} while climbing, "
+          "stop-and-queue once the best score plateaus, never converged mid-seed")
 
     # --- the evidence gate, both directions ----------------------------------
     agent = main.get_agent()

@@ -60,7 +60,6 @@ roughly a tenth of a g5's cost. See the GPU section below for when that changes.
 aws configure                 # access key, secret, default region
 aws ec2 create-key-pair --key-name excipient-screen \
   --query KeyMaterial --output text > excipient-screen.pem
-curl -s ifconfig.me           # your public IP, for the ssh_cidr below
 ```
 
 **2. Apply:**
@@ -68,8 +67,11 @@ curl -s ifconfig.me           # your public IP, for the ssh_cidr below
 ```bash
 cd terraform
 terraform init
-terraform apply -var="key_name=excipient-screen" -var="ssh_cidr=YOUR_IP/32"
+terraform apply -var="key_name=excipient-screen"
 ```
+
+Leave `ssh_cidr` at its default. Deploys SSH in from GitHub's runners, whose addresses change,
+so restricting it to your own IP blocks every deploy. Login is key-only.
 
 This prints a public IP. It's an Elastic IP, so it survives a stop/start of the instance.
 
@@ -77,10 +79,27 @@ This prints a public IP. It's an Elastic IP, so it survives a stop/start of the 
 
 ```bash
 ssh -i excipient-screen.pem ubuntu@<the-ip>
-git clone <your-repo> && cd <your-repo>   # or scp the directory up
-cp .env.example .env                       # set ANTHROPIC_API_KEY and put <the-ip> in the last two vars
-docker compose up -d --build               # first build is slow: RDKit + a Next.js build
+git clone https://github.com/otunmartins/biologix-2.0.git && cd biologix-2.0
+cp .env.example .env    # ANTHROPIC_API_KEY, Neon's POOLED DATABASE_URL, <the-ip> in the last two vars
+docker compose up -d --build    # first build is slow: RDKit + a Next.js build
+curl -s localhost/health        # model_configured, database.reachable and tg_model all true
 ```
+
+Clone it to exactly `/home/ubuntu/biologix-2.0` (what the commands above do): that's where the deploy
+workflow looks, unless you set an `EC2_APP_DIR` secret.
+
+**4. Turn on deploys from `main`:**
+
+```bash
+gh secret set EC2_HOST --body <the-ip>
+gh secret set EC2_USER --body ubuntu
+gh secret set EC2_SSH_KEY < excipient-screen.pem
+gh secret set EC2_HOST_KEY --body "$(ssh-keyscan <the-ip> 2>/dev/null)"
+gh variable set DEPLOY_ENABLED --body true
+```
+
+From then on every merge to `main` runs the tests, deploys, checks `/health`, and rolls back to the
+previous build if the new one comes up unhealthy.
 
 Open `http://<the-ip>`. That's plain HTTP — fine for testing, but don't put anything confidential
 through it. For HTTPS, point a domain's A record at the IP, set `SITE_ADDRESS`, `WEB_ORIGIN` and
@@ -419,6 +438,90 @@ is entirely CPU-bound and runs in seconds. When you add the Stage 3 compatibilit
    return a job id rather than blocking the request.
 
 The GPU is already there and paid for once you deploy; that work is additive, not a redeploy.
+
+## The polymer designer
+
+The app's second workflow (`POST /design`, the **Design** tab). Describe a biologic and the
+temperature it has to survive, and it returns a ranked shortlist of polymer candidates to take
+into the laboratory.
+
+```
+"Lyophilised enzyme for tropical distribution — must hold at 30 °C for a year."
+   -> 50 motif pairings built, screened and ranked
+   -> #1 Poly(methacrylamide) bearing trehalose · Tg ≈ 104 °C predicted · no alerts · grade D
+```
+
+**Candidates are enumerated, not invented.** A model asked to propose stabilising polymers will
+produce fluent, unfalsifiable suggestions — exactly what the evidence gate exists to stop. So the
+chemistry comes from a curated table in `api/design.py`: five backbones × eight pendant groups,
+each with its mechanism stated. The model's only job is reading the goal out of the user's words
+(temperature, duration, liquid or lyophilised, which residues are exposed), and its prompt forbids
+it from inventing a value for a field the user left empty. Hand over a structured `goal` instead
+and no model is called at all.
+
+**The screens do the discriminating.** Each pairing is built into a real 4-unit chain and put
+through the same structural alerts and rule table as any other excipient here, so the ranking is
+driven by chemistry the app can see:
+
+| what fires | on what | consequence |
+|---|---|---|
+| Reducing sugar | glucose pendant | glycates Lys — ranked to the bottom, below every clean candidate |
+| Polyether chain | oligo(ethylene glycol) pendant | peroxides oxidise Met/Trp on storage |
+| Michael acceptor | acrylamide backbone | residual monomer alkylates Cys |
+| Hydrolysable ester | methacrylate backbone | pH drift promotes deamidation |
+
+The sugar regiochemistry is load-bearing and easy to get wrong. Pendants attach through the
+**6-hydroxyl**, as real glycopolymer chemistry does, which leaves the anomeric centre's true
+character intact: glucose keeps its free anomeric OH and is rejected, trehalose and sucrose keep
+both anomeric carbons glycosidic and are not. Attach a sugar through its anomeric carbon instead
+and this silently inverts — glucose reads as safe. `test_smoke.py` pins it.
+
+**Scoring is transparent and additive**, and every term states its own reason: hydroxyl density
+(hydrogen bonding, the basis of both preferential exclusion and water replacement), zwitterionic
+hydration, glass transition, the alerts that actually fired, and the stated caution on each motif.
+Two rules worth knowing:
+
+- **Vitrification only counts for a dried product.** A matrix has to be a glass at the storage
+  temperature to immobilise the protein, so Tg is scored continuously in its margin over the
+  target — residual moisture plasticises a real cake by tens of degrees, so headroom keeps paying.
+  PEG (Tg ≈ −60 °C) is a poor lyophilisation matrix for exactly this reason. For a liquid
+  formulation Tg is ignored entirely.
+- **An exposed residue makes the matching alert cost more.** Tell it the protein exposes Met and
+  every polyether candidate is penalised harder.
+
+**Tg is predicted for the repeat unit, and judged on its lower bound.** `api/tg_model.py` is a
+forest trained on 7204 experimental polymers (LAMALAB curated benchmark, Zenodo 14980914),
+measured at R² 0.885 / MAE 26.3 °C on a random split but **R² 0.704 / MAE 36.3 °C on a scaffold
+split** — whole chemical families held out, which is the honest number for designed chemistry and
+the one the app plans around. Each prediction carries the forest's spread on that query and its
+Tanimoto distance to the nearest training polymer; a candidate outside the model's domain is
+labelled an extrapolation.
+
+The screen then scores the prediction **minus its uncertainty**, not the prediction itself,
+because the two ways of being wrong do not cost the same: understating Tg drops a candidate the
+laboratory would have measured anyway, while overstating it recommends a matrix that is not a
+glass at storage temperature. For the same reason the backbone's handbook value is *not* treated
+as safer — it cannot see the pendant, and a flexible side chain plasticises a stiff backbone by
+60–100 °C — so it carries the same uncertainty, and an out-of-domain prediction is allowed to
+argue a candidate down but never up.
+
+Either way this is a **homopolymer** number. A real copolymer or cake depends on composition,
+moisture and processing, and has to be measured by modulated DSC — which is why that assay is in
+every dried candidate's suggested experiments. `GET /health` reports `tg_model`: false there means
+the trained model is absent and the designer is running on the backbone handbook table.
+
+**What it does not do.** There is no molecular dynamics, no free-energy or preferential-interaction
+calculation and no predicted Tm — those need the Stage 3 compatibility simulation that is not
+built. The ranking is a triage ordering for laboratory work, not a prediction that any candidate
+will stabilise anything. Every candidate is **grade D**, verdict **"Data gap: test"**, and each
+carries the experiments that would settle it (nanoDSF/DSC for Tm shift, accelerated stability with
+SEC, modulated DSC for cake Tg, plus an assay for whatever alert fired). Nothing here addresses
+synthesis feasibility, polydispersity, endotoxin, immunogenicity or clearance, any of which can
+rule out a candidate on its own.
+
+**The designer proposes; the screen judges.** Every candidate carries a *Screen this candidate*
+action that drops its repeat unit into the polymer description on the Screen tab, where it goes
+through identity, precedent, alerts and the liability map like any other excipient.
 
 ## Not a safety assessment
 

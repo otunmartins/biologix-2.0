@@ -1,7 +1,9 @@
 FROM node:20-slim AS build
 WORKDIR /app
-COPY package.json .
-RUN npm install
+# npm ci installs exactly what package-lock.json records and fails if the two
+# disagree; npm install would re-resolve the ^ ranges on every deploy.
+COPY package.json package-lock.json ./
+RUN npm ci
 COPY . .
 # NEXT_PUBLIC_* vars are baked in at BUILD time, not read at container start —
 # so this has to be a build arg, not a docker-compose `environment:` entry.

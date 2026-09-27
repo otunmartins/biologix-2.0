@@ -1,6 +1,21 @@
-fastapi
-uvicorn[standard]
-pydantic-ai[anthropic]
-rdkit
-biopython
-httpx
+# The packages the app imports, pinned. The Dockerfile installs requirements.lock,
+# not this file: every deploy rebuilds the image on the box, so an unpinned
+# dependency means a merge can ship a different library than the one tested.
+# pydantic-ai moves fast, and tg_model.pkl was pickled by scikit-learn 1.9.1 --
+# a newer scikit-learn may refuse the pickle, and the designer then quietly
+# falls back to the handbook table.
+#
+# To upgrade: change a pin here, then regenerate the lock inside the same image
+# the server builds from:
+#   docker run --rm -v "$PWD":/w -w /w python:3.13-slim sh -c \
+#     "pip install -q -r requirements.txt && pip freeze > requirements.lock"
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+pydantic-ai==2.47.0
+anthropic==1.8.0
+rdkit==2026.3.6
+biopython==1.88
+httpx==0.28.1
+numpy==2.5.3
+scikit-learn==1.9.1
+psycopg[binary]==3.3.6

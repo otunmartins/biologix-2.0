@@ -1,7 +1,7 @@
 variable "region" {
-  description = "AWS region"
+  description = "AWS region. us-east-2 because the Neon database is there: the app opens a connection per request, so a cross-region hop is paid on every one."
   type        = string
-  default     = "us-east-1"
+  default     = "us-east-2"
 }
 
 variable "name" {
@@ -34,7 +34,7 @@ variable "root_volume_gb" {
 }
 
 variable "ssh_cidr" {
-  description = "CIDR allowed to SSH. Set this to YOUR_IP/32 — the default leaves port 22 open to the internet."
+  description = "CIDR allowed to SSH. Leave it open: the deploy workflow SSHes in from GitHub's runners, whose addresses change, so YOUR_IP/32 blocks every deploy. Key-only login keeps it safe; the deploy pins the host key via EC2_HOST_KEY."
   type        = string
   default     = "0.0.0.0/0"
 }
