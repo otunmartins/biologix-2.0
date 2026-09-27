@@ -193,6 +193,8 @@ export interface SimulationJob {
   progress: string | null;
   result: SimulationResult | null;
   error: string | null;
+  // Set once an admin has released the run to the worker; until then it waits.
+  approved_at: string | null;
 }
 
 export interface StoredCandidate extends Candidate {
@@ -360,6 +362,7 @@ export async function queueCandidates(
   if (!res.ok) {
     const body = await res.json().catch(() => null);
     if (body?.detail?.code === 'structure_required') throw new StructureRequired(body.detail.message);
+    if (typeof body?.detail?.message === 'string') throw new Error(body.detail.message);
     const detail = Array.isArray(body?.detail)
       ? (body.detail as ValidationIssue[]).map((d) => d.msg.replace(/^Value error, /, '')).join('; ')
       : typeof body?.detail === 'string'
@@ -448,6 +451,49 @@ export interface CampaignSummary {
 
 export type HistoryItem = ScreenSummary | CampaignSummary;
 
+// ---- approving simulations (admins only; the API checks ADMIN_EMAILS) ----
+
+export interface AdminJob extends StoredCandidate {
+  campaign_id: string;
+  owner_email: string | null;
+}
+
+async function detailOf(res: Response): Promise<string> {
+  const body = await res.json().catch(() => null);
+  return typeof body?.detail === 'string' ? body.detail : `Server returned ${res.status}`;
+}
+
+// Whether the signed-in user approves simulations. False on any error: the
+// approvals tab is simply not shown.
+export async function getIsAdmin(signal?: AbortSignal): Promise<boolean> {
+  const res = await call('/design/queue?limit=1', { signal });
+  return res.ok ? Boolean((await res.json()).admin) : false;
+}
+
+export async function getSimulations(
+  signal?: AbortSignal,
+): Promise<{ jobs: AdminJob[]; pod_autostart: boolean }> {
+  const res = await call('/design/simulations', { signal });
+  if (!res.ok) throw new Error(await detailOf(res));
+  return res.json();
+}
+
+// Returns what RunPod said about starting the worker's pod.
+export async function approveSimulation(id: string): Promise<string> {
+  const res = await call(`/design/simulations/${encodeURIComponent(id)}/approve`, { method: 'POST' });
+  if (!res.ok) throw new Error(await detailOf(res));
+  return (await res.json()).pod;
+}
+
+export async function declineSimulation(id: string, reason: string): Promise<void> {
+  const res = await call(`/design/simulations/${encodeURIComponent(id)}/decline`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason }),
+  });
+  if (!res.ok) throw new Error(await detailOf(res));
+}
+
 export interface HistoryEvent {
   at: string;
   kind:
@@ -460,6 +506,8 @@ export interface HistoryEvent {
     | 'candidate.simulated'
     | 'candidate.simulation_failed'
     | 'candidate.requeued'
+    | 'candidate.approved'
+    | 'candidate.declined'
     | 'campaign.ended'
     | 'campaign.reopened';
   data: Record<string, any>;

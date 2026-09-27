@@ -56,6 +56,7 @@ import polymer
 from polymer import PolymerSpec
 import precedent
 import profile
+import runpod
 import users
 
 # ---------------------------------------------------------------------------
@@ -1309,9 +1310,21 @@ def design_queue(req: QueueRequest, user_id: int = Depends(users.current_user)):
                     "code": "structure_required",
                     "message": "Give the biologic's PDB ID or UniProt accession: the simulation "
                                "runs the polymer against the protein you are stabilising."})
+        # One simulation waiting or running per user, admins aside: each is hours
+        # of paid GPU time, and sign-up is open.
+        cap = None if users.is_admin(conn, user_id) else 1
         with db.tx(conn):
-            queued = candidates.enqueue_rows(conn, req.candidate_ids, owner_id=user_id,
-                                             structure_id=structure_id)
+            try:
+                queued = candidates.enqueue_rows(conn, req.candidate_ids, owner_id=user_id,
+                                                 structure_id=structure_id, max_active=cap)
+            except candidates.QueueFull as e:
+                names = ", ".join(a["name"] or a["id"] for a in e.active)
+                raise HTTPException(status_code=409, detail={
+                    "code": "one_at_a_time",
+                    "message": ("You can have one simulation waiting or running at a time"
+                                + (f", and {names} already is." if names else
+                                   "; queue a single candidate.")),
+                    "active": e.active})
             if req.structure_id:
                 # Remembered on each campaign whose goal named none, so the user is
                 # asked once per campaign rather than once per candidate.
@@ -1411,7 +1424,56 @@ def design_queue_view(limit: int = 50, user_id: int = Depends(users.current_user
             "queue": candidates.queue(conn, owner_id=user_id, limit=limit),
             "summary": candidates.queue_summary(conn, owner_id=user_id),
             "note": active.ACTIVE_LIMITS,
+            # Whether to show the approvals panel.
+            "admin": users.is_admin(conn, user_id),
         }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Approving simulations (admins only; ADMIN_EMAILS)
+# ---------------------------------------------------------------------------
+# A queued simulation is a request, not a run: nothing reaches the worker until an
+# admin approves it, because each one is hours of paid GPU time. Approving also
+# starts the worker's RunPod pod, which stops itself again once the queue is empty.
+
+class Decline(BaseModel):
+    reason: str = Field(default="declined by an admin", min_length=1, max_length=500)
+
+
+@app.get("/design/simulations")
+def simulations_view(admin_id: int = Depends(users.current_admin)):
+    """Every user's simulations that are waiting or running."""
+    conn = candidates.connect()
+    try:
+        return {"jobs": candidates.all_active(conn), "pod_autostart": runpod.configured()}
+    finally:
+        conn.close()
+
+
+@app.post("/design/simulations/{job_id}/approve")
+def simulation_approve(job_id: str, admin_id: int = Depends(users.current_admin)):
+    conn = history.connect()
+    try:
+        job = candidates.approve(conn, job_id, admin_id)
+        if job is None:
+            raise HTTPException(status_code=409, detail="not a queued, unapproved job with a structure")
+        _log_sim(conn, job, "candidate.approved", {})
+    finally:
+        conn.close()
+    return {"ok": True, "pod": runpod.start_pod()}
+
+
+@app.post("/design/simulations/{job_id}/decline")
+def simulation_decline(job_id: str, body: Decline, admin_id: int = Depends(users.current_admin)):
+    conn = history.connect()
+    try:
+        job = candidates.decline(conn, job_id, body.reason)
+        if job is None:
+            raise HTTPException(status_code=409, detail="only a job still waiting can be declined")
+        _log_sim(conn, job, "candidate.declined", {"reason": body.reason})
+        return {"ok": True}
     finally:
         conn.close()
 

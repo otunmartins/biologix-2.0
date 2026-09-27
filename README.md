@@ -531,12 +531,27 @@ the default 1,500-residue cap once solvated. Use a Fab or Fc entry.
 can reach the API. It heartbeats every minute; a job whose worker goes quiet for 20 minutes is
 requeued, and failed after three attempts. Jobs run highest triage score first.
 
+**Spending controls.** Sign-up is open and each run is hours of paid GPU time, so queueing is a
+request, not a run:
+
+- **An admin approves every run.** A queued job waits as "Waiting for approval" and the worker
+  cannot claim it. Admins are the emails in `ADMIN_EMAILS` on the server; they get an
+  **Approvals** tab listing every user's waiting and running jobs, with Approve and Decline. A
+  declined job shows the user the reason and can be queued again. Queuing again always needs a
+  fresh approval.
+- **One at a time.** A user can have one simulation waiting or running; queueing another is
+  refused with the name of the one in the way. Admins are exempt, since they approve their own.
+- **The GPU runs only while there is approved work.** Approving starts the RunPod pod (when the
+  API has `RUNPOD_API_KEY` and `RUNPOD_POD_ID`), and the worker stops it after
+  `IDLE_STOP_MINUTES` with nothing to claim.
+
 **Turning it on: a RunPod GPU pod.** The EC2 box has no GPU (AWS's G-instance quota is not
 available on this account), so the worker runs on RunPod and reaches the API through its public
 URL; Caddy routes `/worker*` to the API. The app must already be deployed on its domain with HTTPS.
 
-1. **A token.** On the server, add `WORKER_TOKEN=<openssl rand -hex 32>` to `.env` and run
-   `docker compose up -d api` so the API picks it up. Check it:
+1. **A token and an admin.** On the server, add `WORKER_TOKEN=<openssl rand -hex 32>` and
+   `ADMIN_EMAILS=<the email you sign in with>` to `.env` and run `docker compose up -d api` so the
+   API picks them up. Check it:
    `curl -X POST https://<your-domain>/worker/claim` should now answer 401 (bad token), not 503.
 2. **The image.** Merging to main runs `.github/workflows/worker-image.yml`, which publishes
    `ghcr.io/otunmartins/biologix-worker:latest` (or run it by hand from the Actions tab). The
@@ -551,8 +566,12 @@ URL; Caddy routes `/worker*` to the API. The app must already be deployed on its
    a pre-empted spot pod loses the run in progress. An RTX 4090, L4 or A40 is plenty, since OpenMM
    runs one small system per GPU. Use the CUDA filter to pick hosts with CUDA 12.x or newer
    (the image needs an NVIDIA driver ≥ 525).
-5. **Check it.** The pod's logs should show `platforms [..., 'CUDA']` on the first line, then
-   claim queued candidates. A queued candidate's card switches to "Running: ..." with the
+5. **Let approvals start it.** Copy the pod's id (on its card in the console) and create an API
+   key under RunPod → Settings → API Keys. Put them on the server as `RUNPOD_POD_ID` and
+   `RUNPOD_API_KEY` in `.env`, then `docker compose up -d api`. Stop the pod; from now on
+   approving a run starts it, and the worker stops it again when the queue is empty.
+6. **Check it.** Queue one candidate, approve it in the Approvals tab, and watch the pod start.
+   Its logs should show `platforms [..., 'CUDA']` on the first line, then claim the job. A queued candidate's card switches to "Running: ..." with the
    current stage.
 
 **Cost control.** A pod bills every hour it is up, busy or not. With `IDLE_STOP_MINUTES` set,

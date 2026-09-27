@@ -23,6 +23,8 @@ the adapter needs nothing of its own. The unique indexes are additions: the
 adapter looks rows up by these columns and assumes each finds at most one.
 """
 
+import os
+
 import psycopg
 from fastapi import HTTPException, Request
 
@@ -128,4 +130,31 @@ def current_user(request: Request) -> int:
         conn.close()
     if user_id is None:
         raise HTTPException(status_code=401, detail="your session has expired; sign in again")
+    return user_id
+
+
+# Admins approve every simulation before it spends GPU time (candidates.approve).
+# Named by email in ADMIN_EMAILS, comma-separated, rather than a column: sign-up
+# is open, so being an admin must not be something the database alone can grant.
+def admin_emails() -> set[str]:
+    return {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
+
+
+def is_admin(conn: psycopg.Connection, user_id: int) -> bool:
+    admins = admin_emails()
+    if not admins:
+        return False
+    row = conn.execute("SELECT email FROM users WHERE id=%s", (user_id,)).fetchone()
+    return bool(row and row["email"] and row["email"].strip().lower() in admins)
+
+
+def current_admin(request: Request) -> int:
+    """FastAPI dependency: the signed-in user's id if they are an admin, else 403."""
+    user_id = current_user(request)
+    conn = db.connect()
+    try:
+        if not is_admin(conn, user_id):
+            raise HTTPException(status_code=403, detail="only an admin can do this")
+    finally:
+        conn.close()
     return user_id
