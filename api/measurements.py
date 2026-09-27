@@ -55,11 +55,17 @@ Quantity = Literal[
     "monomer_percent",   # SEC-HPLC main peak
     "activity_percent",  # retained activity after stress
     "aggregation_rate",  # percent per month
+    # Preferential interaction coefficient of the excipient with the NATIVE
+    # protein, from an OpenMM run (worker/). Negative: excluded from the surface
+    # (preferential hydration, the classic stabilising signature). Positive:
+    # accumulates at it. Not an m-value: that needs the unfolded state too.
+    "gamma23",
 ]
 
 UNITS = {
     "tm_c": "C", "delta_tm_c": "C", "m_value": "cal/mol/molal", "tg_c": "C",
     "monomer_percent": "%", "activity_percent": "%", "aggregation_rate": "%/month",
+    "gamma23": "chains/protein",
 }
 
 # Quantities the prediction side can currently be scored against. Recording

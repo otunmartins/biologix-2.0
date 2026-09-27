@@ -40,8 +40,8 @@ import users
 APP_VERSION = os.environ.get("APP_VERSION", "dev")
 
 # The lifecycle of a candidate. 'benchmarked' the moment it is screened and stored;
-# 'queued' once a user sends it for simulation; the rest are for the GPU worker that
-# does not exist yet, kept here so it slots in without a schema change.
+# 'queued' once a user sends it for simulation; then 'simulating' while a worker
+# (worker/) holds it, and 'simulated' or 'failed' when it reports back.
 Status = Literal["proposed", "benchmarked", "queued", "simulating", "simulated", "failed"]
 
 SCHEMA = """
@@ -89,7 +89,30 @@ CREATE TABLE IF NOT EXISTS candidate (
 );
 CREATE INDEX IF NOT EXISTS candidate_by_campaign ON candidate(campaign_id, iteration);
 CREATE INDEX IF NOT EXISTS candidate_by_status ON candidate(status, score);
+-- The OpenMM job (Stage 3), on the candidate it is about. sim_structure_id is the
+-- target biologic's PDB ID or UniProt accession, fixed when it is queued: the
+-- polymer is simulated against the protein the user is trying to stabilise.
+-- Heartbeats are TIMESTAMPTZ and compared with the database's own now(), so a
+-- worker on another machine with a skewed clock cannot make a live job look
+-- dead or a dead one look live.
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_structure_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_worker TEXT;
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_started_at TIMESTAMPTZ;
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_heartbeat_at TIMESTAMPTZ;
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_finished_at TIMESTAMPTZ;
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_progress TEXT;
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_result TEXT;     -- JSON, see worker/
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_error TEXT;
 """
+
+# A job whose worker has not checked in for this long is presumed dead (the box
+# was stopped, the container OOM-killed) and goes back in the queue. Workers
+# heartbeat every minute or so, so this is many missed beats, not one slow one.
+STALE_AFTER_MINUTES = 20
+# After this many claims a job is failed rather than requeued: a system that
+# crashes the worker every time would otherwise loop forever.
+MAX_ATTEMPTS = 3
 
 
 def connect(url: str | None = None) -> psycopg.Connection:
@@ -175,27 +198,36 @@ def record_metrics(conn: psycopg.Connection, campaign_id: str, iteration: int,
             (campaign_id, iteration, json.dumps(metrics), _now()))
 
 
-def enqueue(conn: psycopg.Connection, candidate_ids: list[str], *, owner_id: int) -> int:
+def enqueue(conn: psycopg.Connection, candidate_ids: list[str], *, owner_id: int,
+            structure_id: str = "") -> int:
     """Send benchmarked candidates to the simulation queue. Only a benchmarked
-    candidate can be queued, so re-queuing or queuing a running one is a no-op --
-    and so is naming another user's candidate."""
-    return len(enqueue_rows(conn, candidate_ids, owner_id=owner_id))
+    (or failed) candidate can be queued, so re-queuing or queuing a running one is
+    a no-op -- and so is naming another user's candidate."""
+    return len(enqueue_rows(conn, candidate_ids, owner_id=owner_id, structure_id=structure_id))
 
 
 def enqueue_rows(conn: psycopg.Connection, candidate_ids: list[str], *,
-                 owner_id: int) -> list[dict]:
+                 owner_id: int, structure_id: str = "") -> list[dict]:
     """enqueue(), returning what was actually queued -- id, campaign and score --
-    so the caller can log exactly that and nothing it merely asked for."""
+    so the caller can log exactly that and nothing it merely asked for.
+
+    structure_id is the target protein the worker simulates against. A worker
+    only claims jobs that have one, so a candidate queued without one (before
+    structures were asked for) waits; queuing it again WITH a structure attaches
+    it. That is the one case where queuing an already-queued candidate acts. A
+    failed job can be queued again, which starts its attempts afresh."""
     now = _now()
     queued = []
     with db.tx(conn):
         for cid in candidate_ids:
             row = conn.execute(
-                "UPDATE candidate SET status='queued', updated_at=%s "
-                "WHERE id=%s AND status='benchmarked' "
+                "UPDATE candidate SET status='queued', updated_at=%s, sim_structure_id=%s, "
+                "sim_attempts=0, sim_error=NULL, sim_result=NULL, sim_progress=NULL "
+                "WHERE id=%s AND (status IN ('benchmarked', 'failed') "
+                "     OR (status='queued' AND sim_structure_id='' AND %s <> '')) "
                 "AND campaign_id IN (SELECT id FROM campaign WHERE owner_id=%s) "
                 "RETURNING id, campaign_id, score, payload",
-                (now, cid, owner_id)).fetchone()
+                (now, structure_id, cid, structure_id, owner_id)).fetchone()
             if row:
                 queued.append({"id": row["id"], "campaign_id": row["campaign_id"],
                                "score": row["score"],
@@ -210,6 +242,87 @@ def mark_status(conn: psycopg.Connection, candidate_id: str, status: Status) -> 
 
 
 # ---------------------------------------------------------------------------
+# The simulation worker's side of the queue (worker/, via main.py's /worker/*)
+# ---------------------------------------------------------------------------
+# These are the only functions here that do NOT take an owner: the worker serves
+# every user's queue, and is authenticated by WORKER_TOKEN rather than a session.
+# What it can do is narrow -- claim the next job, report on the job it holds --
+# and every report is checked against the worker that claimed it.
+
+def requeue_stale(conn: psycopg.Connection) -> list[dict]:
+    """Jobs whose worker went silent: back to 'queued', or 'failed' once they
+    have used up their attempts. Returns what changed, for the history."""
+    with db.tx(conn):
+        rows = conn.execute(
+            "UPDATE candidate SET "
+            "  status = CASE WHEN sim_attempts >= %s THEN 'failed' ELSE 'queued' END, "
+            "  sim_error = CASE WHEN sim_attempts >= %s "
+            "    THEN 'the simulation worker stopped responding on every attempt' "
+            "    ELSE 'the simulation worker stopped responding; requeued' END, "
+            "  sim_worker = NULL, updated_at = %s "
+            "WHERE status='simulating' AND sim_heartbeat_at < now() - make_interval(mins => %s) "
+            "RETURNING id, campaign_id, status, sim_error",
+            (MAX_ATTEMPTS, MAX_ATTEMPTS, _now(), STALE_AFTER_MINUTES)).fetchall()
+    return rows
+
+
+def claim_next(conn: psycopg.Connection, worker: str) -> dict | None:
+    """Atomically take the highest-scoring queued job that has a target structure.
+    SKIP LOCKED lets several workers pull from one queue without ever taking the
+    same job. Returns the candidate, its campaign's goal and its owner, or None."""
+    with db.tx(conn):
+        row = conn.execute(
+            "WITH nxt AS ("
+            "  SELECT id FROM candidate WHERE status='queued' AND sim_structure_id <> '' "
+            "  ORDER BY score DESC, updated_at LIMIT 1 FOR UPDATE SKIP LOCKED) "
+            "UPDATE candidate c SET status='simulating', sim_worker=%s, sim_started_at=now(), "
+            "  sim_heartbeat_at=now(), sim_attempts=c.sim_attempts+1, sim_error=NULL, "
+            "  sim_progress=NULL, updated_at=%s "
+            "FROM nxt WHERE c.id=nxt.id RETURNING c.*",
+            (worker, _now())).fetchone()
+        if row is None:
+            return None
+        camp = conn.execute("SELECT goal, owner_id FROM campaign WHERE id=%s",
+                            (row["campaign_id"],)).fetchone()
+    return {"candidate": _hydrate(row), "goal": json.loads(camp["goal"]),
+            "owner_id": camp["owner_id"], "campaign_id": row["campaign_id"]}
+
+
+def heartbeat(conn: psycopg.Connection, candidate_id: str, worker: str,
+              progress: str = "") -> bool:
+    """The worker is alive and still on this job. False if the job is no longer
+    its own (requeued after it went quiet, and perhaps claimed by another): the
+    worker should then abandon it rather than report a result nobody asked for."""
+    with db.tx(conn):
+        cur = conn.execute(
+            "UPDATE candidate SET sim_heartbeat_at=now(), sim_progress=%s "
+            "WHERE id=%s AND status='simulating' AND sim_worker=%s",
+            (progress[:500] or None, candidate_id, worker))
+    return cur.rowcount > 0
+
+
+def finish(conn: psycopg.Connection, candidate_id: str, worker: str, *,
+           result: dict | None = None, error: str | None = None) -> dict | None:
+    """Record the outcome of the job this worker holds: 'simulated' with its
+    result, or 'failed' with why. None if it does not hold the job."""
+    status = "failed" if error else "simulated"
+    with db.tx(conn):
+        row = conn.execute(
+            "UPDATE candidate SET status=%s, sim_result=%s, sim_error=%s, "
+            "  sim_finished_at=now(), sim_progress=NULL, updated_at=%s "
+            "WHERE id=%s AND status='simulating' AND sim_worker=%s "
+            "RETURNING *",
+            (status, json.dumps(result) if result is not None else None,
+             (error or "")[:2000] or None, _now(), candidate_id, worker)).fetchone()
+        if row is None:
+            return None
+        camp = conn.execute("SELECT goal, owner_id FROM campaign WHERE id=%s",
+                            (row["campaign_id"],)).fetchone()
+    return {"candidate": _hydrate(row), "goal": json.loads(camp["goal"]),
+            "owner_id": camp["owner_id"], "campaign_id": row["campaign_id"]}
+
+
+# ---------------------------------------------------------------------------
 # Reads
 # ---------------------------------------------------------------------------
 
@@ -218,9 +331,26 @@ def _row_to_candidate(cid: str, iteration: int, status: str, payload: dict) -> d
     return {**payload, "id": cid, "iteration": iteration, "status": status}
 
 
+def _iso(t) -> str | None:
+    return t.isoformat() if t is not None else None
+
+
 def _hydrate(row: dict) -> dict:
-    return _row_to_candidate(row["id"], row["iteration"], row["status"],
-                             json.loads(row["payload"]))
+    c = _row_to_candidate(row["id"], row["iteration"], row["status"], json.loads(row["payload"]))
+    # The simulation job, once there is one. Absent for a candidate never queued,
+    # so an unqueued candidate's shape is exactly what it always was.
+    if row.get("sim_structure_id") or row.get("sim_attempts") or row.get("sim_error"):
+        c["simulation"] = {
+            "structure_id": row.get("sim_structure_id") or "",
+            "attempts": row.get("sim_attempts") or 0,
+            "started_at": _iso(row.get("sim_started_at")),
+            "heartbeat_at": _iso(row.get("sim_heartbeat_at")),
+            "finished_at": _iso(row.get("sim_finished_at")),
+            "progress": row.get("sim_progress"),
+            "result": json.loads(row["sim_result"]) if row.get("sim_result") else None,
+            "error": row.get("sim_error"),
+        }
+    return c
 
 
 def next_iteration(conn: psycopg.Connection, campaign_id: str) -> int:
@@ -277,7 +407,7 @@ def queue(conn: psycopg.Connection, *, owner_id: int, limit: int = 50,
 def queue_summary(conn: psycopg.Connection, *, owner_id: int,
                   campaign_id: str | None = None) -> dict:
     """Counts by status, plus the top of the queue — enough for the panel to say
-    'N queued for OpenMM, waiting for GPU' without pulling every row."""
+    'N queued, M running' without pulling every row."""
     sql = ("SELECT status, COUNT(*) AS n FROM candidate "
            "WHERE campaign_id IN (SELECT id FROM campaign WHERE owner_id=%s)")
     args: list = [owner_id]
@@ -291,10 +421,13 @@ def queue_summary(conn: psycopg.Connection, *, owner_id: int,
         "n_queued": counts.get("queued", 0),
         "n_benchmarked": counts.get("benchmarked", 0),
         "n_simulated": counts.get("simulated", 0),
+        "n_simulating": counts.get("simulating", 0),
+        "n_failed": counts.get("failed", 0),
         "by_status": counts,
         "top": [{"id": c["id"], "name": c["name"], "score": c["score"]} for c in top],
-        "note": ("Queued candidates are ordered by triage score and wait for an OpenMM run "
-                 "when a GPU is available. A queue position is a triage decision, not evidence."),
+        "note": ("Queued candidates are ordered by triage score and simulated in that order "
+                 "whenever a simulation worker is running. A queue position is a triage "
+                 "decision, not evidence."),
     }
 
 

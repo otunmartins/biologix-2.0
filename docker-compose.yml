@@ -49,11 +49,32 @@ services:
       # so a result can be traced to the exact code that produced it. The
       # deploy sets it; a hand-run `docker compose up` records 'dev'.
       - APP_VERSION=${APP_VERSION:-dev}
+      # Shared secret for the simulation worker's /worker/* routes. Unset, those
+      # routes answer 503 and nothing else changes.
+      - WORKER_TOKEN=${WORKER_TOKEN:-}
     volumes:
       # The FDA Inactive Ingredient file is fetched once and reused for 30 days.
       # Without this it lands in the container's /tmp and is re-downloaded after
       # every restart, so the first screen back up waits on fda.gov.
       - iid_cache:/cache
+    restart: unless-stopped
+
+  # The OpenMM simulation worker (worker/). Off unless the "worker" profile is
+  # on -- COMPOSE_PROFILES=worker in .env -- because it is a multi-GB image that
+  # only earns its keep on a box with a GPU. On one, also layer
+  # docker-compose.gpu.yml so the container can see it. It reaches the API over
+  # the compose network; a worker elsewhere uses the public URL instead.
+  worker:
+    build: ./worker
+    profiles: ["worker"]
+    environment:
+      - API_URL=http://api:8000
+      - WORKER_TOKEN=${WORKER_TOKEN:-}
+      - WORKER_NAME=${WORKER_NAME:-}
+      - OPENMM_PLATFORM=${OPENMM_PLATFORM:-}
+      - SIM_PRODUCTION_NS=${SIM_PRODUCTION_NS:-}
+    depends_on:
+      - api
     restart: unless-stopped
 
 volumes:

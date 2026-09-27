@@ -144,7 +144,7 @@ function ScreenDetail({
 }
 
 // What each kind of event means, in words, from the data it was logged with.
-function describe(e: HistoryEvent): { title: string; body: string | null; tone: 'neutral' | 'good' | 'info' } {
+function describe(e: HistoryEvent): { title: string; body: string | null; tone: 'neutral' | 'good' | 'info' | 'bad' } {
   const d = e.data ?? {};
   switch (e.kind) {
     case 'campaign.started':
@@ -174,6 +174,24 @@ function describe(e: HistoryEvent): { title: string; body: string | null; tone: 
         tone: 'good',
       };
     }
+    case 'candidate.simulating':
+      return {
+        title: `Simulating ${d.candidate?.name ?? 'a candidate'}`,
+        body: `Against ${d.structure_id}, on ${d.worker}${d.attempt > 1 ? ` (attempt ${d.attempt})` : ''}.`,
+        tone: 'info',
+      };
+    case 'candidate.simulated':
+      return {
+        title: `Simulated ${d.candidate?.name ?? 'a candidate'}`,
+        body:
+          `Γ23 = ${d.gamma23}${d.gamma23_se != null ? ` ± ${d.gamma23_se}` : ''} over ${d.production_ns} ns` +
+          (d.smoke ? ' (pipeline smoke test, not a measurement)' : ''),
+        tone: 'good',
+      };
+    case 'candidate.simulation_failed':
+      return { title: `Simulation failed: ${d.candidate?.name ?? 'a candidate'}`, body: d.error ?? '', tone: 'bad' };
+    case 'candidate.requeued':
+      return { title: 'Simulation requeued', body: d.error ?? 'The worker stopped responding.', tone: 'neutral' };
     case 'campaign.ended':
       return { title: 'Ended', body: 'Closed with New experiment. Still here, and can be continued.', tone: 'neutral' };
     case 'campaign.reopened':
@@ -185,7 +203,7 @@ function describe(e: HistoryEvent): { title: string; body: string | null; tone: 
   }
 }
 
-const TONE_DOT = { neutral: 'bg-slate-400', good: 'bg-precedented', info: 'bg-supported' } as const;
+const TONE_DOT = { neutral: 'bg-slate-400', good: 'bg-precedented', info: 'bg-supported', bad: 'bg-alert' } as const;
 
 function EventTimeline({ events }: { events: HistoryEvent[] }) {
   return (

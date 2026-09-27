@@ -233,8 +233,30 @@ class IterateRequest(BaseModel):
     batch_size: int = Field(default=8, ge=1, le=20)
 
 
+# A PDB ID (digit first, 4 characters) or a UniProt accession (6 or 10
+# characters, letter first). Checked at the door, so a typo is a 422 now rather
+# than a failed simulation an hour later.
+STRUCTURE_ID_RE = re.compile(
+    r"^(?:[0-9][A-Za-z0-9]{3}|[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2})$")
+
+
+def _clean_structure_id(v: str) -> str:
+    v = (v or "").strip().upper()
+    if v and not STRUCTURE_ID_RE.match(v):
+        raise ValueError("not a PDB ID (e.g. 1IGT) or UniProt accession (e.g. P01857)")
+    return v
+
+
 class QueueRequest(BaseModel):
     candidate_ids: list[str] = Field(min_length=1, max_length=200)
+    # The target biologic to simulate against. Optional when the campaign's goal
+    # already names one; required (422 otherwise) when it does not.
+    structure_id: str = Field(default="", max_length=40)
+
+    @model_validator(mode="after")
+    def _structure(self):
+        self.structure_id = _clean_structure_id(self.structure_id)
+        return self
 
 
 class ScreenRequest(BaseModel):
@@ -914,6 +936,9 @@ Fill the fields from their words and nothing else:
               Cys, Lys, His, Asn). Empty list if they did not say. Never guess from the
               protein's name.
   notes     - anything else that constrains the formulation, briefly
+  structure_id       - a PDB ID (4 characters, starting with a digit, e.g. 1IGT) or a
+              UniProt accession (e.g. P01857) ONLY if they wrote one. Never look one up
+              from the protein's name; leave "" if none was given.
 
 You do NOT suggest polymers, excipients or mechanisms. Something else does that, from a
 curated table. Inventing a temperature or a residue here silently changes which candidates
@@ -1269,8 +1294,35 @@ def design_queue(req: QueueRequest, user_id: int = Depends(users.current_user)):
     the queue is a triage decision, not evidence — nothing here upgrades a grade."""
     conn = history.connect()
     try:
+        structure_id = req.structure_id
+        if not structure_id:
+            # Fall back to the structure the campaign's goal names. Every campaign
+            # the request touches must agree on one, or the caller must say which.
+            goals = conn.execute(
+                "SELECT DISTINCT cp.goal FROM candidate c JOIN campaign cp ON cp.id=c.campaign_id "
+                "WHERE c.id = ANY(%s) AND cp.owner_id=%s", (req.candidate_ids, user_id)).fetchall()
+            found = {(json.loads(g["goal"]).get("structure_id") or "").strip().upper() for g in goals}
+            if len(found) == 1 and "" not in found:
+                structure_id = found.pop()
+            elif goals:
+                raise HTTPException(status_code=422, detail={
+                    "code": "structure_required",
+                    "message": "Give the biologic's PDB ID or UniProt accession: the simulation "
+                               "runs the polymer against the protein you are stabilising."})
         with db.tx(conn):
-            queued = candidates.enqueue_rows(conn, req.candidate_ids, owner_id=user_id)
+            queued = candidates.enqueue_rows(conn, req.candidate_ids, owner_id=user_id,
+                                             structure_id=structure_id)
+            if req.structure_id:
+                # Remembered on each campaign whose goal named none, so the user is
+                # asked once per campaign rather than once per candidate.
+                for row in conn.execute(
+                        "SELECT DISTINCT cp.id, cp.goal FROM candidate c JOIN campaign cp "
+                        "ON cp.id=c.campaign_id WHERE c.id = ANY(%s) AND cp.owner_id=%s",
+                        (req.candidate_ids, user_id)).fetchall():
+                    g = json.loads(row["goal"])
+                    if not g.get("structure_id"):
+                        conn.execute("UPDATE campaign SET goal=%s WHERE id=%s",
+                                     (json.dumps({**g, "structure_id": structure_id}), row["id"]))
             # Logged per campaign, and only for what was actually queued.
             by_campaign: dict[str, list[dict]] = {}
             for q in queued:
@@ -1278,7 +1330,7 @@ def design_queue(req: QueueRequest, user_id: int = Depends(users.current_user)):
                     {"id": q["id"], "name": q["name"], "score": q["score"]})
             for cid, rows in by_campaign.items():
                 history.log_event(conn, user_id, "candidate.queued", "campaign", cid,
-                                  {"candidates": rows})
+                                  {"candidates": rows, "structure_id": structure_id})
         return {"queued": len(queued), "queue_summary": candidates.queue_summary(conn, owner_id=user_id)}
     finally:
         conn.close()
@@ -1360,6 +1412,220 @@ def design_queue_view(limit: int = 50, user_id: int = Depends(users.current_user
             "summary": candidates.queue_summary(conn, owner_id=user_id),
             "note": active.ACTIVE_LIMITS,
         }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# The OpenMM simulation worker (worker/). Stage 3.
+# ---------------------------------------------------------------------------
+# The worker is a separate process -- a conda image with OpenMM, on a GPU box or
+# anywhere else -- that pulls queued candidates from here over HTTP. It holds no
+# database credentials: it can only claim the next job and report on the job it
+# holds, authenticated by a shared WORKER_TOKEN. Unset, these routes are off
+# (503), which is the right default for a deployment with no worker.
+
+def _worker_auth(request: Request) -> None:
+    import hmac
+    expected = os.environ.get("WORKER_TOKEN", "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="simulation worker is not enabled (WORKER_TOKEN unset)")
+    got = request.headers.get("authorization", "")
+    if not hmac.compare_digest(got.encode(), f"Bearer {expected}".encode()):
+        raise HTTPException(status_code=401, detail="bad worker token")
+
+
+class WorkerHello(BaseModel):
+    # Names the worker in the job record, so a result can be traced to the box
+    # and build that produced it.
+    worker: str = Field(min_length=1, max_length=120)
+
+
+class WorkerProgress(WorkerHello):
+    progress: str = Field(default="", max_length=500)
+
+
+class WorkerFailure(WorkerHello):
+    error: str = Field(min_length=1, max_length=2000)
+
+
+class SimulationResult(BaseModel):
+    """What a finished run reports. Checked, because it is written into the
+    measurement store as an observation and shown to the user."""
+
+    # Preferential interaction coefficient, in polymer chains per protein.
+    gamma23: float = Field(ge=-1e4, le=1e4)
+    gamma23_se: float | None = Field(default=None, ge=0)
+    # Per-block values, so the spread behind the mean is on the record.
+    gamma23_blocks: list[float] = Field(default_factory=list, max_length=100)
+    # Gamma23 at several local-domain cutoffs (nm -> value): whether it has
+    # plateaued, i.e. whether the local domain holds every perturbed molecule.
+    gamma23_profile: dict[str, float] = Field(default_factory=dict, max_length=20)
+    production_ns: float = Field(gt=0)
+    temperature_k: float = Field(gt=200, lt=400)
+    n_chains: int = Field(ge=1)
+    n_frames: int = Field(ge=1)
+    r_local_nm: float = Field(gt=0)
+    r_bulk_nm: float = Field(gt=0)
+    # Bulk polymer concentration the protein actually saw, from the far domain.
+    bulk_chain_molar: float | None = None
+    # Residues the polymer touched most, as {"residue": "LYS 45 A", "fraction": 0.4}.
+    contacts: list[dict] = Field(default_factory=list, max_length=50)
+    engine: str = Field(max_length=200)            # "OpenMM 8.2.0, CUDA"
+    forcefields: str = Field(max_length=300)       # "amber14 / OpenFF 2.2.0 (NAGL) / TIP3P"
+    structure_source: str = Field(default="", max_length=300)
+    n_atoms: int = Field(ge=1)
+    wall_seconds: float = Field(ge=0)
+    # A deliberately tiny run (the CPU smoke test). Recorded on the candidate but
+    # never written to the measurement store: it is a check of the pipeline, not
+    # an observation.
+    smoke: bool = False
+    notes: list[str] = Field(default_factory=list, max_length=20)
+
+
+class WorkerReport(WorkerHello):
+    result: SimulationResult
+
+
+def _sim_detail(r: SimulationResult) -> str:
+    return (f"{r.engine}; {r.forcefields}; {r.production_ns:g} ns at {r.temperature_k:.0f} K; "
+            f"{r.n_chains} chains; two-domain r_local {r.r_local_nm:g} nm / r_bulk {r.r_bulk_nm:g} nm; "
+            f"{r.structure_source}")[:500]
+
+
+def _record_simulation(job: dict, r: SimulationResult) -> str | None:
+    """Write the run into the measurement store as a source='simulation'
+    observation against the target biologic. Returns the measurement id."""
+    goal, cand = job["goal"], job["candidate"]
+    sid = cand["simulation"]["structure_id"]
+    name = (goal.get("protein") or sid)[:200]
+    mconn = measurements.connect()
+    try:
+        row = mconn.execute("SELECT id FROM biologic WHERE structure_id=%s AND name=%s LIMIT 1",
+                            (sid, name)).fetchone()
+        bid = row["id"] if row else measurements.add_biologic(
+            mconn, measurements.Biologic(name=name, structure_id=sid,
+                                         notes="Created by the simulation worker."))
+        return measurements.add_measurement(mconn, measurements.Measurement(
+            biologic_id=bid,
+            excipient=cand.get("name", "designed polymer")[:200],
+            excipient_smiles=(cand.get("screened_oligomer_smiles") or "")[:4000],
+            concentration=(f"{r.bulk_chain_molar * 1000:.1f} mM chains (bulk)"
+                           if r.bulk_chain_molar else f"{r.n_chains} chains in the box"),
+            quantity="gamma23", value=r.gamma23, sd=r.gamma23_se,
+            n_replicates=max(1, len(r.gamma23_blocks)),
+            buffer="water, 0.15 M NaCl (simulated)", ph=goal.get("ph") or 7.0,
+            format="liquid", stress=f"{r.temperature_k - 273.15:.0f} C",
+            method="MD preferential interaction (two-domain)", instrument=r.engine[:120],
+            source="simulation", simulation_detail=_sim_detail(r),
+            observed_by="simulation worker", prediction_ref=f"candidate:{cand['id']}",
+        ))
+    finally:
+        mconn.close()
+
+
+def _log_sim(conn, job: dict, kind: str, data: dict) -> None:
+    if job.get("owner_id") is not None:
+        c = job["candidate"]
+        history.log_event(conn, job["owner_id"], kind, "campaign", job["campaign_id"],
+                          {"candidate": {"id": c["id"], "name": c.get("name", "")}, **data})
+
+
+@app.post("/worker/claim")
+def worker_claim(hello: WorkerHello, request: Request):
+    """The next job, or 204 when the queue is empty. Jobs whose worker went
+    silent are requeued first. The target structure is fetched here (RCSB or
+    AlphaFold, the same code the liability scan uses) and handed over whole, so
+    the worker needs no network access beyond this API."""
+    _worker_auth(request)
+    conn = history.connect()
+    try:
+        for row in candidates.requeue_stale(conn):
+            owner = conn.execute("SELECT owner_id FROM campaign WHERE id=%s",
+                                 (row["campaign_id"],)).fetchone()
+            if owner and owner["owner_id"] is not None:
+                history.log_event(conn, owner["owner_id"], "candidate.simulation_failed"
+                                  if row["status"] == "failed" else "candidate.requeued",
+                                  "campaign", row["campaign_id"],
+                                  {"candidate": {"id": row["id"]}, "error": row["sim_error"]})
+        # A job whose structure cannot be fetched fails and the next is tried, so
+        # one bad accession never blocks the queue.
+        for _ in range(10):
+            job = candidates.claim_next(conn, hello.worker)
+            if job is None:
+                return Response(status_code=204)
+            cand = job["candidate"]
+            sid = cand["simulation"]["structure_id"]
+            try:
+                cif, source, predicted = accessibility._fetch(sid)
+            except Exception as e:
+                err = f"could not fetch structure {sid}: {type(e).__name__}: {e}"[:500]
+                done = candidates.finish(conn, cand["id"], hello.worker, error=err)
+                if done:
+                    _log_sim(conn, done, "candidate.simulation_failed", {"error": err})
+                continue
+            _log_sim(conn, job, "candidate.simulating", {"worker": hello.worker, "structure_id": sid,
+                                                        "attempt": cand["simulation"]["attempts"]})
+            goal = job["goal"]
+            return {
+                "job_id": cand["id"],
+                "candidate": {k: cand.get(k) for k in (
+                    "id", "name", "screened_oligomer_smiles", "screened_units",
+                    "repeat_unit_smiles", "composition", "charge")},
+                # Simulated at the temperature the biologic has to survive.
+                "temperature_c": goal.get("target_temp_c") if goal.get("target_temp_c") is not None else 25.0,
+                "ph": goal.get("ph") or 7.0,
+                "format": goal.get("format", "liquid"),
+                "protein": goal.get("protein", ""),
+                "structure": {"id": sid, "source": source, "predicted": predicted, "mmcif": cif},
+                "attempt": cand["simulation"]["attempts"],
+            }
+        return Response(status_code=204)
+    finally:
+        conn.close()
+
+
+@app.post("/worker/jobs/{job_id}/heartbeat")
+def worker_heartbeat(job_id: str, body: WorkerProgress, request: Request):
+    """409 means the job is no longer this worker's: stop and drop it."""
+    _worker_auth(request)
+    conn = candidates.connect()
+    try:
+        if not candidates.heartbeat(conn, job_id, body.worker, body.progress):
+            raise HTTPException(status_code=409, detail="job is not held by this worker")
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+@app.post("/worker/jobs/{job_id}/result")
+def worker_result(job_id: str, report: WorkerReport, request: Request):
+    _worker_auth(request)
+    body = report.result
+    conn = history.connect()
+    try:
+        done = candidates.finish(conn, job_id, report.worker, result=body.model_dump())
+        if done is None:
+            raise HTTPException(status_code=409, detail="job is not held by this worker")
+        mid = None if body.smoke else _record_simulation(done, body)
+        _log_sim(conn, done, "candidate.simulated", {
+            "gamma23": body.gamma23, "gamma23_se": body.gamma23_se,
+            "production_ns": body.production_ns, "measurement_id": mid, "smoke": body.smoke})
+        return {"ok": True, "measurement_id": mid}
+    finally:
+        conn.close()
+
+
+@app.post("/worker/jobs/{job_id}/fail")
+def worker_fail(job_id: str, body: WorkerFailure, request: Request):
+    _worker_auth(request)
+    conn = history.connect()
+    try:
+        done = candidates.finish(conn, job_id, body.worker, error=body.error)
+        if done is None:
+            raise HTTPException(status_code=409, detail="job is not held by this worker")
+        _log_sim(conn, done, "candidate.simulation_failed", {"error": body.error[:500]})
+        return {"ok": True}
     finally:
         conn.close()
 
