@@ -97,6 +97,9 @@ export interface DesignGoal {
   format: 'liquid' | 'lyophilised';
   exposed_residues: string[];
   notes: string;
+  // The biologic's PDB ID or UniProt accession; what simulations run against.
+  // Absent on campaigns started before it existed.
+  structure_id?: string;
 }
 
 export interface Candidate {
@@ -157,11 +160,47 @@ export interface CompositionPart {
 
 // A Candidate as stored in a campaign: the design fields plus what only the store
 // knows. `composition` breaks a copolymer into its weighted motifs.
+// A finished OpenMM run (api/main.py SimulationResult, worker/simulate.py).
+export interface SimulationResult {
+  gamma23: number;
+  gamma23_se: number | null;
+  gamma23_blocks: number[];
+  gamma23_profile: Record<string, number>;
+  production_ns: number;
+  temperature_k: number;
+  n_chains: number;
+  n_frames: number;
+  r_local_nm: number;
+  r_bulk_nm: number;
+  bulk_chain_molar: number | null;
+  contacts: { residue: string; fraction: number }[];
+  engine: string;
+  forcefields: string;
+  structure_source: string;
+  n_atoms: number;
+  wall_seconds: number;
+  smoke: boolean;
+  notes: string[];
+}
+
+// The simulation job on a candidate, once it has been queued.
+export interface SimulationJob {
+  structure_id: string;
+  attempts: number;
+  started_at: string | null;
+  heartbeat_at: string | null;
+  finished_at: string | null;
+  progress: string | null;
+  result: SimulationResult | null;
+  error: string | null;
+}
+
 export interface StoredCandidate extends Candidate {
   id: string;
   iteration: number;
   status: CandidateStatus;
   composition: CompositionPart[];
+  simulation?: SimulationJob;
 }
 
 export interface IterationMetrics {
@@ -191,6 +230,8 @@ export interface QueueSummary {
   n_queued: number;
   n_benchmarked: number;
   n_simulated: number;
+  n_simulating?: number;
+  n_failed?: number;
   by_status: Record<string, number>;
   top: { id: string; name: string; score: number }[];
   note: string;
@@ -302,17 +343,30 @@ export async function iterateDesign(
   return res.json();
 }
 
+// Thrown when the campaign names no biologic structure and none was given.
+export class StructureRequired extends Error {}
+
 export async function queueCandidates(
   candidateIds: string[],
+  structureId = '',
   signal?: AbortSignal,
 ): Promise<{ queued: number; queue_summary: QueueSummary }> {
   const res = await call('/design/queue', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ candidate_ids: candidateIds }),
+    body: JSON.stringify({ candidate_ids: candidateIds, structure_id: structureId }),
     signal,
   });
-  if (!res.ok) throw new Error(`Server returned ${res.status}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    if (body?.detail?.code === 'structure_required') throw new StructureRequired(body.detail.message);
+    const detail = Array.isArray(body?.detail)
+      ? (body.detail as ValidationIssue[]).map((d) => d.msg.replace(/^Value error, /, '')).join('; ')
+      : typeof body?.detail === 'string'
+        ? body.detail
+        : '';
+    throw new Error(detail || `Server returned ${res.status}`);
+  }
   return res.json();
 }
 
@@ -402,6 +456,10 @@ export interface HistoryEvent {
     | 'campaign.started'
     | 'campaign.iterated'
     | 'candidate.queued'
+    | 'candidate.simulating'
+    | 'candidate.simulated'
+    | 'candidate.simulation_failed'
+    | 'candidate.requeued'
     | 'campaign.ended'
     | 'campaign.reopened';
   data: Record<string, any>;

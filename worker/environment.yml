@@ -1,0 +1,41 @@
+# The simulation worker's environment. conda-forge, not pip: OpenMM's GPU
+# builds, OpenFF and PDBFixer are only packaged properly there.
+#
+# This file says what we want; conda-linux-64.lock says exactly what we get, and
+# is what the Dockerfile installs. Two reasons for the split: the same versions
+# on every build, and no solve inside `docker build` -- solving this much of
+# conda-forge needs more memory than a 4 GB Docker Desktop VM has.
+#
+# Keep these constraints loose and let the solver find a set that fits. Exact
+# pins picked by hand did not: rdkit 2026.03.6 needs a newer Boost than the
+# AmberTools openmmforcefields depends on, so the solver lands on 2026.03.1.
+#
+# After changing this file, regenerate the lock (from worker/):
+#   docker run --rm -v "$PWD":/work mambaorg/micromamba:2.0.5-ubuntu22.04 \
+#     bash -c "micromamba create -n lock -f /work/environment.yml --dry-run --json > /work/solve.json"
+#   python lock.py solve.json && rm solve.json
+#
+# The conda-forge openmm build carries its CUDA plugin, so this one image runs on
+# a CPU laptop (for the smoke test) and on an NVIDIA GPU box unchanged.
+# cuda-version pins the CUDA runtime it links against; 12.x needs a driver >= 525.
+#
+# PyTorch is here only for the NAGL charge model, evaluated once per job, so it
+# is the CPU build: the CUDA one is several GB for no gain.
+name: base
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.11,<3.13
+  - openmm>=8.2
+  - cuda-version=12
+  - openmmforcefields>=0.14
+  - openff-toolkit>=0.16
+  - openff-nagl
+  - openff-nagl-models
+  - pytorch=*=cpu*
+  - rdkit
+  - pdbfixer
+  - gemmi
+  - numpy
+  - scipy
+  - httpx

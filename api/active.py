@@ -8,7 +8,8 @@ laboratory would: propose a batch, screen it, learn which regions score well,
 and propose a better batch next time.
 
 WHAT IT OPTIMISES, AND WHAT IT EMPHATICALLY DOES NOT. There are no stabilisation
-labels yet — the OpenMM compatibility simulation is Stage 3 and is not built. So
+labels yet: the OpenMM simulation (worker/) runs only on queued candidates, hours
+each, and yields a native-state Gamma23, not a stabilisation label. So
 the surrogate here learns to predict design.py's TRANSPARENT TRIAGE SCORE from a
 candidate's composition, and the acquisition function chases a high triage score.
 That score is a laboratory-triage ordering built from hydration, glass transition,

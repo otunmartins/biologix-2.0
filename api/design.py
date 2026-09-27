@@ -212,6 +212,10 @@ class DesignGoal(BaseModel):
     net_charge: float | None = None
     ph: float | None = None
     notes: str = Field(default="", max_length=1000)
+    # The biologic itself, as a PDB ID (1IGT) or UniProt accession (P01857, whose
+    # AlphaFold model is used). What the OpenMM worker simulates the polymer
+    # against, so a candidate's simulation is about THIS protein, not a stand-in.
+    structure_id: str = Field(default="", max_length=40)
 
 
 # ---------------------------------------------------------------------------
@@ -777,8 +781,9 @@ LIMITS = (
     "and screened with the same structural alerts and rule table as any other excipient here. "
     "The ranking is a triage ordering for laboratory work — it is NOT a prediction that a "
     "candidate will stabilise this protein. No molecular dynamics, no free-energy or "
-    "preferential-interaction calculation and no Tm prediction was performed; those require "
-    "the compatibility simulation that is not built. Tg is a HOMOPOLYMER value either predicted "
+    "preferential-interaction calculation and no Tm prediction was performed for this ranking. "
+    "A candidate queued for simulation gets an OpenMM preferential-interaction run against the "
+    "biologic's structure, reported on its card; that is still not a Tm, and still grade D. Tg is a HOMOPOLYMER value either predicted "
     "for the repeat unit from experimental data (scaffold-split error about 36 C, and each "
     "candidate reports whether it fell inside the model's domain) or taken from the backbone's "
     "handbook value; neither is the Tg of a real copolymer or cake, which depends on composition, "

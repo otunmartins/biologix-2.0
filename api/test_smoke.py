@@ -1218,7 +1218,7 @@ def main_test():
         r = client.post("/design/iterate", headers=as_("tok-alice"), json={"campaign_id": camp, "batch_size": 4})
         assert r.status_code == 200 and r.json()["iteration"] == 2
         assert client.post("/design/queue", headers=as_("tok-alice"),
-                           json={"candidate_ids": [first]}).json()["queued"] == 1
+                           json={"candidate_ids": [first], "structure_id": "1IGT"}).json()["queued"] == 1
         state = client.get(f"/design/campaign/{camp}", headers=as_("tok-alice")).json()
         kinds = [e["kind"] for e in state["events"]]
         assert kinds == ["campaign.started", "campaign.iterated", "campaign.ended",
@@ -1256,6 +1256,179 @@ def main_test():
         assert client.post(f"/design/campaign/{camp}/end", headers=as_("tok-bob")).status_code == 404
         assert client.get("/history").status_code == 401
         print("ok  history: another user sees none of it and cannot end your campaign; signed out is 401")
+
+        # --- the OpenMM worker's side of the queue ---------------------------
+        # The worker is a separate process that talks to /worker/* with a shared
+        # token. No token configured means the routes are off, not open.
+        os.environ.pop("WORKER_TOKEN", None)
+        assert client.post("/worker/claim", json={"worker": "w1"}).status_code == 503
+        os.environ["WORKER_TOKEN"] = "worker-secret"
+        W = {"Authorization": "Bearer worker-secret"}
+        assert client.post("/worker/claim", json={"worker": "w1"},
+                           headers={"Authorization": "Bearer wrong"}).status_code == 401
+        assert client.post("/worker/claim", json={"worker": "w1"}, headers=as_("tok-alice")).status_code == 401, \
+            "a user's session is not a worker token"
+
+        # Structures are fetched by the API (RCSB / AlphaFold); offline here.
+        real_fetch = main.accessibility._fetch
+        def fake_fetch(sid):
+            if sid == "9ZZZ":
+                raise ValueError("no such entry")
+            return f"data_{sid}\n#fake mmCIF", f"RCSB PDB {sid} (experimental)", False
+        main.accessibility._fetch = fake_fetch
+        try:
+            # Clear jobs queued by earlier checks (with a structure), then: the three
+            # queued at the top of this file have none, and a worker must not take them.
+            while (r := client.post("/worker/claim", json={"worker": "w0"}, headers=W)).status_code == 200:
+                CS.finish(conn, r.json()["job_id"], "w0", error="drained by the test")
+            assert r.status_code == 204, r.text
+            ids = [c["id"] for c in top3]
+            r = client.post("/design/queue", headers=as_("tok-alice"), json={"candidate_ids": ids})
+            assert r.status_code == 422 and r.json()["detail"]["code"] == "structure_required", r.text
+            r = client.post("/design/queue", headers=as_("tok-alice"),
+                            json={"candidate_ids": ids, "structure_id": "not a pdb"})
+            assert r.status_code == 422, r.text
+            r = client.post("/design/queue", headers=as_("tok-alice"),
+                            json={"candidate_ids": ids, "structure_id": "1l2y"})
+            assert r.status_code == 200 and r.json()["queued"] == 3, r.text
+            print("ok  worker: routes off without WORKER_TOKEN, 401 on a bad one; queueing needs the "
+                  "biologic's PDB/UniProt id and attaches it to jobs queued without one")
+
+            # Claims come highest score first, each job to exactly one worker.
+            j1 = client.post("/worker/claim", json={"worker": "w1"}, headers=W)
+            assert j1.status_code == 200, j1.text
+            j1 = j1.json()
+            assert j1["job_id"] == top3[0]["id"], "the best-scoring job goes first"
+            assert j1["structure"] == {"id": "1L2Y", "source": "RCSB PDB 1L2Y (experimental)",
+                                       "predicted": False, "mmcif": "data_1L2Y\n#fake mmCIF"}
+            assert j1["temperature_c"] == 25 and j1["format"] == "lyophilised", \
+                "simulated at the temperature the goal says the biologic must survive"
+            assert j1["candidate"]["screened_oligomer_smiles"], "the worker needs the chain to build"
+            j2 = client.post("/worker/claim", json={"worker": "w2"}, headers=W).json()
+            assert j2["job_id"] == top3[1]["id"] != j1["job_id"]
+
+            # Heartbeats: only the holder may report on a job.
+            hb = f"/worker/jobs/{j1['job_id']}/heartbeat"
+            assert client.post(hb, json={"worker": "w2"}, headers=W).status_code == 409
+            assert client.post(hb, json={"worker": "w1", "progress": "production 1/20 ns"},
+                               headers=W).status_code == 200
+            st = next(c for c in client.get("/design/queue", headers=as_("tok-alice")).json()["queue"]
+                      if c["id"] == top3[2]["id"])
+            assert st["simulation"]["structure_id"] == "1L2Y" and st["status"] == "queued"
+            camp = client.get(f"/design/campaign/{cid}", headers=as_("tok-alice")).json()
+            running = next(c for it in camp["candidates_by_iteration"].values() for c in it
+                           if c["id"] == j1["job_id"])
+            assert running["status"] == "simulating" and running["simulation"]["progress"] == "production 1/20 ns"
+            print("ok  worker: claims go best score first, one job per worker; only the holder "
+                  "can heartbeat, and progress shows on the candidate")
+
+            # A result becomes a source='simulation' measurement against the biologic.
+            result = {"gamma23": -2.4, "gamma23_se": 0.6, "gamma23_blocks": [-2, -3, -2.2],
+                      "gamma23_profile": {"0.6": -1.1, "1": -2.4}, "production_ns": 20,
+                      "temperature_k": 298.15, "n_chains": 6, "n_frames": 2000, "r_local_nm": 1.0,
+                      "r_bulk_nm": 1.2, "bulk_chain_molar": 0.012,
+                      "contacts": [{"residue": "LYS 8 A", "fraction": 0.3}],
+                      "engine": "OpenMM 8.2.0, CUDA", "forcefields": "Amber ff14SB / OpenFF 2.2.0 / TIP3P",
+                      "structure_source": "RCSB PDB 1L2Y (experimental)", "n_atoms": 30000,
+                      "wall_seconds": 3600}
+            res = f"/worker/jobs/{j1['job_id']}/result"
+            assert client.post(res, json={"worker": "w2", "result": result}, headers=W).status_code == 409
+            r = client.post(res, json={"worker": "w1", "result": {**result, "temperature_k": 1000}}, headers=W)
+            assert r.status_code == 422, "an implausible result is refused"
+            r = client.post(res, json={"worker": "w1", "result": result}, headers=W)
+            assert r.status_code == 200 and r.json()["measurement_id"], r.text
+            m = conn.execute("SELECT * FROM measurement WHERE id=%s", (r.json()["measurement_id"],)).fetchone()
+            assert m["quantity"] == "gamma23" and m["source"] == "simulation" and m["value"] == -2.4
+            assert m["sd"] == 0.6 and "OpenMM 8.2.0" in m["simulation_detail"]
+            assert m["prediction_ref"] == f"candidate:{j1['job_id']}"
+            b = conn.execute("SELECT * FROM biologic WHERE id=%s", (m["biologic_id"],)).fetchone()
+            assert b["structure_id"] == "1L2Y"
+            camp = client.get(f"/design/campaign/{cid}", headers=as_("tok-alice")).json()
+            done = next(c for it in camp["candidates_by_iteration"].values() for c in it
+                        if c["id"] == j1["job_id"])
+            assert done["status"] == "simulated" and done["simulation"]["result"]["gamma23"] == -2.4
+            assert done["simulation"]["result"]["gamma23_profile"] == {"0.6": -1.1, "1": -2.4}
+            assert client.post(res, json={"worker": "w1", "result": result}, headers=W).status_code == 409, \
+                "a job reports once"
+            print("ok  worker: a result is checked, lands on the candidate, and is recorded as a "
+                  "source='simulation' gamma23 measurement against the biologic")
+
+            # A failure is recorded, and the user can queue the candidate again.
+            r = client.post(f"/worker/jobs/{j2['job_id']}/fail", json={"worker": "w2", "error": "NaN at step 400"},
+                            headers=W)
+            assert r.status_code == 200
+            state = {c["id"]: c for c in CS.candidates_for(conn, cid)}
+            assert state[j2["job_id"]]["status"] == "failed"
+            assert state[j2["job_id"]]["simulation"]["error"] == "NaN at step 400"
+            r = client.post("/design/queue", headers=as_("tok-alice"),
+                            json={"candidate_ids": [j2["job_id"]], "structure_id": "1L2Y"})
+            assert r.json()["queued"] == 1
+            state = {c["id"]: c for c in CS.candidates_for(conn, cid)}
+            assert state[j2["job_id"]]["status"] == "queued" and state[j2["job_id"]]["simulation"]["error"] is None
+            print("ok  worker: a failed run keeps its error, and can be queued again")
+
+            # A worker that goes silent loses its job: requeued, then failed after MAX_ATTEMPTS.
+            j3 = client.post("/worker/claim", json={"worker": "w3"}, headers=W).json()
+            with main.db.tx(conn):
+                conn.execute("UPDATE candidate SET sim_heartbeat_at = now() - interval '1 hour' WHERE id=%s",
+                             (j3["job_id"],))
+            again = client.post("/worker/claim", json={"worker": "w4"}, headers=W).json()
+            assert again["job_id"] == j3["job_id"] and again["attempt"] == 2, again.get("attempt")
+            assert client.post(f"/worker/jobs/{j3['job_id']}/heartbeat", json={"worker": "w3"},
+                               headers=W).status_code == 409, "the silent worker must learn it lost the job"
+            with main.db.tx(conn):
+                conn.execute("UPDATE candidate SET sim_heartbeat_at = now() - interval '1 hour', "
+                             "sim_attempts = %s WHERE id=%s", (CS.MAX_ATTEMPTS, j3["job_id"]))
+            client.post("/worker/claim", json={"worker": "w5"}, headers=W)
+            state = {c["id"]: c for c in CS.candidates_for(conn, cid)}
+            assert state[j3["job_id"]]["status"] == "failed", state[j3["job_id"]]["status"]
+            assert "stopped responding" in state[j3["job_id"]]["simulation"]["error"]
+            print("ok  worker: a silent worker's job is requeued, and failed after "
+                  f"{CS.MAX_ATTEMPTS} attempts")
+
+            # Drain whatever w5 claimed, so the queue is empty again.
+            for c in CS.candidates_for(conn, cid):
+                if c["status"] == "simulating":
+                    CS.finish(conn, c["id"], "w5", error="drained by the test")
+
+            # The goal can carry the structure; a smoke result is not a measurement;
+            # a structure that cannot be fetched fails that job and the next is tried.
+            goal2 = {**goal_lyo.model_dump(), "structure_id": "1L2Y", "protein": "Trp-cage"}
+            cid2 = CS.create_campaign(conn, goal2, owner_id=alice)
+            rows = [c for c in CS.candidates_for(conn, cid) if c["status"] == "benchmarked"][:2]
+            items = [{"payload": {k: v for k, v in c.items() if k not in ("id", "iteration", "status")},
+                      "backbone_key": mab.key, "components": [[treh.key, 1.0]], "score": 100 + i}
+                     for i, c in enumerate(rows)]
+            new = CS.add_candidates(conn, cid2, 1, items)
+            r = client.post("/design/queue", headers=as_("tok-alice"),
+                            json={"candidate_ids": [new[1]["id"]]})
+            assert r.status_code == 200 and r.json()["queued"] == 1, "the goal's structure is used"
+            r = client.post("/design/queue", headers=as_("tok-alice"),
+                            json={"candidate_ids": [new[0]["id"]], "structure_id": "9ZZZ"})
+            assert r.json()["queued"] == 1
+            # new[1] scores 101: claimed first. 9ZZZ (new[0], 100) cannot be fetched.
+            j = client.post("/worker/claim", json={"worker": "w6"}, headers=W).json()
+            assert j["job_id"] == new[1]["id"] and j["protein"] == "Trp-cage"
+            before = conn.execute("SELECT COUNT(*) AS n FROM measurement").fetchone()["n"]
+            r = client.post(f"/worker/jobs/{j['job_id']}/result", headers=W,
+                            json={"worker": "w6", "result": {**result, "smoke": True}})
+            assert r.status_code == 200 and r.json()["measurement_id"] is None
+            assert conn.execute("SELECT COUNT(*) AS n FROM measurement").fetchone()["n"] == before, \
+                "a smoke run must not become a measurement"
+            assert client.post("/worker/claim", json={"worker": "w6"}, headers=W).status_code in (200, 204)
+            bad = {c["id"]: c for c in CS.candidates_for(conn, cid2)}[new[0]["id"]]
+            assert bad["status"] == "failed" and "could not fetch structure 9ZZZ" in bad["simulation"]["error"]
+            print("ok  worker: the goal's structure is used when queueing; smoke results are not "
+                  "measurements; an unfetchable structure fails its job, not the queue")
+
+            evs = [e["kind"] for e in main.history.events_for(conn, cid, owner_id=alice)]
+            for k in ("candidate.simulating", "candidate.simulated", "candidate.simulation_failed",
+                      "candidate.requeued"):
+                assert k in evs, (k, evs)
+            print("ok  worker: every step of a simulation is in the campaign's history")
+        finally:
+            main.accessibility._fetch = real_fetch
+            os.environ.pop("WORKER_TOKEN", None)
     finally:
         if saved_url is None:
             os.environ.pop("DATABASE_URL", None)

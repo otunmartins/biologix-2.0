@@ -124,9 +124,9 @@ per address instead.
 
 ## Deploy to AWS
 
-Defaults to a `t3.large` on the current Ubuntu 22.04 AMI — no AMI to look up, and no GPU quota
-request to wait on. Nothing in `api/` touches a GPU yet, so this runs the identical stack for
-roughly a tenth of a g5's cost. See the GPU section below for when that changes.
+Defaults to a `t3.large` (8 GB RAM) on the current Ubuntu 22.04 AMI: no AMI to look up, and no
+GPU quota request to wait on. It runs the whole app. Simulations need a GPU and run elsewhere
+(see "OpenMM simulations" below).
 
 **1. Credentials and a key pair** (one time):
 
@@ -235,7 +235,8 @@ This is Stage 0, Stage 1, and a slice of Stage 2 from the design doc. Deliberate
   solvent accessibility, computed with Shrake-Rupley against Tien et al. 2013 reference max-ASA.
   Without an identifier it falls back to raw sequence counts and labels each flag `not modelled`.
   On intact IgG (1IGT) this is the difference between "22 Met" and "22 Met, 5 exposed".
-- **Missing:** the Stage 3 OpenMM compatibility screen. See below.
+- **Real, needs a GPU to be useful:** the Stage 3 OpenMM compatibility simulation of queued
+  design candidates. See "OpenMM simulations" below.
 
 ### Describing a polymer
 
@@ -507,19 +508,51 @@ Three things are enforced in code rather than by prompt, because a prompt rule i
 - **`needs_testing` is derived, not reported** — recomputed from the grades and severities on every
   dossier, so the model can't forget to set it.
 
-## Where GPU and OpenMM fit in later
+## OpenMM simulations (Stage 3)
 
-This instance is provisioned with a GPU, but nothing in `api/` uses it yet — the current pipeline
-is entirely CPU-bound and runs in seconds. When you add the Stage 3 compatibility simulation:
+Queued design candidates are simulated against **the user's own biologic** by a separate worker
+(`worker/`), and the result comes back onto the candidate card, into the campaign's history, and
+into the measurement store as a `source='simulation'` observation.
 
-1. Add a `worker` service to `docker-compose.yml` (separate image — OpenMM needs conda/micromamba,
-   not pip, unlike everything in `api/` today) with `deploy.resources` reserving the GPU.
-2. Add a `run_compatibility_simulation` tool to the agent, called only when the user explicitly
-   asks — never automatically, since it's the expensive, slow step (hours, not seconds).
-3. Gate it behind a button in `web/app/page.tsx` showing an estimated runtime before it starts, and
-   return a job id rather than blocking the request.
+**What is computed.** Gamma23, the preferential interaction coefficient of the polymer with the
+native protein (two-domain Kirkwood-Buff method, `worker/analysis.py`). Several copies of the
+candidate's screened oligomer are put in a water box with the protein and simulated at the
+temperature the goal says the biologic must survive. Negative Gamma23 means the polymer is excluded
+from the surface and the protein is preferentially hydrated, the signature of sucrose-like
+stabilisers. Positive means it accumulates at the surface, and the residues it touches are listed.
+It is **not an m-value**: that needs the unfolded state as well. A result is still grade D until an
+experiment agrees.
 
-The GPU is already there and paid for once you deploy; that work is additive, not a redeploy.
+**The system** (`worker/simulate.py`): the structure from RCSB or AlphaFold (low-confidence
+AlphaFold termini trimmed, internal gaps filled by PDBFixer, protonated at the goal's pH), Amber
+ff14SB for the protein, OpenFF Sage 2.2 with NAGL AM1-BCC charges for the polymer, TIP3P with
+0.15 M NaCl, 5% w/v polymer (at least 4 chains), C-alpha atoms restrained to hold the native fold,
+4 fs with hydrogen mass repartitioning, 1 ns equilibration and 20 ns production by default.
+
+**The target structure.** Give a PDB ID or UniProt accession in the design prompt, or when
+queueing the first candidate; the campaign remembers it. Whole IgGs (about 1,300 residues) are over
+the default 1,500-residue cap once solvated. Use a Fab or Fc entry.
+
+**How the worker runs.** It pulls jobs from the API over HTTP (`/worker/*`), authenticated by
+`WORKER_TOKEN`, so it needs no database credentials and can run on this box or anywhere else that
+can reach the API. It heartbeats every minute; a job whose worker goes quiet for 20 minutes is
+requeued, and failed after three attempts. Jobs run highest triage score first.
+
+**Turning it on** on a box with an NVIDIA GPU and Docker:
+
+1. In the server `.env`: `WORKER_TOKEN=<openssl rand -hex 32>`, `COMPOSE_PROFILES=worker` and
+   `COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml`.
+2. Confirm the GPU reaches containers:
+   `docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi`.
+3. Deploy as usual; `docker compose logs -f worker` shows each job's progress.
+
+A worker somewhere else (a rented GPU) runs the same image with `API_URL=https://<your-domain>`
+and the same `WORKER_TOKEN`; Caddy routes `/worker*` to the API.
+
+**Timing.** A 20 ns run of a Fab-sized system (about 100,000 atoms) takes roughly 3 to 6 hours on
+an A10G. On a CPU it would take days, so the CPU is used only for the smoke test
+(`python worker/smoke.py`, and in CI), which proves every stage runs: about 15 minutes on two
+cores, 12,817 atoms for a few picoseconds.
 
 ## The polymer designer
 
@@ -592,9 +625,9 @@ moisture and processing, and has to be measured by modulated DSC — which is wh
 every dried candidate's suggested experiments. `GET /health` reports `tg_model`: false there means
 the trained model is absent and the designer is running on the backbone handbook table.
 
-**What it does not do.** There is no molecular dynamics, no free-energy or preferential-interaction
-calculation and no predicted Tm — those need the Stage 3 compatibility simulation that is not
-built. The ranking is a triage ordering for laboratory work, not a prediction that any candidate
+**What it does not do.** The designer itself runs no molecular dynamics and predicts no Tm. The
+preferential-interaction simulation is a separate, opt-in step per queued candidate (see "OpenMM
+simulations" above), and its result is still grade D. The ranking is a triage ordering for laboratory work, not a prediction that any candidate
 will stabilise anything. Every candidate is **grade D**, verdict **"Data gap: test"**, and each
 carries the experiments that would settle it (nanoDSF/DSC for Tm shift, accelerated stability with
 SEC, modulated DSC for cake Tg, plus an assay for whatever alert fired). Nothing here addresses

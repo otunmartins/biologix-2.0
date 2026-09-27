@@ -13,6 +13,7 @@ import HistoryView from '@/components/history/HistoryView';
 import {
   API_URL,
   endCampaign,
+  getCampaign,
   getHealth,
   iterateDesign,
   queueCandidates,
@@ -459,25 +460,62 @@ export default function Workbench({ user }: { user: SessionUser }) {
     setWorkflow('design');
   }, []);
 
-  const queueCandidate = useCallback(async (c: StoredCandidate) => {
+  const queueCandidate = useCallback(async (c: StoredCandidate, structureId: string) => {
     setQueueingId(c.id);
     setError(null);
     try {
-      await queueCandidates([c.id]);
-      setCampaign((prev) =>
-        prev && {
+      await queueCandidates([c.id], structureId);
+      setCampaign((prev) => {
+        if (!prev) return prev;
+        const sid = structureId.toUpperCase() || prev.goal.structure_id || '';
+        return {
           ...prev,
+          // The API remembers a structure given here on the campaign's goal.
+          goal: prev.goal.structure_id ? prev.goal : { ...prev.goal, structure_id: sid },
           candidates: prev.candidates.map((x) =>
-            x.id === c.id ? { ...x, status: 'queued' } : x,
+            x.id === c.id
+              ? {
+                  ...x,
+                  status: 'queued',
+                  simulation: {
+                    structure_id: sid, attempts: 0, started_at: null, heartbeat_at: null,
+                    finished_at: null, progress: null, result: null, error: null,
+                  },
+                }
+              : x,
           ),
-        },
-      );
+        };
+      });
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setQueueingId(null);
     }
   }, []);
+
+  // While any candidate is waiting on or running a simulation, refresh the
+  // campaign now and then so progress and results appear without a reload.
+  const activeSims = campaign?.candidates.some((c) => c.status === 'queued' || c.status === 'simulating');
+  const campaignId = campaign?.campaignId;
+  useEffect(() => {
+    if (!activeSims || !campaignId) return;
+    const ctl = new AbortController();
+    const t = setInterval(async () => {
+      try {
+        const s = await getCampaign(campaignId, ctl.signal);
+        const fresh = Object.values(s.candidates_by_iteration).flat();
+        setCampaign((prev) =>
+          prev && prev.campaignId === s.campaign_id ? { ...prev, goal: s.goal, candidates: fresh } : prev,
+        );
+      } catch {
+        // A missed refresh is not worth an error banner; the next one will do.
+      }
+    }, 20000);
+    return () => {
+      clearInterval(t);
+      ctl.abort();
+    };
+  }, [activeSims, campaignId]);
 
   useEffect(() => {
     if (rerunPending.current && workflow === 'screen') {

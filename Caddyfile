@@ -23,6 +23,11 @@
 	handle /health {
 		reverse_proxy api:8000
 	}
+	# The simulation worker's queue, for a worker running somewhere other than
+	# this box (a rented GPU). Token-protected by the API itself.
+	handle /worker* {
+		reverse_proxy api:8000
+	}
 	handle {
 		reverse_proxy web:3000
 	}

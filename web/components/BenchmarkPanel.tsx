@@ -208,7 +208,11 @@ export default function BenchmarkPanel({
             </div>
             <p className="mt-2 text-sm text-slate-700">
               <b className="text-lg font-semibold text-slate-900">{queue.n_queued}</b> queued for
-              OpenMM — <span className="text-slate-500">waiting for GPU</span>
+              OpenMM
+              {(queue.n_simulating ?? 0) > 0 && <>, {queue.n_simulating} running</>}
+              {queue.n_simulated > 0 && <>, {queue.n_simulated} done</>}
+              {' '}
+              <span className="text-slate-500">— runs whenever a simulation worker is on</span>
             </p>
             {queue.top.length > 0 && (
               <ul className="mt-2 space-y-1">

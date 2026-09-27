@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import type { CandidateStatus, DesignGoal, StoredCandidate } from '@/lib/api';
+import type { CandidateStatus, DesignGoal, SimulationJob, StoredCandidate } from '@/lib/api';
 import { GradeBox } from './badges';
 import { CheckCircle, Chevron, Flask, Info, Triangle } from './icons';
 import Structure, { Smiles } from './Structure';
@@ -13,8 +13,9 @@ interface Props {
   verdict: string;
   // Hands the candidate to the screening form, which is what actually judges it.
   onScreen?: (c: StoredCandidate) => void;
-  // Sends the candidate to the OpenMM simulation backlog.
-  onQueue?: (c: StoredCandidate) => void;
+  // Sends the candidate to the OpenMM simulation backlog, against the given
+  // structure ('' when the campaign's goal already names one).
+  onQueue?: (c: StoredCandidate, structureId: string) => void;
   queueing?: string | null;
   // History shows a campaign as it stood; acting on it happens in the workspace.
   readOnly?: boolean;
@@ -28,6 +29,7 @@ export function GoalChips({ goal: g }: { goal: DesignGoal }) {
     g.duration_months !== null ? `${g.duration_months} months` : null,
     g.format,
     g.exposed_residues.length ? `exposed ${g.exposed_residues.join(', ')}` : null,
+    g.structure_id ? `structure ${g.structure_id}` : null,
   ].filter(Boolean) as string[];
   return (
     <div className="flex flex-wrap gap-1.5">
@@ -110,9 +112,161 @@ function CandidateStructures({ c }: { c: StoredCandidate }) {
   );
 }
 
+// What a Gamma23 means, in words. Within two standard errors of zero is no
+// preference either way: the run cannot tell the polymer from water.
+function readGamma(g: number, se: number | null): { label: string; body: string; tone: string } {
+  if (se !== null && Math.abs(g) < 2 * se) {
+    return {
+      label: 'No clear preference',
+      body: 'Within two standard errors of zero: at this length of run the polymer is indistinguishable from water at the protein surface.',
+      tone: 'text-slate-700',
+    };
+  }
+  if (g < 0) {
+    return {
+      label: 'Excluded from the surface',
+      body: 'The protein is preferentially hydrated: the polymer stays away from it. This is the signature of classic stabilisers such as sucrose and trehalose. It is consistent with stabilisation, not proof of it: that needs the unfolded state too, or an experiment.',
+      tone: 'text-precedented',
+    };
+  }
+  return {
+    label: 'Accumulates at the surface',
+    body: 'The polymer gathers at the protein more than water does. That is binding, which often destabilises, though a polymer that covers an aggregation-prone patch can still help. The residues it touches most are listed below.',
+    tone: 'text-gap',
+  };
+}
+
+function SimulationPanel({ sim, status }: { sim: SimulationJob; status: CandidateStatus }) {
+  const r = sim.result;
+  return (
+    <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
+      <div className="eyebrow mb-1.5">OpenMM simulation · against {sim.structure_id || 'no structure yet'}</div>
+      {status === 'queued' && (
+        <p className="text-sm leading-relaxed text-slate-600">
+          {sim.structure_id
+            ? 'Queued. Waiting for a simulation worker; the queue runs highest triage score first.'
+            : 'Queued before structures were asked for. Queue it again with the biologic’s PDB ID or UniProt accession to run it.'}
+          {sim.error && <span className="mt-1 block text-slate-500">{sim.error}</span>}
+        </p>
+      )}
+      {status === 'simulating' && (
+        <p className="text-sm leading-relaxed text-slate-600">
+          Running{sim.attempts > 1 ? ` (attempt ${sim.attempts})` : ''}: {sim.progress || 'starting'}.
+        </p>
+      )}
+      {status === 'failed' && (
+        <p className="text-sm leading-relaxed text-alert">
+          Failed{sim.attempts > 1 ? ` after ${sim.attempts} attempts` : ''}: {sim.error}
+        </p>
+      )}
+      {status === 'simulated' && r && (() => {
+        const read = readGamma(r.gamma23, r.gamma23_se);
+        return (
+          <div className="space-y-2.5">
+            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+              <span className="font-mono text-xl font-semibold tabular-nums text-slate-900">
+                Γ23 = {r.gamma23 > 0 ? '+' : ''}
+                {r.gamma23}
+                {r.gamma23_se !== null && <span className="text-base font-normal text-slate-500"> ± {r.gamma23_se}</span>}
+              </span>
+              <span className={`text-sm font-semibold ${read.tone}`}>{read.label}</span>
+              {r.smoke && (
+                <span className="rounded-full border border-gap-line bg-gap-soft px-2 py-0.5 text-[11px] font-semibold text-gap">
+                  smoke test, not a measurement
+                </span>
+              )}
+            </div>
+            <p className="text-sm leading-relaxed text-slate-600">{read.body}</p>
+            {r.contacts.length > 0 && (
+              <p className="text-sm leading-relaxed text-slate-600">
+                <span className="font-medium text-slate-700">Most-contacted residues: </span>
+                {r.contacts
+                  .slice(0, 6)
+                  .map((c) => `${c.residue} (${Math.round(c.fraction * 100)}%)`)
+                  .join(', ')}
+              </p>
+            )}
+            {Object.keys(r.gamma23_profile).length > 0 && (
+              <p className="text-xs leading-relaxed text-slate-500">
+                Γ23 by local-domain cutoff:{' '}
+                {Object.entries(r.gamma23_profile)
+                  .map(([nm, g]) => `${nm} nm ${g > 0 ? '+' : ''}${g}`)
+                  .join(' · ')}
+                . A value that has stopped changing with the cutoff has captured every perturbed chain.
+              </p>
+            )}
+            <p className="text-xs leading-relaxed text-slate-500">
+              {r.production_ns} ns at {Math.round(r.temperature_k - 273.15)} °C, {r.n_chains} chains,{' '}
+              {r.n_atoms.toLocaleString()} atoms, {r.n_frames} frames; {r.engine}; {r.forcefields}.{' '}
+              {r.structure_source}. Chains per protein; the protein&rsquo;s backbone held to its native structure.
+              {r.notes.length > 0 && ` ${r.notes.join('. ')}.`}
+            </p>
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
+
+// Queue (or re-queue) for simulation. Asks for the biologic's structure when the
+// campaign's goal does not name one: the run is against that protein.
+function QueueControl({
+  status,
+  needsStructure,
+  onQueue,
+  queueing,
+}: {
+  status: CandidateStatus;
+  needsStructure: boolean;
+  onQueue: (structureId: string) => void;
+  queueing: boolean;
+}) {
+  const [sid, setSid] = useState('');
+  const canQueue = status === 'benchmarked' || status === 'failed';
+  if (!canQueue) {
+    return (
+      <button type="button" className="btn-ghost" disabled>
+        {status === 'simulated' ? 'Simulated ✓' : status === 'simulating' ? 'Simulating…' : 'Queued for simulation ✓'}
+      </button>
+    );
+  }
+  const label = queueing ? 'Queuing…' : status === 'failed' ? 'Queue again' : 'Queue for simulation';
+  if (!needsStructure) {
+    return (
+      <button type="button" className="btn-ghost" onClick={() => onQueue('')} disabled={queueing}>
+        {label}
+      </button>
+    );
+  }
+  return (
+    <form
+      className="flex w-full flex-wrap items-end gap-2 sm:w-auto"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (sid.trim()) onQueue(sid.trim());
+      }}
+    >
+      <label className="block text-xs font-medium text-slate-600">
+        Your biologic&rsquo;s PDB ID or UniProt accession
+        <input
+          value={sid}
+          onChange={(e) => setSid(e.target.value)}
+          placeholder="1IGT or P01857"
+          maxLength={40}
+          className="mt-1 block w-40 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-sm text-slate-900 placeholder:text-slate-400 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+        />
+      </label>
+      <button type="submit" className="btn-ghost" disabled={queueing || !sid.trim()}>
+        {label}
+      </button>
+    </form>
+  );
+}
+
 function CandidateCard({
   c,
   defaultOpen,
+  needsStructure,
   onScreen,
   onQueue,
   queueing,
@@ -120,14 +274,15 @@ function CandidateCard({
 }: {
   c: StoredCandidate;
   defaultOpen: boolean;
+  needsStructure: boolean;
   onScreen: () => void;
-  onQueue: () => void;
+  onQueue: (structureId: string) => void;
   queueing: boolean;
   readOnly?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   const clean = c.alerts_fired.length === 0;
-  const queued = c.status !== 'benchmarked';
+  const sim = c.simulation?.result;
 
   return (
     <li className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-card">
@@ -162,6 +317,13 @@ function CandidateCard({
             <span className={clean ? 'text-precedented' : 'text-alert'}>
               {clean ? 'no alerts' : `${c.alerts_fired.length} alert${c.alerts_fired.length === 1 ? '' : 's'}`}
             </span>
+            {c.status === 'simulated' && sim && (
+              <span className="font-mono tabular-nums text-slate-700">
+                Γ23 {sim.gamma23 > 0 ? '+' : ''}
+                {sim.gamma23}
+                {sim.gamma23_se !== null && ` ± ${sim.gamma23_se}`}
+              </span>
+            )}
           </span>
         </span>
         <GradeBox grade="D" />
@@ -216,19 +378,19 @@ function CandidateCard({
             </ul>
           </div>
 
+          {c.simulation && c.status !== 'benchmarked' && <SimulationPanel sim={c.simulation} status={c.status} />}
+
           {!readOnly && (
-            <div className="flex flex-wrap gap-2">
+            <div className="flex flex-wrap items-end gap-2">
               <button type="button" className="btn-ghost" onClick={onScreen}>
                 Screen this candidate →
               </button>
-              <button
-                type="button"
-                className="btn-ghost"
-                onClick={onQueue}
-                disabled={queued || queueing}
-              >
-                {queued ? 'Queued for simulation ✓' : queueing ? 'Queuing…' : 'Queue for simulation'}
-              </button>
+              <QueueControl
+                status={c.status}
+                needsStructure={needsStructure}
+                onQueue={onQueue}
+                queueing={queueing}
+              />
             </div>
           )}
         </div>
@@ -295,8 +457,9 @@ export default function DesignResults({
                   key={c.id}
                   c={c}
                   defaultOpen={c.id === topId}
+                  needsStructure={!goal.structure_id}
                   onScreen={() => onScreen?.(c)}
-                  onQueue={() => onQueue?.(c)}
+                  onQueue={(sid) => onQueue?.(c, sid)}
                   queueing={queueing === c.id}
                   readOnly={readOnly}
                 />
