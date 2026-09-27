@@ -23,8 +23,16 @@ services:
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - WEB_ORIGIN=${WEB_ORIGIN}
+      - IID_CACHE_DIR=/cache
+      - OPENFDA_API_KEY=${OPENFDA_API_KEY:-}
+    volumes:
+      # The FDA Inactive Ingredient file is fetched once and reused for 30 days.
+      # Without this it lands in the container's /tmp and is re-downloaded after
+      # every restart, so the first screen back up waits on fda.gov.
+      - iid_cache:/cache
     restart: unless-stopped
 
 volumes:
   caddy_data:
   caddy_config:
+  iid_cache:
