@@ -6,6 +6,14 @@ import { GRADE_MEANING, VERDICTS, overview, sortLiabilities } from '@/lib/screen
 import { GradeBox, SeverityTag, VERDICT_STYLE, VerdictPill } from './badges';
 import { CheckCircle, Chevron, Download, Refresh, Triangle } from './icons';
 
+// What the backend actually screened, from its own record of the run.
+const BASIS: Record<string, { label: string; ok: boolean }> = {
+  pubchem: { label: 'PubChem structure', ok: true },
+  polymer_description: { label: 'Described polymer · structural grades ≤ C', ok: true },
+  surrogate: { label: 'Stand-in structure · structural grades ≤ D', ok: false },
+  unresolved: { label: 'Not resolved · structural grades E', ok: false },
+};
+
 interface Props {
   dossier: Dossier;
   // What was sent, so the header can say it; null for a plain-English run.
@@ -102,7 +110,13 @@ export default function Results({ dossier: d, context, onRerun, loading }: Props
         </header>
 
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          <Tile step={1} title="Identity" value={d.excipient} sub={`against ${d.protein}`} ok />
+          <Tile
+            step={1}
+            title="Identity"
+            value={d.excipient}
+            sub={BASIS[d.structure_basis]?.label ?? `against ${d.protein}`}
+            ok={BASIS[d.structure_basis]?.ok ?? true}
+          />
           <Tile
             step={2}
             title="Precedent"
@@ -282,6 +296,11 @@ export default function Results({ dossier: d, context, onRerun, loading }: Props
                         <span className="font-mono text-[15px] font-semibold text-slate-900">{l.residue}</span>
                         <SeverityTag severity={l.severity} />
                       </div>
+                      {l.source && l.source !== 'excipient' && (
+                        <div className="mt-1.5 inline-block rounded-md border border-gap-line bg-gap-soft px-2 py-0.5 text-xs font-medium text-gap">
+                          from {l.source}
+                        </div>
+                      )}
                       <div className="mt-1 text-sm text-slate-600">{l.reaction_class}</div>
                       <div
                         className={`mt-2 inline-block rounded-md px-2 py-1 text-xs ${

@@ -6,7 +6,13 @@ import ScreenForm, { type Mode } from '@/components/ScreenForm';
 import { GradeBox } from '@/components/badges';
 import { Info, Molecule, Spinner, Triangle } from '@/components/icons';
 import { API_URL, getHealth, runScreen, type Dossier, type Grade, type Health } from '@/lib/api';
-import { DEFAULT_FORM, GRADE_MEANING, buildPrompt, type ScreenForm as Form } from '@/lib/screen';
+import {
+  DEFAULT_FORM,
+  GRADE_MEANING,
+  buildPrompt,
+  toPolymerSpec,
+  type ScreenForm as Form,
+} from '@/lib/screen';
 
 type ApiState = { kind: 'checking' } | { kind: 'down' } | { kind: 'up'; health: Health };
 
@@ -180,7 +186,9 @@ export default function Home() {
     setDossier(null);
 
     try {
-      const result = await runScreen(prompt, ctrl.signal);
+      // Only the structured form carries a polymer description.
+      const polymer = mode === 'form' ? toPolymerSpec(form.polymer) : null;
+      const result = await runScreen(prompt, polymer, ctrl.signal);
       setDossier(result);
       setContext(
         mode === 'form'
@@ -190,6 +198,7 @@ export default function Home() {
               form.concentration.trim() ? `${form.concentration.trim()} excipient` : 'concentration not given',
               `stored at ${form.temp.split(' (')[0]}`,
               form.structureId.trim() ? `structure ${form.structureId.trim().toUpperCase()}` : 'no structure',
+              ...(form.polymer.enabled ? ['described polymer'] : []),
             ]
           : null,
       );
