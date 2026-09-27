@@ -1,11 +1,10 @@
 'use client';
 
-import { useState } from 'react';
 import { useFormState, useFormStatus } from 'react-dom';
 import { registerWithPassword, signInWithPassword, type PasswordState } from '@/app/actions';
 import { Spinner, Triangle } from '@/components/icons';
 
-type Mode = 'signin' | 'register';
+export type Mode = 'signin' | 'register';
 
 const INITIAL: PasswordState = { error: null, email: '' };
 
@@ -78,8 +77,8 @@ function Fields({ mode, state }: { mode: Mode; state: PasswordState }) {
   );
 }
 
-export default function PasswordForm() {
-  const [mode, setMode] = useState<Mode>('signin');
+// The mode is owned by AuthCard, so the heading and the Google button follow it.
+export default function PasswordForm({ mode, onMode }: { mode: Mode; onMode: (m: Mode) => void }) {
   const [signInState, signInAction] = useFormState(signInWithPassword, INITIAL);
   const [registerState, registerAction] = useFormState(registerWithPassword, INITIAL);
 
@@ -102,7 +101,7 @@ export default function PasswordForm() {
         {mode === 'signin' ? 'New here?' : 'Already have an account?'}{' '}
         <button
           type="button"
-          onClick={() => setMode(mode === 'signin' ? 'register' : 'signin')}
+          onClick={() => onMode(mode === 'signin' ? 'register' : 'signin')}
           className="font-medium text-slate-900 underline decoration-slate-300 underline-offset-2 hover:decoration-slate-900"
         >
           {mode === 'signin' ? 'Create an account' : 'Sign in'}

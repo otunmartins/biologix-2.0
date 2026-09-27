@@ -12,6 +12,14 @@
 	handle /design* {
 		reverse_proxy api:8000
 	}
+	# Structure drawings and the per-user history. Same trap as /design*: a path
+	# missing here falls through to Next.js and 404s there.
+	handle /structure* {
+		reverse_proxy api:8000
+	}
+	handle /history* {
+		reverse_proxy api:8000
+	}
 	handle /health {
 		reverse_proxy api:8000
 	}

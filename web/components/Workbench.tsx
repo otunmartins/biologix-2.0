@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import DesignPanel from '@/components/DesignPanel';
+import DesignPanel, { type CurrentExperiment } from '@/components/DesignPanel';
 import DesignResults from '@/components/DesignResults';
 import Results from '@/components/Results';
 import ScreenForm, { type Mode } from '@/components/ScreenForm';
@@ -9,12 +9,15 @@ import { GradeBox } from '@/components/badges';
 import { Info, Molecule, Spinner, Triangle } from '@/components/icons';
 import BenchmarkPanel from '@/components/BenchmarkPanel';
 import UserMenu, { type SessionUser } from '@/components/UserMenu';
+import HistoryView from '@/components/history/HistoryView';
 import {
   API_URL,
+  endCampaign,
   getHealth,
   iterateDesign,
   queueCandidates,
   runScreen,
+  type CampaignState,
   type DesignGoal,
   type Dossier,
   type Grade,
@@ -22,6 +25,8 @@ import {
   type IterationMetrics,
   type QueueSummary,
   type Recommendation,
+  type SavedForm,
+  type ScreenRecord,
   type StoredCandidate,
 } from '@/lib/api';
 import {
@@ -52,9 +57,13 @@ function ApiBadge({ api }: { api: ApiState }) {
           ? ['bg-gap', 'No model key']
           : ['bg-precedented', 'API ready'];
   return (
-    <span className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-medium text-slate-600">
+    // On a phone only the dot shows; the label stays as a tooltip and for screen readers.
+    <span
+      title={label}
+      className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-2 py-2 text-xs font-medium text-slate-600 sm:px-3 sm:py-1"
+    >
       <span className={`h-2 w-2 rounded-full ${dot}`} />
-      {label}
+      <span className="sr-only sm:not-sr-only">{label}</span>
     </span>
   );
 }
@@ -203,7 +212,7 @@ function LoadingState({ elapsed }: { elapsed: number }) {
   );
 }
 
-type Workflow = 'screen' | 'design';
+type Workflow = 'screen' | 'design' | 'history';
 
 interface CampaignView {
   campaignId: string;
@@ -214,6 +223,30 @@ interface CampaignView {
   recommendation: Recommendation;
   limits: string;
   verdict: string;
+  // Provenance the panel shows while the campaign is open.
+  prompt: string;
+  startedAt: string;
+  // Set when it was reopened from history after being ended; the next
+  // iteration reopens it.
+  endedAt: string | null;
+}
+
+// A campaign as the store returns it, in the shape the workspace shows.
+function campaignFromState(s: CampaignState): CampaignView {
+  const candidates = Object.values(s.candidates_by_iteration).flat();
+  return {
+    campaignId: s.campaign_id,
+    iteration: s.n_iterations,
+    goal: s.goal,
+    candidates,
+    history: s.metrics_history,
+    recommendation: s.recommendation,
+    limits: s.limits,
+    verdict: 'Data gap: test',
+    prompt: s.prompt,
+    startedAt: s.created_at,
+    endedAt: s.ended_at,
+  };
 }
 
 // The signed-in app. app/page.tsx renders it only once there is a session.
@@ -234,7 +267,11 @@ export default function Workbench({ user }: { user: SessionUser }) {
   const [error, setError] = useState<string | null>(null);
   const [dossier, setDossier] = useState<Dossier | null>(null);
   const [context, setContext] = useState<string[] | null>(null);
+  // The last screen came back but could not be written to history.
+  const [unsaved, setUnsaved] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  // "Run again" from history refills the form, then runs once it has rendered.
+  const rerunPending = useRef(false);
 
   // Say the API is unreachable or keyless before anyone waits on a run.
   useEffect(() => {
@@ -269,17 +306,23 @@ export default function Workbench({ user }: { user: SessionUser }) {
     setElapsed(0);
     setError(null);
     setDossier(null);
+    setUnsaved(false);
 
     try {
       // Only the structured form carries a polymer description.
       const polymer = mode === 'form' ? toPolymerSpec(form.polymer) : null;
+      // Kept with the run in history, so it can be reopened exactly as filled in.
+      const saved: SavedForm =
+        mode === 'form' ? { mode: 'form', values: { ...form } } : { mode: 'text', text: freeText };
       const result = await runScreen(
         prompt,
         polymer,
         mode === 'form' ? toExposureInputs(form) : null,
+        saved,
         ctrl.signal,
       );
       setDossier(result);
+      setUnsaved(!result.history_id);
       setContext(
         mode === 'form'
           ? [
@@ -320,6 +363,9 @@ export default function Workbench({ user }: { user: SessionUser }) {
         recommendation: r.recommendation,
         limits: r.limits,
         verdict: r.verdict,
+        prompt: designPrompt,
+        startedAt: new Date().toISOString(),
+        endedAt: null,
       });
     } catch (e) {
       if ((e as Error).name !== 'AbortError') setError((e as Error).message);
@@ -346,6 +392,8 @@ export default function Workbench({ user }: { user: SessionUser }) {
           candidates: [...prev.candidates, ...r.candidates],
           history: r.metrics_history,
           recommendation: r.recommendation,
+          // Continuing an ended campaign reopens it (the API logs that).
+          endedAt: null,
         },
       );
     } catch (e) {
@@ -354,6 +402,62 @@ export default function Workbench({ user }: { user: SessionUser }) {
       if (abortRef.current === ctrl) setLoading(false);
     }
   }, [campaign]);
+
+  // Close the campaign on screen and clear the workspace. Nothing is lost: it
+  // stays in History, where it can be reopened. The workspace clears first so
+  // the button feels instant; a failure to record the end is shown, not hidden.
+  const newExperiment = useCallback(async () => {
+    if (!campaign) return;
+    abortRef.current?.abort();
+    const id = campaign.campaignId;
+    setCampaign(null);
+    setDesignPrompt('');
+    setError(null);
+    setLoading(false);
+    try {
+      await endCampaign(id);
+    } catch (e) {
+      setError(`The workspace is clear, but the old campaign could not be marked as ended: ${(e as Error).message}`);
+    }
+  }, [campaign]);
+
+  // Put a past screen back in the workspace: the form as it was filled in, and
+  // the dossier it produced.
+  const openScreen = useCallback((r: ScreenRecord) => {
+    abortRef.current?.abort();
+    const saved = r.request.form;
+    if (saved?.mode === 'form') {
+      setMode('form');
+      // Defaults first, so a record saved by an older form still opens.
+      setForm({ ...DEFAULT_FORM, ...(saved.values as Partial<Form>) });
+    } else {
+      setMode('text');
+      setFreeText(saved?.mode === 'text' ? saved.text : r.request.prompt);
+    }
+    setDossier(r.dossier);
+    setContext(null);
+    setUnsaved(false);
+    setLoading(false);
+    setError(r.status === 'failed' ? r.error : null);
+    setWorkflow('screen');
+  }, []);
+
+  const rerunScreen = useCallback(
+    (r: ScreenRecord) => {
+      openScreen(r);
+      rerunPending.current = true;
+    },
+    [openScreen],
+  );
+
+  const openCampaign = useCallback((s: CampaignState) => {
+    abortRef.current?.abort();
+    setCampaign(campaignFromState(s));
+    setDesignPrompt(s.prompt);
+    setLoading(false);
+    setError(null);
+    setWorkflow('design');
+  }, []);
 
   const queueCandidate = useCallback(async (c: StoredCandidate) => {
     setQueueingId(c.id);
@@ -375,10 +479,17 @@ export default function Workbench({ user }: { user: SessionUser }) {
     }
   }, []);
 
+  useEffect(() => {
+    if (rerunPending.current && workflow === 'screen') {
+      rerunPending.current = false;
+      run();
+    }
+  }, [run, workflow]);
+
   // Ctrl/Cmd+Enter runs from anywhere, including inside the textareas.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !loading) {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !loading && workflow !== 'history') {
         e.preventDefault();
         // In a running campaign, Ctrl+Enter runs the next iteration.
         (workflow === 'design' ? (campaign ? iterateNext : design) : run)();
@@ -411,6 +522,15 @@ export default function Workbench({ user }: { user: SessionUser }) {
     setError(null);
   }, []);
 
+  const currentExperiment: CurrentExperiment | null = campaign && {
+    prompt: campaign.prompt,
+    goal: campaign.goal,
+    startedAt: campaign.startedAt,
+    endedAt: campaign.endedAt,
+    iteration: campaign.iteration,
+    nCandidates: campaign.candidates.length,
+  };
+
   // The queue panel is derived from the candidates on screen, so it always reflects
   // this campaign rather than the global backlog the queue endpoint reports.
   const queueView: QueueSummary | null = campaign
@@ -435,19 +555,21 @@ export default function Workbench({ user }: { user: SessionUser }) {
 
   return (
     <div className="flex min-h-screen flex-col lg:h-screen">
-      <header className="flex h-14 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-5">
+      {/* On a phone the tabs drop to a second, full-width row; from sm up it is one row. */}
+      <header className="flex shrink-0 flex-wrap items-center justify-between gap-y-2 border-b border-slate-200 bg-white px-4 py-2 sm:h-14 sm:flex-nowrap sm:px-5 sm:py-0">
         <div className="flex items-center gap-2.5">
           <span className="grid h-8 w-8 place-items-center rounded-lg bg-slate-900 text-white">
             <Molecule className="h-[18px] w-[18px]" />
           </span>
-          <span className="text-[15px] font-semibold tracking-tight text-slate-900">Excipient Screen</span>
+          <span className="whitespace-nowrap text-[15px] font-semibold tracking-tight text-slate-900">Excipient Screen</span>
         </div>
 
-        <nav className="flex rounded-lg bg-slate-100 p-1 text-sm font-medium">
+        <nav className="order-last flex w-full rounded-lg bg-slate-100 p-1 text-sm font-medium sm:order-none sm:w-auto">
           {(
             [
               ['screen', 'Screen'],
               ['design', 'Design'],
+              ['history', 'History'],
             ] as const
           ).map(([w, label]) => (
             <button
@@ -458,7 +580,7 @@ export default function Workbench({ user }: { user: SessionUser }) {
                 setError(null);
               }}
               aria-current={workflow === w}
-              className={`rounded-md px-4 py-1.5 transition ${
+              className={`flex-1 rounded-md px-4 py-1.5 transition sm:flex-none ${
                 workflow === w ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'
               }`}
             >
@@ -472,96 +594,111 @@ export default function Workbench({ user }: { user: SessionUser }) {
         </div>
       </header>
 
-      <div className="flex flex-1 flex-col lg:min-h-0 lg:flex-row">
-        <aside className="shrink-0 border-b border-slate-200 bg-white lg:w-[400px] lg:border-b-0 lg:border-r">
-          {workflow === 'design' ? (
-            <DesignPanel
-              prompt={designPrompt}
-              onPrompt={setDesignPrompt}
+      {workflow === 'history' ? (
+        <HistoryView onOpenScreen={openScreen} onRerunScreen={rerunScreen} onOpenCampaign={openCampaign} />
+      ) : (
+        <div className="flex flex-1 flex-col lg:min-h-0 lg:flex-row">
+          <aside className="shrink-0 border-b border-slate-200 bg-white lg:w-[400px] lg:border-b-0 lg:border-r">
+            {workflow === 'design' ? (
+              <DesignPanel
+                prompt={designPrompt}
+                onPrompt={setDesignPrompt}
+                loading={loading}
+                elapsed={elapsed}
+                onRun={design}
+                current={currentExperiment}
+                onNew={newExperiment}
+              />
+            ) : (
+            <ScreenForm
+              mode={mode}
+              onMode={setMode}
+              form={form}
+              onChange={updateForm}
+              freeText={freeText}
+              onFreeText={setFreeText}
               loading={loading}
               elapsed={elapsed}
-              onRun={design}
+              onRun={run}
             />
-          ) : (
-          <ScreenForm
-            mode={mode}
-            onMode={setMode}
-            form={form}
-            onChange={updateForm}
-            freeText={freeText}
-            onFreeText={setFreeText}
-            loading={loading}
-            elapsed={elapsed}
-            onRun={run}
-          />
-          )}
-        </aside>
-
-        <main className="flex flex-1 flex-col lg:min-h-0 lg:flex-row">
-          <div className="flex-1 lg:min-h-0 lg:overflow-y-auto">
-            {(api.kind === 'down' || (api.kind === 'up' && !api.health.model_configured) || error) && (
-              <div className="space-y-3 px-6 pt-6 lg:px-10">
-                {api.kind === 'down' && (
-                  <Notice tone="alert" title={`API unreachable at ${API_URL}`}>
-                    Start it with <code className="font-mono">uvicorn main:app --port 8000</code> in{' '}
-                    <code className="font-mono">api/</code>.
-                  </Notice>
-                )}
-                {api.kind === 'up' && !api.health.model_configured && (
-                  <Notice tone="gap" title="API is up, but no model key is configured">
-                    Set <code className="font-mono">ANTHROPIC_API_KEY</code> in the API environment — screens
-                    fail with 503 until you do.
-                  </Notice>
-                )}
-                {error && (
-                  <Notice tone="alert" title={workflow === 'design' ? 'Design failed' : 'Screen failed'}>
-                    {error}
-                  </Notice>
-                )}
-              </div>
             )}
+          </aside>
 
-            {workflow === 'design' ? (
-              // A campaign stays on screen while the next batch loads; only the very
-              // first proposal shows the full skeleton.
-              !campaign && loading ? (
+          <main className="flex flex-1 flex-col lg:min-h-0 lg:flex-row">
+            <div className="flex-1 lg:min-h-0 lg:overflow-y-auto">
+              {(api.kind === 'down' ||
+                (api.kind === 'up' && !api.health.model_configured) ||
+                error ||
+                (unsaved && workflow === 'screen' && dossier)) && (
+                <div className="space-y-3 px-6 pt-6 lg:px-10">
+                  {api.kind === 'down' && (
+                    <Notice tone="alert" title={`API unreachable at ${API_URL}`}>
+                      Start it with <code className="font-mono">uvicorn main:app --port 8000</code> in{' '}
+                      <code className="font-mono">api/</code>.
+                    </Notice>
+                  )}
+                  {api.kind === 'up' && !api.health.model_configured && (
+                    <Notice tone="gap" title="API is up, but no model key is configured">
+                      Set <code className="font-mono">ANTHROPIC_API_KEY</code> in the API environment — screens
+                      fail with 503 until you do.
+                    </Notice>
+                  )}
+                  {error && (
+                    <Notice tone="alert" title={workflow === 'design' ? 'Design failed' : 'Screen failed'}>
+                      {error}
+                    </Notice>
+                  )}
+                  {unsaved && workflow === 'screen' && dossier && (
+                    <Notice tone="gap" title="Not saved to your history">
+                      The screen finished, but its record could not be stored. Download the dossier if you need to
+                      keep it.
+                    </Notice>
+                  )}
+                </div>
+              )}
+
+              {workflow === 'design' ? (
+                // A campaign stays on screen while the next batch loads; only the very
+                // first proposal shows the full skeleton.
+                !campaign && loading ? (
+                  <LoadingState elapsed={elapsed} />
+                ) : campaign ? (
+                  <DesignResults
+                    goal={campaign.goal}
+                    candidates={campaign.candidates}
+                    limits={campaign.limits}
+                    verdict={campaign.verdict}
+                    onScreen={screenCandidate}
+                    onQueue={queueCandidate}
+                    queueing={queueingId}
+                  />
+                ) : (
+                  <DesignEmpty />
+                )
+              ) : loading ? (
                 <LoadingState elapsed={elapsed} />
-              ) : campaign ? (
-                <DesignResults
-                  goal={campaign.goal}
-                  candidates={campaign.candidates}
-                  limits={campaign.limits}
-                  verdict={campaign.verdict}
-                  onScreen={screenCandidate}
-                  onQueue={queueCandidate}
-                  queueing={queueingId}
-                />
+              ) : dossier ? (
+                <Results dossier={dossier} context={context} onRerun={run} loading={loading} />
               ) : (
-                <DesignEmpty />
-              )
-            ) : loading ? (
-              <LoadingState elapsed={elapsed} />
-            ) : dossier ? (
-              <Results dossier={dossier} context={context} onRerun={run} loading={loading} />
-            ) : (
-              <EmptyState />
-            )}
-          </div>
+                <EmptyState />
+              )}
+            </div>
 
-          {workflow === 'design' && campaign && (
-            <aside className="shrink-0 border-t border-slate-200 bg-slate-50 lg:min-h-0 lg:w-[360px] lg:border-l lg:border-t-0">
-              <BenchmarkPanel
-                iteration={campaign.iteration}
-                history={campaign.history}
-                recommendation={campaign.recommendation}
-                queue={queueView}
-                loading={loading}
-                onIterate={iterateNext}
-              />
-            </aside>
-          )}
-        </main>
-      </div>
+            {workflow === 'design' && campaign && (
+              <aside className="shrink-0 border-t border-slate-200 bg-slate-50 lg:min-h-0 lg:w-[360px] lg:border-l lg:border-t-0">
+                <BenchmarkPanel
+                  iteration={campaign.iteration}
+                  history={campaign.history}
+                  recommendation={campaign.recommendation}
+                  queue={queueView}
+                  loading={loading}
+                  onIterate={iterateNext}
+                />
+              </aside>
+            )}
+          </main>
+        </div>
+      )}
     </div>
   );
 }

@@ -54,6 +54,11 @@ CREATE TABLE IF NOT EXISTS campaign (
 );
 -- For a campaign table created before sign-in existed. A no-op on a fresh one.
 ALTER TABLE campaign ADD COLUMN IF NOT EXISTS owner_id INTEGER REFERENCES users(id);
+-- Provenance (history.py): the words the user typed, before the model read a
+-- goal out of them, and when they closed the campaign with "New experiment".
+-- Ended is a marker, not a lock: continuing an ended campaign reopens it.
+ALTER TABLE campaign ADD COLUMN IF NOT EXISTS prompt TEXT;
+ALTER TABLE campaign ADD COLUMN IF NOT EXISTS ended_at TEXT;
 CREATE INDEX IF NOT EXISTS campaign_by_owner ON campaign(owner_id);
 CREATE TABLE IF NOT EXISTS iteration (
     campaign_id TEXT NOT NULL REFERENCES campaign(id),
@@ -102,13 +107,37 @@ def _now() -> str:
 # Writes
 # ---------------------------------------------------------------------------
 
-def create_campaign(conn: psycopg.Connection, goal: dict, *, owner_id: int) -> str:
+def create_campaign(conn: psycopg.Connection, goal: dict, *, owner_id: int,
+                    prompt: str = "") -> str:
     cid = str(uuid.uuid4())
     with db.tx(conn):
-        conn.execute("INSERT INTO campaign (id, goal, created_at, app_version, owner_id) "
-                     "VALUES (%s,%s,%s,%s,%s)",
-                     (cid, json.dumps(goal), _now(), APP_VERSION, owner_id))
+        conn.execute("INSERT INTO campaign (id, goal, created_at, app_version, owner_id, prompt) "
+                     "VALUES (%s,%s,%s,%s,%s,%s)",
+                     (cid, json.dumps(goal), _now(), APP_VERSION, owner_id, prompt or None))
     return cid
+
+
+def end_campaign(conn: psycopg.Connection, campaign_id: str, *, owner_id: int) -> str | None:
+    """Mark a campaign ended. Returns 'ended', 'already' if it was, or None if the
+    user has no such campaign. Nothing is deleted: it stays in their history."""
+    with db.tx(conn):
+        row = conn.execute("SELECT ended_at FROM campaign WHERE id=%s AND owner_id=%s FOR UPDATE",
+                           (campaign_id, owner_id)).fetchone()
+        if row is None:
+            return None
+        if row["ended_at"]:
+            return "already"
+        conn.execute("UPDATE campaign SET ended_at=%s WHERE id=%s", (_now(), campaign_id))
+    return "ended"
+
+
+def reopen_campaign(conn: psycopg.Connection, campaign_id: str, *, owner_id: int) -> bool:
+    """Clear ended_at. True if the campaign had been ended, so the caller logs it."""
+    with db.tx(conn):
+        cur = conn.execute("UPDATE campaign SET ended_at=NULL "
+                           "WHERE id=%s AND owner_id=%s AND ended_at IS NOT NULL",
+                           (campaign_id, owner_id))
+    return cur.rowcount > 0
 
 
 def add_candidates(conn: psycopg.Connection, campaign_id: str, iteration: int,
@@ -150,17 +179,28 @@ def enqueue(conn: psycopg.Connection, candidate_ids: list[str], *, owner_id: int
     """Send benchmarked candidates to the simulation queue. Only a benchmarked
     candidate can be queued, so re-queuing or queuing a running one is a no-op --
     and so is naming another user's candidate."""
+    return len(enqueue_rows(conn, candidate_ids, owner_id=owner_id))
+
+
+def enqueue_rows(conn: psycopg.Connection, candidate_ids: list[str], *,
+                 owner_id: int) -> list[dict]:
+    """enqueue(), returning what was actually queued -- id, campaign and score --
+    so the caller can log exactly that and nothing it merely asked for."""
     now = _now()
-    n = 0
+    queued = []
     with db.tx(conn):
         for cid in candidate_ids:
-            cur = conn.execute(
+            row = conn.execute(
                 "UPDATE candidate SET status='queued', updated_at=%s "
                 "WHERE id=%s AND status='benchmarked' "
-                "AND campaign_id IN (SELECT id FROM campaign WHERE owner_id=%s)",
-                (now, cid, owner_id))
-            n += cur.rowcount
-    return n
+                "AND campaign_id IN (SELECT id FROM campaign WHERE owner_id=%s) "
+                "RETURNING id, campaign_id, score, payload",
+                (now, cid, owner_id)).fetchone()
+            if row:
+                queued.append({"id": row["id"], "campaign_id": row["campaign_id"],
+                               "score": row["score"],
+                               "name": json.loads(row["payload"]).get("name", "")})
+    return queued
 
 
 def mark_status(conn: psycopg.Connection, candidate_id: str, status: Status) -> None:
@@ -273,7 +313,10 @@ def campaign_state(conn: psycopg.Connection, campaign_id: str, *,
     return {
         "campaign_id": campaign_id,
         "goal": json.loads(row["goal"]),
+        "prompt": row.get("prompt") or "",
         "created_at": row["created_at"],
+        "ended_at": row.get("ended_at"),
+        "app_version": row["app_version"],
         "n_candidates": len(cands),
         "n_iterations": len(by_iteration),
         "candidates_by_iteration": by_iteration,

@@ -100,6 +100,28 @@ The callback Auth.js sends Google is built from `WEB_ORIGIN` (passed to the web 
 `AUTH_URL`). If it doesn't exactly match a redirect URI above, sign-in fails with
 `redirect_uri_mismatch`.
 
+## History and provenance
+
+Every screen and design campaign is kept in the user's **History** tab, and each record says how
+the result was produced (`api/history.py`):
+
+- **Screens**: the prompt and form exactly as sent, the dossier, the model, the build
+  (`APP_VERSION`, the git commit the deploy stamps), timings and token use, the order the tools
+  ran in, and what each data source returned during that run: the PubChem resolution or
+  stand-in structure, the FDA Inactive Ingredient rows, the label counts with application
+  numbers, and any lookup errors. Failed runs are kept as failed.
+- **Campaigns**: an append-only event log of started (with the words typed and the model that
+  read the goal from them), each iteration's metrics, candidates queued, ended, and reopened.
+
+Nothing in history is edited or deleted. **New experiment** ends the campaign on screen (an
+event, and `ended_at`); continuing it from History reopens it. If a screen's record cannot be
+written, the user still gets the dossier, with a notice that it was not saved.
+
+Structures are drawn by the API's own RDKit (`GET /structure.svg`), so the picture is of exactly
+what was screened. That endpoint is public: a drawing reveals nothing about any user, and a session
+check per thumbnail would cost a database round trip. It is size-limited, cached, and rate-limited
+per address instead.
+
 ## Deploy to AWS
 
 Defaults to a `t3.large` on the current Ubuntu 22.04 AMI — no AMI to look up, and no GPU quota

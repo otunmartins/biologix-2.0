@@ -40,6 +40,11 @@ export interface Dossier {
   needs_testing: boolean;
   // Set by the backend from what it actually screened, not by the model.
   structure_basis: StructureBasis;
+  // The SMILES the screen actually ran on; empty if nothing resolved. Optional
+  // because dossiers saved before this field existed do not have it.
+  structure_smiles?: string;
+  // Where this run was saved in the user's history; null if saving failed.
+  history_id?: string | null;
   // Computed by the backend from the request, before the agent runs.
   exposure: ExposureAssessment | null;
 }
@@ -315,6 +320,8 @@ export async function runScreen(
   prompt: string,
   polymer: PolymerSpec | null,
   exposure: ExposureInputs | null,
+  // The form as filled in, kept in the user's history so it can be reopened.
+  form: SavedForm | null,
   signal?: AbortSignal,
 ): Promise<Dossier> {
   const res = await call('/screen', {
@@ -324,6 +331,7 @@ export async function runScreen(
       prompt,
       ...(polymer ? { polymer } : {}),
       ...(exposure ? { exposure } : {}),
+      ...(form ? { form } : {}),
     }),
     signal,
   });
@@ -341,4 +349,145 @@ export async function runScreen(
     throw new Error(detail || `Server returned ${res.status}`);
   }
   return res.json();
+}
+
+// ---- history and provenance (mirrors api/history.py) ------------------------
+
+// What a screen's history record keeps of the form: either the structured form
+// as filled in, or the plain-English text. Loose on purpose: a record saved by
+// an older form still reopens, with anything missing taken from the defaults.
+export type SavedForm =
+  | { mode: 'form'; values: Record<string, unknown> }
+  | { mode: 'text'; text: string };
+
+export interface ScreenSummary {
+  kind: 'screen';
+  id: string;
+  at: string;
+  status: 'ok' | 'failed';
+  excipient: string | null;
+  protein: string | null;
+  route: string | null;
+  worst_verdict: Verdict | null;
+  needs_testing: boolean | null;
+  smiles: string | null;
+  error: string | null;
+  prompt: string | null;
+  app_version: string;
+  duration_s: number;
+}
+
+export interface CampaignSummary {
+  kind: 'campaign';
+  id: string;
+  at: string;
+  goal: DesignGoal;
+  prompt: string;
+  ended_at: string | null;
+  last_activity: string | null;
+  n_candidates: number;
+  n_iterations: number;
+  n_queued: number;
+  app_version: string;
+  top: { name: string; score: number; smiles: string } | null;
+}
+
+export type HistoryItem = ScreenSummary | CampaignSummary;
+
+export interface HistoryEvent {
+  at: string;
+  kind:
+    | 'screen.completed'
+    | 'screen.failed'
+    | 'campaign.started'
+    | 'campaign.iterated'
+    | 'candidate.queued'
+    | 'campaign.ended'
+    | 'campaign.reopened';
+  data: Record<string, any>;
+  app_version: string;
+}
+
+export interface ScreenProvenance {
+  model: string;
+  app_version: string;
+  duration_s: number;
+  usage: { requests: number; input_tokens: number; output_tokens: number; tool_calls: number } | null;
+  // Exactly what each tool returned during the run. Shapes are the tools' own
+  // (api/main.py, api/precedent.py), so they are read defensively.
+  identity_calls: Record<string, any>[];
+  precedent_calls: Record<string, any>[];
+  exposure: ExposureAssessment | null;
+  precedent_index: { loaded?: boolean; rows?: number; cached_on_disk?: boolean; last_error?: string | null };
+  tool_trace: { tool: string; args: Record<string, unknown> }[];
+  // Why the evidence gate sent a dossier back, once per rejection. Absent on
+  // records saved before it was recorded.
+  gate_rejections?: string[];
+}
+
+export interface ScreenRecord {
+  id: string;
+  created_at: string;
+  finished_at: string;
+  status: 'ok' | 'failed';
+  request: {
+    prompt: string;
+    polymer: PolymerSpec | null;
+    exposure: ExposureInputs | null;
+    form: SavedForm | null;
+  };
+  dossier: Dossier | null;
+  error: string | null;
+  provenance: ScreenProvenance;
+  app_version: string;
+  events: HistoryEvent[];
+}
+
+export interface CampaignState {
+  campaign_id: string;
+  goal: DesignGoal;
+  prompt: string;
+  created_at: string;
+  ended_at: string | null;
+  app_version: string;
+  n_candidates: number;
+  n_iterations: number;
+  candidates_by_iteration: Record<string, StoredCandidate[]>;
+  metrics_history: IterationMetrics[];
+  queue_summary: QueueSummary;
+  limits: string;
+  recommendation: Recommendation;
+  events: HistoryEvent[];
+}
+
+async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const res = await call(path, { signal });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(typeof body?.detail === 'string' ? body.detail : `Server returned ${res.status}`);
+  }
+  return res.json();
+}
+
+export function getHistory(
+  args: { kind?: 'all' | 'screen' | 'campaign'; before?: string | null; limit?: number },
+  signal?: AbortSignal,
+): Promise<{ items: HistoryItem[]; next: string | null }> {
+  const q = new URLSearchParams({ kind: args.kind ?? 'all', limit: String(args.limit ?? 20) });
+  if (args.before) q.set('before', args.before);
+  return getJson(`/history?${q}`, signal);
+}
+
+export function getScreenRecord(id: string, signal?: AbortSignal): Promise<ScreenRecord> {
+  return getJson(`/history/screens/${encodeURIComponent(id)}`, signal);
+}
+
+export function getCampaign(id: string, signal?: AbortSignal): Promise<CampaignState> {
+  return getJson(`/design/campaign/${encodeURIComponent(id)}`, signal);
+}
+
+// "New experiment": closes the campaign. It stays in history and reopens if continued.
+export async function endCampaign(id: string): Promise<void> {
+  const res = await call(`/design/campaign/${encodeURIComponent(id)}/end`, { method: 'POST' });
+  if (!res.ok) throw new Error(`Server returned ${res.status}`);
 }

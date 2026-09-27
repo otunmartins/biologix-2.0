@@ -91,7 +91,9 @@ jobs:
 
             # --build because NEXT_PUBLIC_API_URL is baked into the frontend
             # bundle at build time; a restart alone would not pick up a change.
-            docker compose up -d --build
+            # APP_VERSION stamps every history record with this commit. Escaped
+            # so it is read on the box, after the reset, not on the runner.
+            APP_VERSION=\$(git rev-parse --short HEAD) docker compose up -d --build
 
             # The box has a small root volume and every build leaves the old
             # image behind. Without this it fills up after a dozen deploys.
@@ -173,7 +175,7 @@ jobs:
           ssh target bash -euo pipefail <<EOF
             cd "$APP_DIR"
             git reset --hard "$PREV"
-            docker compose up -d --build
+            APP_VERSION=\$(git rev-parse --short HEAD) docker compose up -d --build
           EOF
           for attempt in $(seq 1 30); do
             if ssh target "cd '$APP_DIR' && docker compose exec -T api python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\", timeout=10)'" >/dev/null 2>&1; then
