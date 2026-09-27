@@ -20,13 +20,14 @@ Run standalone:
 
 import os
 import re
+from contextlib import asynccontextmanager
 from itertools import product
 from dataclasses import dataclass, field
 from typing import Literal
 from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent, ModelRetry, RunContext, Tool
@@ -50,6 +51,7 @@ import polymer
 from polymer import PolymerSpec
 import precedent
 import profile
+import users
 
 # ---------------------------------------------------------------------------
 # Output schema
@@ -994,7 +996,30 @@ def _is_precedent_endpoint(name: str) -> bool:
 # API
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Excipient Screen API")
+def _ensure_tables() -> str | None:
+    """Create the sign-in and campaign tables. Returns why it could not, or None.
+
+    Run at startup because the web app's first sign-in writes to `users` and
+    `sessions`, and nothing else would have created them yet: every other request
+    that touches the database needs a signed-in user first.
+    """
+    try:
+        candidates.connect().close()  # users first, then the campaign store
+        return None
+    except Exception as e:
+        return _scrub(f"{type(e).__name__}: {e}")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Never fatal: a database that is down at boot must still leave /health up to
+    # say so, and /health retries the same call on every hit until it succeeds.
+    if err := _ensure_tables():
+        print(f"warning: could not create tables at startup: {err}", flush=True)
+    yield
+
+
+app = FastAPI(title="Excipient Screen API", lifespan=lifespan)
 
 # Kept for local dev (web on :3000, api on :8000 directly). In the deployed
 # stack, Caddy puts both on one origin, so this middleware is mostly a
@@ -1002,10 +1027,20 @@ app = FastAPI(title="Excipient Screen API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[os.environ.get("WEB_ORIGIN", "http://localhost:3000")],
+    # Credentials because the session cookie is how the API knows who is asking
+    # (users.py). Only safe with an explicit origin list, which this is.
+    allow_credentials=True,
     # GET as well as POST since the campaign and queue views are reads.
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+def _scrub(message: str) -> str:
+    """Strip credentials out of a connection error. /health is public, and
+    psycopg errors can quote the connection string back."""
+    message = re.sub(r"://[^@\s/]*@", "://***@", message)
+    return re.sub(r"password=\S+", "password=***", message)
 
 
 @app.get("/health")
@@ -1030,22 +1065,18 @@ def health():
 
 
 def _database_status() -> dict:
-    """Reachable or not, and why not. Never raises — /health must always answer."""
-    try:
-        conn = db.connect()
-    except Exception as e:
-        return {"reachable": False, "error": f"{type(e).__name__}: {e}"}
-    try:
-        conn.execute("SELECT 1")
-        return {"reachable": True}
-    except Exception as e:
-        return {"reachable": False, "error": f"{type(e).__name__}: {e}"}
-    finally:
-        conn.close()
+    """Reachable or not, and why not. Never raises — /health must always answer.
+
+    Reachable means the tables exist too, since sign-in cannot work without them:
+    if the database was down when the API started, this is where they get made.
+    """
+    if err := _ensure_tables():
+        return {"reachable": False, "error": err}
+    return {"reachable": True}
 
 
 @app.post("/design")
-async def design_candidates(req: DesignRequest):
+async def design_candidates(req: DesignRequest, user_id: int = Depends(users.current_user)):
     """Rank polymer candidates for stabilising a biologic above fridge temperature.
 
     The model, if it is used at all, only reads the goal out of the user's words.
@@ -1094,7 +1125,7 @@ async def _resolve_goal(prompt: str, goal: DesignGoal | None) -> DesignGoal:
 
 
 @app.post("/design/iterate")
-async def design_iterate(req: IterateRequest):
+async def design_iterate(req: IterateRequest, user_id: int = Depends(users.current_user)):
     """One active-learning iteration over the copolymer space.
 
     Starts a campaign from a goal/prompt, or continues one by campaign_id, proposing
@@ -1104,7 +1135,7 @@ async def design_iterate(req: IterateRequest):
     conn = candidates.connect()
     try:
         if req.campaign_id:
-            state = candidates.campaign_state(conn, req.campaign_id)
+            state = candidates.campaign_state(conn, req.campaign_id, owner_id=user_id)
             if state is None:
                 raise HTTPException(status_code=404, detail="no such campaign")
             goal = DesignGoal(**state["goal"])
@@ -1113,7 +1144,7 @@ async def design_iterate(req: IterateRequest):
                      for p in candidates.prior_for(conn, campaign_id)]
         else:
             goal = await _resolve_goal(req.prompt, req.goal)
-            campaign_id = candidates.create_campaign(conn, goal.model_dump())
+            campaign_id = candidates.create_campaign(conn, goal.model_dump(), owner_id=user_id)
             prior = []
 
         proposal = active.propose_batch(goal, prior, k=req.batch_size)
@@ -1140,7 +1171,7 @@ async def design_iterate(req: IterateRequest):
             "metrics_history": history,
             # The advisory campaign controller's read of where the run stands.
             "recommendation": orchestrator.recommend(history),
-            "queue_summary": candidates.queue_summary(conn, campaign_id),
+            "queue_summary": candidates.queue_summary(conn, owner_id=user_id, campaign_id=campaign_id),
             "limits": active.ACTIVE_LIMITS,
             "orchestration": orchestrator.ORCHESTRATION_NOTE,
             "verdict": "Data gap: test",
@@ -1151,22 +1182,22 @@ async def design_iterate(req: IterateRequest):
 
 
 @app.post("/design/queue")
-def design_queue(req: QueueRequest):
+def design_queue(req: QueueRequest, user_id: int = Depends(users.current_user)):
     """Send benchmarked candidates to the OpenMM simulation backlog. A position in
     the queue is a triage decision, not evidence — nothing here upgrades a grade."""
     conn = candidates.connect()
     try:
-        n = candidates.enqueue(conn, req.candidate_ids)
-        return {"queued": n, "queue_summary": candidates.queue_summary(conn)}
+        n = candidates.enqueue(conn, req.candidate_ids, owner_id=user_id)
+        return {"queued": n, "queue_summary": candidates.queue_summary(conn, owner_id=user_id)}
     finally:
         conn.close()
 
 
 @app.get("/design/campaign/{campaign_id}")
-def design_campaign(campaign_id: str):
+def design_campaign(campaign_id: str, user_id: int = Depends(users.current_user)):
     conn = candidates.connect()
     try:
-        state = candidates.campaign_state(conn, campaign_id)
+        state = candidates.campaign_state(conn, campaign_id, owner_id=user_id)
         if state is None:
             raise HTTPException(status_code=404, detail="no such campaign")
         state["limits"] = active.ACTIVE_LIMITS
@@ -1178,15 +1209,15 @@ def design_campaign(campaign_id: str):
 
 
 @app.get("/design/queue")
-def design_queue_view(limit: int = 50):
-    """The simulation backlog a future GPU worker pulls, highest triage score first,
-    across every campaign. A finished run is recorded through the measurement store
+def design_queue_view(limit: int = 50, user_id: int = Depends(users.current_user)):
+    """The signed-in user's simulation backlog, highest triage score first, across
+    all of their campaigns. A finished run is recorded through the measurement store
     as a source='simulation' observation, closing the loop against a real label."""
     conn = candidates.connect()
     try:
         return {
-            "queue": candidates.queue(conn, limit=limit),
-            "summary": candidates.queue_summary(conn),
+            "queue": candidates.queue(conn, owner_id=user_id, limit=limit),
+            "summary": candidates.queue_summary(conn, owner_id=user_id),
             "note": active.ACTIVE_LIMITS,
         }
     finally:
@@ -1194,7 +1225,7 @@ def design_queue_view(limit: int = 50):
 
 
 @app.post("/screen", response_model=Dossier)
-async def screen(req: ScreenRequest):
+async def screen(req: ScreenRequest, user_id: int = Depends(users.current_user)):
     prompt = req.prompt.strip()
     if not prompt:
         raise HTTPException(status_code=422, detail="prompt is empty")

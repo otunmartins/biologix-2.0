@@ -25,6 +25,7 @@ Two terminals:
 cd api
 pip install -r requirements.txt
 export ANTHROPIC_API_KEY=sk-ant-...
+export DATABASE_URL=postgresql://biologix:devpass@localhost:5432/biologix
 uvicorn main:app --reload --port 8000
 
 # terminal 2 — web
@@ -33,8 +34,18 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:3000. The frontend defaults to `http://localhost:8000` for the API when
-`NEXT_PUBLIC_API_URL` isn't set, so this works with no extra config.
+The web app needs its own `web/.env.local` for sign-in (see [Sign-in](#sign-in) for where the
+Google values come from):
+
+```bash
+AUTH_SECRET=<openssl rand -base64 32>
+AUTH_GOOGLE_ID=...
+AUTH_GOOGLE_SECRET=...
+DATABASE_URL=postgresql://biologix:devpass@localhost:5432/biologix
+```
+
+Open http://localhost:3000 and sign in with Google. The frontend defaults to
+`http://localhost:8000` for the API when `NEXT_PUBLIC_API_URL` isn't set.
 
 The first screen you run downloads the FDA Inactive Ingredient file (~380 KB) and caches it for
 30 days in the system temp directory; set `IID_CACHE_DIR` to put it somewhere durable. `/health`
@@ -47,6 +58,47 @@ open.fda.gov/apis/authentication) to lift that to 120,000. When a source does fa
 says so in `lookup_errors` rather than grading the excipient as if nothing were found, failures
 are never cached, and a failed IID download is retried after five minutes (falling back to an
 expired copy on disk if there is one).
+
+## Sign-in
+
+Two ways in, on one page: **Google** (Auth.js, `web/auth.ts`) and **email and password**
+(`web/lib/password-auth.ts`). Anyone can sign up either way; each user sees only their own
+campaigns and queue. `/health` is the only thing open without signing in.
+
+Sessions are rows in the `sessions` table of the same Postgres the API uses. The browser holds
+only a random token, and the API checks it against that table on every request
+(`api/users.py`), so signing out takes effect everywhere at once. The API creates the
+sign-in tables when it starts.
+
+Password sign-in is not an Auth.js provider: Auth.js's credentials provider always issues a JWT
+cookie, which the API cannot check. Instead it verifies the password (scrypt, from Node's
+crypto) and writes the same session row and cookie a Google sign-in gets, so nothing
+downstream can tell them apart. Wrong guesses are limited per email and per address, and an
+unknown email gets the same answer, in the same time, as a wrong password.
+
+**There is no email verification yet** (no mail service), so a password account does not prove
+its owner has that inbox. Two rules follow: an email that already has an account cannot be
+registered again, so nobody can put a password on your Google account; and signing in with
+Google to an email that has a password links to that account and **removes the password**,
+because Google has proved who owns the address and the password may have been set by someone
+else. There is no "forgot password" either: if the address is also a Google account, signing in with
+Google gets you back in; otherwise the password has to be reset by hand in the database.
+Both need a mail service (e.g. Resend) to lift.
+
+**Google credentials** (one time, about five minutes):
+
+1. [Google Cloud Console](https://console.cloud.google.com) → create a project (or pick one).
+2. **APIs & Services → OAuth consent screen**: External, app name, your email. Add the
+   `email` and `profile` scopes. Publish it when you're ready for people outside your test users.
+3. **APIs & Services → Credentials → Create credentials → OAuth client ID** → Web application.
+   Authorised redirect URIs, one for each place the app runs:
+   - `https://<your-domain>/api/auth/callback/google`
+   - `http://localhost:3000/api/auth/callback/google` (local dev)
+4. Copy the client ID and secret into `AUTH_GOOGLE_ID` and `AUTH_GOOGLE_SECRET`.
+
+The callback Auth.js sends Google is built from `WEB_ORIGIN` (passed to the web container as
+`AUTH_URL`). If it doesn't exactly match a redirect URI above, sign-in fails with
+`redirect_uri_mismatch`.
 
 ## Deploy to AWS
 
@@ -75,36 +127,44 @@ so restricting it to your own IP blocks every deploy. Login is key-only.
 
 This prints a public IP. It's an Elastic IP, so it survives a stop/start of the instance.
 
-**3. Get the code on the box and bring it up:**
+**3. Point your domain at it.** At your DNS provider, add an A record for the domain (or a
+subdomain) with the IP from step 2. Google sign-in needs a real domain: it won't redirect to a
+bare IP.
+
+**4. Get the code on the box and bring it up:**
 
 ```bash
 ssh -i excipient-screen.pem ubuntu@<the-ip>
 git clone https://github.com/otunmartins/biologix-2.0.git && cd biologix-2.0
-cp .env.example .env    # ANTHROPIC_API_KEY, Neon's POOLED DATABASE_URL, <the-ip> in the last two vars
+cp .env.example .env    # then fill it in, below
 docker compose up -d --build    # first build is slow: RDKit + a Next.js build
-curl -s localhost/health        # model_configured, database.reachable and tg_model all true
+docker compose exec api python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/health').read().decode())"
 ```
+
+In `.env`: `ANTHROPIC_API_KEY`, Neon's **pooled** `DATABASE_URL`, the three sign-in values
+(`AUTH_SECRET`, `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`), and your domain in the last three:
+`SITE_ADDRESS=<your-domain>`, `WEB_ORIGIN=https://<your-domain>`,
+`NEXT_PUBLIC_API_URL=https://<your-domain>`. Caddy gets the HTTPS certificate on its own once
+DNS points at the box. The health check should show `model_configured`, `database.reachable`
+and `tg_model` all true.
 
 Clone it to exactly `/home/ubuntu/biologix-2.0` (what the commands above do): that's where the deploy
 workflow looks, unless you set an `EC2_APP_DIR` secret.
 
-**4. Turn on deploys from `main`:**
+**5. Turn on deploys from `main`:**
 
 ```bash
 gh secret set EC2_HOST --body <the-ip>
 gh secret set EC2_USER --body ubuntu
 gh secret set EC2_SSH_KEY < excipient-screen.pem
 gh secret set EC2_HOST_KEY --body "$(ssh-keyscan <the-ip> 2>/dev/null)"
+gh variable set SITE_URL --body https://<your-domain>
 gh variable set DEPLOY_ENABLED --body true
 ```
 
-From then on every merge to `main` runs the tests, deploys, checks `/health`, and rolls back to the
-previous build if the new one comes up unhealthy.
-
-Open `http://<the-ip>`. That's plain HTTP — fine for testing, but don't put anything confidential
-through it. For HTTPS, point a domain's A record at the IP, set `SITE_ADDRESS`, `WEB_ORIGIN` and
-`NEXT_PUBLIC_API_URL` to that hostname (see `.env.example`), and re-run
-`docker compose up -d --build`. Caddy gets the certificate on its own.
+From then on every merge to `main` runs the tests, deploys, and checks the result: the API's
+`/health` on the box, then `SITE_URL` from outside, including that Google will call back to that
+address. If the new build fails any of it, the box rolls back to the previous one.
 
 Two things that bite here:
 

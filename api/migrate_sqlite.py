@@ -26,12 +26,16 @@ import sys
 import candidates
 import db
 import measurements
+import users
 
 # Parents before children, so foreign keys hold as each table goes in.
 STORES = {
     "measurements": (measurements.SCHEMA, [("biologic", ["id"]),
                                            ("measurement", ["id"])]),
-    "campaigns": (candidates.SCHEMA, [("campaign", ["id"]),
+    # users.SCHEMA first: campaign.owner_id references it. Migrated campaigns
+    # predate sign-in, so they arrive with no owner and stay hidden until one
+    # is set by hand (UPDATE campaign SET owner_id = ...).
+    "campaigns": (users.SCHEMA + candidates.SCHEMA, [("campaign", ["id"]),
                                       ("iteration", ["campaign_id", "iteration"]),
                                       ("candidate", ["id"])]),
 }

@@ -39,9 +39,10 @@ def fresh_store(module):
     conn = main.db.connect(TEST_DB)
     with main.db.tx(conn):
         # CASCADE and the order together: candidate references campaign,
-        # measurement references biologic.
+        # measurement references biologic, campaign and sessions reference users.
         conn.execute("DROP TABLE IF EXISTS candidate, iteration, campaign, "
-                     "measurement, biologic CASCADE")
+                     "measurement, biologic, passwords, sessions, accounts, verification_token, "
+                     "users CASCADE")
     main.db.reset_schema_cache()
     conn.close()
     return module.connect(TEST_DB)
@@ -1001,7 +1002,14 @@ def main_test():
     # --- campaign store + simulation queue ------------------------------------
     CS = main.candidates
     conn = fresh_store(CS)
-    cid = CS.create_campaign(conn, goal_lyo.model_dump())
+
+    def add_user(email):
+        with main.db.tx(conn):
+            return conn.execute("INSERT INTO users (name, email) VALUES (%s, %s) RETURNING id",
+                                (email.split("@")[0], email)).fetchone()["id"]
+
+    alice, bob = add_user("alice@example.org"), add_user("bob@example.org")
+    cid = CS.create_campaign(conn, goal_lyo.model_dump(), owner_id=alice)
     prior2 = []
     for it in range(1, 4):
         loaded = [A.PriorCandidate(p["backbone_key"], p["components"], p["score"])
@@ -1019,13 +1027,23 @@ def main_test():
 
     # Queue the three highest-scoring, and the backlog must come back score-ordered.
     top3 = sorted(allc, key=lambda c: -c["score"])[:3]
-    assert CS.enqueue(conn, [c["id"] for c in top3]) == 3
-    q = CS.queue(conn)
+    assert CS.enqueue(conn, [c["id"] for c in top3], owner_id=alice) == 3
+    q = CS.queue(conn, owner_id=alice)
     assert [round(c["score"], 2) for c in q] == sorted((round(c["score"], 2) for c in q), reverse=True)
-    assert CS.enqueue(conn, [top3[0]["id"]]) == 0, "re-queuing an already-queued candidate is a no-op"
-    assert CS.queue_summary(conn, cid)["n_queued"] == 3
+    assert CS.enqueue(conn, [top3[0]["id"]], owner_id=alice) == 0,         "re-queuing an already-queued candidate is a no-op"
+    assert CS.queue_summary(conn, owner_id=alice, campaign_id=cid)["n_queued"] == 3
     print(f"ok  campaign store: {len(allc)} candidates over 3 iterations, top 3 queued, "
           "backlog score-ordered, re-queue is a no-op")
+
+    # One user must never see, or act on, another's campaign.
+    rest = [c["id"] for c in allc if c["id"] not in {t["id"] for t in top3}]
+    assert CS.campaign_state(conn, cid, owner_id=bob) is None, "bob can read alice's campaign"
+    assert CS.queue(conn, owner_id=bob) == [], "bob sees alice's queue"
+    assert CS.queue_summary(conn, owner_id=bob)["n_queued"] == 0
+    assert CS.enqueue(conn, rest, owner_id=bob) == 0, "bob queued alice's candidates"
+    assert CS.queue_summary(conn, owner_id=alice)["n_queued"] == 3, "bob's attempt changed alice's queue"
+    assert CS.campaign_state(conn, cid, owner_id=alice)["n_candidates"] == 24
+    print("ok  campaign store: another user can neither read nor queue a campaign they do not own")
 
     # Provenance and referential integrity, as the measurement store demands.
     assert all(r["app_version"] for r in conn.execute("SELECT app_version FROM candidate"))
@@ -1036,6 +1054,59 @@ def main_test():
     except Exception as e:
         assert isinstance(e, main.db.IntegrityError), f"{type(e).__name__}: {e}"
     print("ok  campaign store: orphan candidates rejected, every row stamped with a version")
+
+    # --- sign-in, end to end through the HTTP layer ---------------------------
+    # The API trusts nothing but a live row in `sessions`, which is what Auth.js
+    # writes when someone signs in with Google. So: no cookie, a made-up token and
+    # an expired one must all be turned away before any route runs, and a real one
+    # must only ever see its own user's data.
+    from fastapi.testclient import TestClient
+
+    with main.db.tx(conn):
+        for uid, token, expires in [(alice, "tok-alice", "now() + interval '1 day'"),
+                                    (bob, "tok-bob", "now() + interval '1 day'"),
+                                    (alice, "tok-expired", "now() - interval '1 minute'")]:
+            conn.execute(f'INSERT INTO sessions ("userId", expires, "sessionToken") '
+                         f"VALUES (%s, {expires}, %s)", (uid, token))
+    saved_url = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = TEST_DB
+    try:
+        client = TestClient(main.app)
+
+        def as_(token, prod=False):
+            name = "__Secure-authjs.session-token" if prod else "authjs.session-token"
+            return {"Cookie": f"{name}={token}"} if token else {}
+
+        assert client.get("/health").status_code == 200, "/health must stay public"
+        for label, token in [("no cookie", None), ("unknown token", "tok-made-up"),
+                             ("expired session", "tok-expired")]:
+            for method, path, body in [("get", "/design/queue", None),
+                                       ("get", f"/design/campaign/{cid}", None),
+                                       ("post", "/design/queue", {"candidate_ids": rest}),
+                                       ("post", "/screen", {"prompt": "Screen sucrose IV"}),
+                                       ("post", "/design", {"prompt": "stabilise an mAb"})]:
+                r = client.request(method, path, json=body, headers=as_(token))
+                assert r.status_code == 401, f"{label}: {method.upper()} {path} gave {r.status_code}"
+
+        r = client.get("/design/queue", headers=as_("tok-alice"))
+        assert r.status_code == 200 and len(r.json()["queue"]) == 3, r.text
+        # The __Secure- name is what the browser sends once the site is on HTTPS.
+        r = client.get(f"/design/campaign/{cid}", headers=as_("tok-alice", prod=True))
+        assert r.status_code == 200 and r.json()["n_candidates"] == 24, r.text
+
+        r = client.get("/design/queue", headers=as_("tok-bob"))
+        assert r.status_code == 200 and r.json()["queue"] == [], "bob sees alice's queue over HTTP"
+        r = client.get(f"/design/campaign/{cid}", headers=as_("tok-bob"))
+        assert r.status_code == 404, "another user's campaign must look like no campaign at all"
+        r = client.post("/design/queue", json={"candidate_ids": rest}, headers=as_("tok-bob"))
+        assert r.status_code == 200 and r.json()["queued"] == 0, r.text
+    finally:
+        if saved_url is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = saved_url
+    print("ok  sign-in: no cookie, unknown and expired sessions get 401 on every route; "
+          "a live one sees only its own campaigns; /health stays public")
 
     # --- orchestration (advisory campaign controller) -------------------------
     OR = main.orchestrator

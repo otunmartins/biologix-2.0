@@ -14,6 +14,13 @@ written for precisely this (see its DESIGN NOTES) — so the loop can later be c
 against a real label without a migration. Being queued is a triage decision, never
 evidence, and nothing here upgrades a candidate above grade D.
 
+EVERY CAMPAIGN HAS AN OWNER. owner_id is the signed-in user who started it
+(users.py), and every read and write below that a request can reach takes the
+owner and filters on it, so one user can neither see nor queue another's
+candidates. The owner is a required argument rather than an optional filter:
+forgetting it is a TypeError, not a quiet leak across users. Rows from before
+sign-in existed have no owner and are visible to nobody.
+
 Mirrors measurements.py deliberately: TEXT uuid primary keys, explicit
 timestamps, portable SQL, and the app version stamped on every row, so moving to
 Postgres is a connection change rather than a data-model migration.
@@ -28,6 +35,7 @@ from typing import Literal
 import psycopg
 
 import db
+import users
 
 APP_VERSION = os.environ.get("APP_VERSION", "dev")
 
@@ -41,8 +49,12 @@ CREATE TABLE IF NOT EXISTS campaign (
     id          TEXT PRIMARY KEY,
     goal        TEXT NOT NULL,          -- the DesignGoal, as JSON
     created_at  TEXT NOT NULL,
-    app_version TEXT NOT NULL DEFAULT ''
+    app_version TEXT NOT NULL DEFAULT '',
+    owner_id    INTEGER REFERENCES users(id)
 );
+-- For a campaign table created before sign-in existed. A no-op on a fresh one.
+ALTER TABLE campaign ADD COLUMN IF NOT EXISTS owner_id INTEGER REFERENCES users(id);
+CREATE INDEX IF NOT EXISTS campaign_by_owner ON campaign(owner_id);
 CREATE TABLE IF NOT EXISTS iteration (
     campaign_id TEXT NOT NULL REFERENCES campaign(id),
     iteration   INTEGER NOT NULL,
@@ -77,6 +89,7 @@ CREATE INDEX IF NOT EXISTS candidate_by_status ON candidate(status, score);
 
 def connect(url: str | None = None) -> psycopg.Connection:
     conn = db.connect(url)
+    users.ensure_schema(conn)  # campaign.owner_id references users(id)
     db.init_schema(conn, SCHEMA)
     return conn
 
@@ -89,11 +102,12 @@ def _now() -> str:
 # Writes
 # ---------------------------------------------------------------------------
 
-def create_campaign(conn: psycopg.Connection, goal: dict) -> str:
+def create_campaign(conn: psycopg.Connection, goal: dict, *, owner_id: int) -> str:
     cid = str(uuid.uuid4())
     with db.tx(conn):
-        conn.execute("INSERT INTO campaign (id, goal, created_at, app_version) VALUES (%s,%s,%s,%s)",
-                     (cid, json.dumps(goal), _now(), APP_VERSION))
+        conn.execute("INSERT INTO campaign (id, goal, created_at, app_version, owner_id) "
+                     "VALUES (%s,%s,%s,%s,%s)",
+                     (cid, json.dumps(goal), _now(), APP_VERSION, owner_id))
     return cid
 
 
@@ -132,16 +146,19 @@ def record_metrics(conn: psycopg.Connection, campaign_id: str, iteration: int,
             (campaign_id, iteration, json.dumps(metrics), _now()))
 
 
-def enqueue(conn: psycopg.Connection, candidate_ids: list[str]) -> int:
+def enqueue(conn: psycopg.Connection, candidate_ids: list[str], *, owner_id: int) -> int:
     """Send benchmarked candidates to the simulation queue. Only a benchmarked
-    candidate can be queued, so re-queuing or queuing a running one is a no-op."""
+    candidate can be queued, so re-queuing or queuing a running one is a no-op --
+    and so is naming another user's candidate."""
     now = _now()
     n = 0
     with db.tx(conn):
         for cid in candidate_ids:
             cur = conn.execute(
                 "UPDATE candidate SET status='queued', updated_at=%s "
-                "WHERE id=%s AND status='benchmarked'", (now, cid))
+                "WHERE id=%s AND status='benchmarked' "
+                "AND campaign_id IN (SELECT id FROM campaign WHERE owner_id=%s)",
+                (now, cid, owner_id))
             n += cur.rowcount
     return n
 
@@ -202,12 +219,13 @@ def metrics_history(conn: psycopg.Connection, campaign_id: str) -> list[dict]:
     return [{"iteration": r["iteration"], **json.loads(r["metrics"])} for r in rows]
 
 
-def queue(conn: psycopg.Connection, limit: int = 50,
+def queue(conn: psycopg.Connection, *, owner_id: int, limit: int = 50,
           campaign_id: str | None = None) -> list[dict]:
-    """The simulation backlog a GPU worker would pull, highest triage score first.
-    Scoped to one campaign when given, else across all of them."""
-    sql = "SELECT * FROM candidate WHERE status='queued'"
-    args: list = []
+    """One user's simulation backlog, highest triage score first. Scoped to one
+    of their campaigns when given, else across all of them."""
+    sql = ("SELECT * FROM candidate WHERE status='queued' "
+           "AND campaign_id IN (SELECT id FROM campaign WHERE owner_id=%s)")
+    args: list = [owner_id]
     if campaign_id:
         sql += " AND campaign_id=%s"
         args.append(campaign_id)
@@ -216,17 +234,19 @@ def queue(conn: psycopg.Connection, limit: int = 50,
     return [_hydrate(r) for r in conn.execute(sql, args)]
 
 
-def queue_summary(conn: psycopg.Connection, campaign_id: str | None = None) -> dict:
+def queue_summary(conn: psycopg.Connection, *, owner_id: int,
+                  campaign_id: str | None = None) -> dict:
     """Counts by status, plus the top of the queue — enough for the panel to say
     'N queued for OpenMM, waiting for GPU' without pulling every row."""
-    sql = "SELECT status, COUNT(*) AS n FROM candidate"
-    args: list = []
+    sql = ("SELECT status, COUNT(*) AS n FROM candidate "
+           "WHERE campaign_id IN (SELECT id FROM campaign WHERE owner_id=%s)")
+    args: list = [owner_id]
     if campaign_id:
-        sql += " WHERE campaign_id=%s"
+        sql += " AND campaign_id=%s"
         args.append(campaign_id)
     sql += " GROUP BY status"
     counts = {r["status"]: r["n"] for r in conn.execute(sql, args)}
-    top = queue(conn, limit=5, campaign_id=campaign_id)
+    top = queue(conn, owner_id=owner_id, limit=5, campaign_id=campaign_id)
     return {
         "n_queued": counts.get("queued", 0),
         "n_benchmarked": counts.get("benchmarked", 0),
@@ -238,8 +258,12 @@ def queue_summary(conn: psycopg.Connection, campaign_id: str | None = None) -> d
     }
 
 
-def campaign_state(conn: psycopg.Connection, campaign_id: str) -> dict | None:
-    row = conn.execute("SELECT * FROM campaign WHERE id=%s", (campaign_id,)).fetchone()
+def campaign_state(conn: psycopg.Connection, campaign_id: str, *,
+                   owner_id: int) -> dict | None:
+    """The whole campaign, or None if it does not exist OR belongs to someone
+    else -- the caller cannot tell the two apart, so ids cannot be probed."""
+    row = conn.execute("SELECT * FROM campaign WHERE id=%s AND owner_id=%s",
+                       (campaign_id, owner_id)).fetchone()
     if row is None:
         return None
     cands = candidates_for(conn, campaign_id)
@@ -254,5 +278,5 @@ def campaign_state(conn: psycopg.Connection, campaign_id: str) -> dict | None:
         "n_iterations": len(by_iteration),
         "candidates_by_iteration": by_iteration,
         "metrics_history": metrics_history(conn, campaign_id),
-        "queue_summary": queue_summary(conn, campaign_id),
+        "queue_summary": queue_summary(conn, owner_id=owner_id, campaign_id=campaign_id),
     }

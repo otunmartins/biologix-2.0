@@ -16,6 +16,23 @@ services:
       context: ./web
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+    environment:
+      # Sign-in (web/auth.ts). Read at runtime, unlike NEXT_PUBLIC_API_URL, so
+      # changing these needs a restart, not a rebuild.
+      - AUTH_SECRET=${AUTH_SECRET}
+      - AUTH_GOOGLE_ID=${AUTH_GOOGLE_ID}
+      - AUTH_GOOGLE_SECRET=${AUTH_GOOGLE_SECRET}
+      # The public address, for Google's callback URL and the cookie's Secure
+      # flag. Must be explicit: behind Caddy, Next.js hands Auth.js its own
+      # http://localhost:3000 whatever the forwarded headers say, and Google
+      # rejects that callback as a redirect_uri_mismatch.
+      - AUTH_URL=${WEB_ORIGIN}
+      # Sessions live in the same Postgres the API checks them against.
+      - DATABASE_URL=${DATABASE_URL}
+    # The API creates the users and sessions tables at startup; a sign-in that
+    # beat it there would fail on a missing table.
+    depends_on:
+      - api
     restart: unless-stopped
 
   api:

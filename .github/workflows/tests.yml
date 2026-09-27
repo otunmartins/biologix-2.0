@@ -65,6 +65,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Password hashing
+        # Plain Node, no install: lib/passwords.ts imports only node:crypto.
+        working-directory: web
+        run: node --experimental-strip-types lib/passwords.test.ts
+
       - name: Build the web image
         # `next build` type-checks, so this is also the TypeScript check.
         run: docker build --build-arg NEXT_PUBLIC_API_URL=http://localhost -t biologix-web ./web
