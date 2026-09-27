@@ -3,6 +3,7 @@
 import { useMemo, useState } from 'react';
 import type { Dossier, Verdict } from '@/lib/api';
 import { GRADE_MEANING, VERDICTS, overview, sortLiabilities } from '@/lib/screen';
+import ExposureTable from './ExposureTable';
 import { GradeBox, SeverityTag, VERDICT_STYLE, VerdictPill } from './badges';
 import { CheckCircle, Chevron, Download, Refresh, Triangle } from './icons';
 
@@ -277,6 +278,8 @@ export default function Results({ dossier: d, context, onRerun, loading }: Props
             })}
           </ul>
         </section>
+
+        {d.exposure && <ExposureTable exposure={d.exposure} />}
 
         <section className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-card">
           <div className="border-b border-slate-200 px-5 py-4">

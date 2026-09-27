@@ -40,6 +40,37 @@ export interface Dossier {
   needs_testing: boolean;
   // Set by the backend from what it actually screened, not by the model.
   structure_basis: StructureBasis;
+  // Computed by the backend from the request, before the agent runs.
+  exposure: ExposureAssessment | null;
+}
+
+// Mirrors api/exposure.py.
+export interface ExposureInputs {
+  excipient_concentration: string;
+  dose_volume_ml: number | null;
+  dosing_interval_days: number;
+  treatment_duration_days: number | null;
+}
+
+export interface ImpurityExposure {
+  name: string;
+  level: string;
+  status: 'within' | 'above' | 'not_computed';
+  reason?: string;
+  level_ug_per_g?: number;
+  ug_per_dose?: number;
+  ug_per_dosing_day?: number;
+  margin?: number | null;
+}
+
+export interface ExposureAssessment {
+  acceptable_intake_ug_per_day: number;
+  duration_category: string;
+  duration_basis: string;
+  excipient_mg_per_dose: number | null;
+  excipient_mass_basis: string;
+  impurities: ImpurityExposure[];
+  basis: string;
 }
 
 // Mirrors api/polymer.py. SMILES use [*] for attachment points.
@@ -76,12 +107,17 @@ interface ValidationIssue {
 export async function runScreen(
   prompt: string,
   polymer: PolymerSpec | null,
+  exposure: ExposureInputs | null,
   signal?: AbortSignal,
 ): Promise<Dossier> {
   const res = await fetch(`${API_URL}/screen`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(polymer ? { prompt, polymer } : { prompt }),
+    body: JSON.stringify({
+      prompt,
+      ...(polymer ? { polymer } : {}),
+      ...(exposure ? { exposure } : {}),
+    }),
     signal,
   });
   if (!res.ok) {

@@ -122,10 +122,19 @@ This is Stage 0, Stage 1, and a slice of Stage 2 from the design doc. Deliberate
   anything derived from a surrogate is capped at grade D and labelled in the rationale.
 - **Real:** described polymers. Give `/screen` a repeat unit, end groups, an approximate DP and
   any residual impurities, and it screens that chemistry instead of the surrogate — see below.
+- **Real:** impurity exposure margins. A residual impurity's specification level becomes µg per
+  dose and is compared with the ICH M7 acceptable intake for the treatment duration — see below.
 - **Simplified:** label mining reads the DESCRIPTION text only — no structured SPL ingredient
-  amounts, so label precedent carries no concentrations. No statistical mutagenicity model, no
-  exposure-margin/TTC calculation. Polymers are linear chains of one repeat unit: no
-  polydispersity, branching or block copolymers.
+  amounts, so label precedent carries no concentrations. No statistical mutagenicity model.
+  Exposure margins cover residual impurities only, against a generic benchmark, never the
+  excipient itself. Polymers are linear chains of one repeat unit: no polydispersity, branching
+  or block copolymers.
+- **Real:** solvent-accessibility weighting. Give the scan a UniProt accession (AlphaFold model) or
+  a 4-character PDB ID (RCSB experimental structure) and every liability is weighted by relative
+  solvent accessibility, computed with Shrake-Rupley against Tien et al. 2013 reference max-ASA.
+  Without an identifier it falls back to raw sequence counts and labels each flag `not modelled`.
+  On intact IgG (1IGT) this is the difference between "22 Met" and "22 Met, 5 exposed".
+- **Missing:** the Stage 3 OpenMM compatibility screen. See below.
 
 ### Describing a polymer
 
@@ -160,18 +169,55 @@ What a description buys, and where it stops:
   make an excipient look cleaner than the stand-in did.
 - **Residual impurities are screened as their own molecules**, resolved through PubChem. Residual
   ethylene oxide trips the epoxide alert and adds a His alkylation flag tagged
-  `from residual ethylene oxide (<= 1 ppm)`. The level is quoted, never used to scale a severity —
-  there is no exposure model yet.
+  `from residual ethylene oxide (<= 1 ppm)`. The level is quoted and feeds the exposure margin
+  below; it never scales a severity.
 - **Architecture is linear.** A polysorbate's four sorbitan arms are written as one chain with a
   sorbitan-ester end group, which carries the same reactive groups but not the same shape.
   Poloxamers (block copolymers) and the cellulosics have no linear preset and stay on the surrogate
   unless described by hand.
-- **Real:** solvent-accessibility weighting. Give the scan a UniProt accession (AlphaFold model) or
-  a 4-character PDB ID (RCSB experimental structure) and every liability is weighted by relative
-  solvent accessibility, computed with Shrake-Rupley against Tien et al. 2013 reference max-ASA.
-  Without an identifier it falls back to raw sequence counts and labels each flag `not modelled`.
-  On intact IgG (1IGT) this is the difference between "22 Met" and "22 Met, 5 exposed".
-- **Missing:** the Stage 3 OpenMM compatibility screen. See below.
+
+### Impurity exposure margins
+
+A level of "≤ 1 ppm" is a specification, not an exposure. With an `exposure` object alongside a
+polymer's impurities, `api/exposure.py` makes it one, from the request alone and before the agent
+runs, so the numbers never pass through the model:
+
+```json
+"exposure": {
+  "excipient_concentration": "0.02% w/v",
+  "dose_volume_ml": 1,
+  "dosing_interval_days": 14,
+  "treatment_duration_days": 365
+}
+```
+
+Excipient per dose (0.02 %w/v × 1 mL = 0.2 mg) × level (1 µg/g) = 0.0002 µg ethylene oxide per
+dose, against the ICH M7 Table 2 acceptable intake for an individual mutagenic impurity:
+
+| dosing days | acceptable intake |
+|---|---|
+| ≤ 30 (≤ 1 month) | 120 µg/day |
+| ≤ 365 (> 1–12 months) | 20 µg/day |
+| ≤ 3650 (> 1–10 years) | 10 µg/day |
+| more, or duration not given | 1.5 µg/day |
+
+The duration category follows ICH M7's rule for intermittent dosing: it is set by the number of
+*dosing days*, not the calendar span, so every two weeks for a year is 27 dosing days and the
+≤ 1 month tier. That is the case that matters for biologics. Levels parse as ppm, ppb, µg/g,
+mg/kg or % w/w; a peroxide value in meq/kg is refused rather than guessed, since it is not a mass
+fraction. Anything that can't be computed is reported with its reason, never as zero.
+
+What it is not, and says so in every result:
+
+- **A benchmark, not a limit.** ICH M7 formally excludes biotechnological products and covers
+  only DNA-reactive impurities. It is used here because it is the most conservative generic limit
+  there is.
+- **Compound-specific limits are not applied.** Where the M7 addendum or a published PDE gives
+  one, it supersedes these tiers; none are built in.
+- **"Above" means the specification allows more than the benchmark**, not that a lot contains it.
+  The verdict for such an impurity is `Data gap: test`: lot data or a compound-specific
+  assessment is needed.
+- **One impurity at a time**, and residual impurities only — never the excipient itself.
 
 ### Where regulatory precedent comes from, and what it isn't
 

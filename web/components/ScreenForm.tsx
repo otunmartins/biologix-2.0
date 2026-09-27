@@ -2,6 +2,8 @@
 
 import { useState } from 'react';
 import {
+  DURATIONS,
+  INTERVALS,
   PRESETS,
   ROUTES,
   SAMPLE_SEQ,
@@ -9,6 +11,7 @@ import {
   TEMPS,
   TRACKED,
   cleanSequence,
+  hasImpurities,
   sequenceStats,
   structureKind,
   type ScreenForm as Form,
@@ -327,6 +330,63 @@ export default function ScreenForm(p: Props) {
                   })}
                 </div>
               </div>
+              {hasImpurities(form) && (
+                <div className="space-y-3 rounded-xl border border-slate-200 bg-slate-50/60 p-4">
+                  <div>
+                    <div className="text-sm font-semibold text-slate-800">Dosing</div>
+                    <p className="hint mt-0.5">
+                      Turns impurity levels into intake per dose, against the ICH M7 benchmark.
+                    </p>
+                  </div>
+                  <label className="block">
+                    <span className="label">Dose volume</span>
+                    <div className="relative">
+                      <input
+                        type="number"
+                        min={0}
+                        step="any"
+                        className="input pr-10"
+                        value={form.doseVolume}
+                        placeholder="needed for a % w/v or mg/mL concentration"
+                        onChange={(e) => onChange({ doseVolume: e.target.value })}
+                      />
+                      <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-slate-400">
+                        mL
+                      </span>
+                    </div>
+                  </label>
+                  <div className="grid grid-cols-2 gap-3">
+                    <label className="block">
+                      <span className="label">Every</span>
+                      <select
+                        className="input"
+                        value={form.intervalDays}
+                        onChange={(e) => onChange({ intervalDays: e.target.value })}
+                      >
+                        {INTERVALS.map(([days, label]) => (
+                          <option key={days} value={days}>
+                            {label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="block">
+                      <span className="label">For</span>
+                      <select
+                        className="input"
+                        value={form.durationDays}
+                        onChange={(e) => onChange({ durationDays: e.target.value })}
+                      >
+                        {DURATIONS.map(([days, label]) => (
+                          <option key={label} value={days}>
+                            {label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                </div>
+              )}
             </Section>
           </>
         )}

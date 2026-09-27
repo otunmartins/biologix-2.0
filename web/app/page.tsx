@@ -10,6 +10,7 @@ import {
   DEFAULT_FORM,
   GRADE_MEANING,
   buildPrompt,
+  toExposureInputs,
   toPolymerSpec,
   type ScreenForm as Form,
 } from '@/lib/screen';
@@ -188,7 +189,12 @@ export default function Home() {
     try {
       // Only the structured form carries a polymer description.
       const polymer = mode === 'form' ? toPolymerSpec(form.polymer) : null;
-      const result = await runScreen(prompt, polymer, ctrl.signal);
+      const result = await runScreen(
+        prompt,
+        polymer,
+        mode === 'form' ? toExposureInputs(form) : null,
+        ctrl.signal,
+      );
       setDossier(result);
       setContext(
         mode === 'form'
