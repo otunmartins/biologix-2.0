@@ -104,6 +104,11 @@ ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_attempts INTEGER NOT NULL DEF
 ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_progress TEXT;
 ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_result TEXT;     -- JSON, see worker/
 ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_error TEXT;
+-- Each run costs GPU hours, so a queued job waits until an admin approves it
+-- (ADMIN_EMAILS, users.py); only an approved job can be claimed. Queuing again
+-- clears the approval: what was approved was that job, not the candidate.
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_approved_at TIMESTAMPTZ;
+ALTER TABLE candidate ADD COLUMN IF NOT EXISTS sim_approved_by INTEGER REFERENCES users(id);
 """
 
 # A job whose worker has not checked in for this long is presumed dead (the box
@@ -113,6 +118,20 @@ STALE_AFTER_MINUTES = 20
 # After this many claims a job is failed rather than requeued: a system that
 # crashes the worker every time would otherwise loop forever.
 MAX_ATTEMPTS = 3
+# What counts against a user's one-simulation-at-a-time allowance: waiting for
+# approval, approved and waiting for the worker, or running.
+ACTIVE = ("queued", "simulating")
+# pg_advisory_xact_lock's first key, naming this lock; the second is the owner.
+_QUEUE_LOCK = 5316
+
+
+class QueueFull(Exception):
+    """Queuing these would leave the user with more active simulations than
+    they are allowed. Raised inside the transaction, so nothing was queued."""
+
+    def __init__(self, allowed: int, active: list[dict]):
+        super().__init__(f"at most {allowed} simulation(s) at a time")
+        self.allowed, self.active = allowed, active
 
 
 def connect(url: str | None = None) -> psycopg.Connection:
@@ -207,7 +226,8 @@ def enqueue(conn: psycopg.Connection, candidate_ids: list[str], *, owner_id: int
 
 
 def enqueue_rows(conn: psycopg.Connection, candidate_ids: list[str], *,
-                 owner_id: int, structure_id: str = "") -> list[dict]:
+                 owner_id: int, structure_id: str = "",
+                 max_active: int | None = None) -> list[dict]:
     """enqueue(), returning what was actually queued -- id, campaign and score --
     so the caller can log exactly that and nothing it merely asked for.
 
@@ -215,14 +235,22 @@ def enqueue_rows(conn: psycopg.Connection, candidate_ids: list[str], *,
     only claims jobs that have one, so a candidate queued without one (before
     structures were asked for) waits; queuing it again WITH a structure attaches
     it. That is the one case where queuing an already-queued candidate acts. A
-    failed job can be queued again, which starts its attempts afresh."""
+    failed job can be queued again, which starts its attempts afresh.
+
+    max_active caps how many of the owner's candidates may be queued or running
+    once this is done; over it, QueueFull and nothing changes. The check runs
+    after the writes, under a per-owner lock, so two requests at once cannot
+    both slip under the cap."""
     now = _now()
     queued = []
     with db.tx(conn):
+        if max_active is not None:
+            conn.execute("SELECT pg_advisory_xact_lock(%s, %s)", (_QUEUE_LOCK, owner_id))
         for cid in candidate_ids:
             row = conn.execute(
                 "UPDATE candidate SET status='queued', updated_at=%s, sim_structure_id=%s, "
-                "sim_attempts=0, sim_error=NULL, sim_result=NULL, sim_progress=NULL "
+                "sim_attempts=0, sim_error=NULL, sim_result=NULL, sim_progress=NULL, "
+                "sim_approved_at=NULL, sim_approved_by=NULL "
                 "WHERE id=%s AND (status IN ('benchmarked', 'failed') "
                 "     OR (status='queued' AND sim_structure_id='' AND %s <> '')) "
                 "AND campaign_id IN (SELECT id FROM campaign WHERE owner_id=%s) "
@@ -232,6 +260,16 @@ def enqueue_rows(conn: psycopg.Connection, candidate_ids: list[str], *,
                 queued.append({"id": row["id"], "campaign_id": row["campaign_id"],
                                "score": row["score"],
                                "name": json.loads(row["payload"]).get("name", "")})
+        if max_active is not None:
+            active = [{"id": r["id"], "status": r["status"],
+                       "name": json.loads(r["payload"]).get("name", "")}
+                      for r in conn.execute(
+                          "SELECT id, status, payload FROM candidate WHERE status = ANY(%s) "
+                          "AND campaign_id IN (SELECT id FROM campaign WHERE owner_id=%s)",
+                          (list(ACTIVE), owner_id))]
+            if len(active) > max_active:
+                newly = {q["id"] for q in queued}
+                raise QueueFull(max_active, [a for a in active if a["id"] not in newly])
     return queued
 
 
@@ -267,13 +305,14 @@ def requeue_stale(conn: psycopg.Connection) -> list[dict]:
 
 
 def claim_next(conn: psycopg.Connection, worker: str) -> dict | None:
-    """Atomically take the highest-scoring queued job that has a target structure.
+    """Atomically take the highest-scoring approved job that has a target structure.
     SKIP LOCKED lets several workers pull from one queue without ever taking the
     same job. Returns the candidate, its campaign's goal and its owner, or None."""
     with db.tx(conn):
         row = conn.execute(
             "WITH nxt AS ("
             "  SELECT id FROM candidate WHERE status='queued' AND sim_structure_id <> '' "
+            "  AND sim_approved_at IS NOT NULL "
             "  ORDER BY score DESC, updated_at LIMIT 1 FOR UPDATE SKIP LOCKED) "
             "UPDATE candidate c SET status='simulating', sim_worker=%s, sim_started_at=now(), "
             "  sim_heartbeat_at=now(), sim_attempts=c.sim_attempts+1, sim_error=NULL, "
@@ -323,6 +362,56 @@ def finish(conn: psycopg.Connection, candidate_id: str, worker: str, *,
 
 
 # ---------------------------------------------------------------------------
+# The admin's side: approving runs (main.py's /design/simulations)
+# ---------------------------------------------------------------------------
+# Owner-free too, for the same reason as the worker's: an admin decides on every
+# user's jobs. The routes check the caller is an admin before any of these run.
+
+def _job_info(conn: psycopg.Connection, row: dict) -> dict:
+    camp = conn.execute("SELECT owner_id FROM campaign WHERE id=%s", (row["campaign_id"],)).fetchone()
+    return {"candidate": _hydrate(row), "campaign_id": row["campaign_id"],
+            "owner_id": camp["owner_id"] if camp else None}
+
+
+def approve(conn: psycopg.Connection, candidate_id: str, admin_id: int) -> dict | None:
+    """Let the worker run this job. None unless it is queued, not yet approved,
+    and has a structure to run against (one without could not be claimed)."""
+    with db.tx(conn):
+        row = conn.execute(
+            "UPDATE candidate SET sim_approved_at=now(), sim_approved_by=%s, updated_at=%s "
+            "WHERE id=%s AND status='queued' AND sim_approved_at IS NULL AND sim_structure_id <> '' "
+            "RETURNING *", (admin_id, _now(), candidate_id)).fetchone()
+        return _job_info(conn, row) if row else None
+
+
+def decline(conn: psycopg.Connection, candidate_id: str, reason: str) -> dict | None:
+    """Take a waiting job out of the queue without running it. It ends 'failed'
+    with the reason, so the user sees why and can queue it again. A running job
+    cannot be declined: its GPU time is already being spent."""
+    with db.tx(conn):
+        row = conn.execute(
+            "UPDATE candidate SET status='failed', sim_error=%s, sim_approved_at=NULL, "
+            "  sim_approved_by=NULL, updated_at=%s "
+            "WHERE id=%s AND status='queued' RETURNING *",
+            (f"Not approved: {reason}"[:2000], _now(), candidate_id)).fetchone()
+        return _job_info(conn, row) if row else None
+
+
+def all_active(conn: psycopg.Connection, limit: int = 200) -> list[dict]:
+    """Every user's waiting and running jobs, for the admin: awaiting approval
+    first, then approved, then running, each best score first."""
+    rows = conn.execute(
+        "SELECT c.*, u.email AS owner_email FROM candidate c "
+        "JOIN campaign cp ON cp.id=c.campaign_id LEFT JOIN users u ON u.id=cp.owner_id "
+        "WHERE c.status = ANY(%s) "
+        "ORDER BY CASE WHEN c.status='simulating' THEN 2 "
+        "              WHEN c.sim_approved_at IS NULL THEN 0 ELSE 1 END, c.score DESC "
+        "LIMIT %s", (list(ACTIVE), limit)).fetchall()
+    return [{**_hydrate(r), "campaign_id": r["campaign_id"], "owner_email": r["owner_email"]}
+            for r in rows]
+
+
+# ---------------------------------------------------------------------------
 # Reads
 # ---------------------------------------------------------------------------
 
@@ -349,6 +438,7 @@ def _hydrate(row: dict) -> dict:
             "progress": row.get("sim_progress"),
             "result": json.loads(row["sim_result"]) if row.get("sim_result") else None,
             "error": row.get("sim_error"),
+            "approved_at": _iso(row.get("sim_approved_at")),
         }
     return c
 
@@ -425,9 +515,9 @@ def queue_summary(conn: psycopg.Connection, *, owner_id: int,
         "n_failed": counts.get("failed", 0),
         "by_status": counts,
         "top": [{"id": c["id"], "name": c["name"], "score": c["score"]} for c in top],
-        "note": ("Queued candidates are ordered by triage score and simulated in that order "
-                 "whenever a simulation worker is running. A queue position is a triage "
-                 "decision, not evidence."),
+        "note": ("An admin approves each simulation before it runs, and you can have one "
+                 "waiting or running at a time. Approved runs go in triage-score order. A "
+                 "queue position is a triage decision, not evidence."),
     }
 
 

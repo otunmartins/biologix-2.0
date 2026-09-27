@@ -52,6 +52,11 @@ services:
       # Shared secret for the simulation worker's /worker/* routes. Unset, those
       # routes answer 503 and nothing else changes.
       - WORKER_TOKEN=${WORKER_TOKEN:-}
+      # Who approves simulations (comma-separated emails), and the RunPod pod an
+      # approval starts. Without ADMIN_EMAILS nothing can be approved, so nothing runs.
+      - ADMIN_EMAILS=${ADMIN_EMAILS:-}
+      - RUNPOD_API_KEY=${RUNPOD_API_KEY:-}
+      - RUNPOD_POD_ID=${RUNPOD_POD_ID:-}
     volumes:
       # The FDA Inactive Ingredient file is fetched once and reused for 30 days.
       # Without this it lands in the container's /tmp and is re-downloaded after

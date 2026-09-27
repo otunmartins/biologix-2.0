@@ -190,6 +190,14 @@ function describe(e: HistoryEvent): { title: string; body: string | null; tone: 
       };
     case 'candidate.simulation_failed':
       return { title: `Simulation failed: ${d.candidate?.name ?? 'a candidate'}`, body: d.error ?? '', tone: 'bad' };
+    case 'candidate.approved':
+      return {
+        title: `Approved: ${d.candidate?.name ?? 'a candidate'}`,
+        body: 'Released to the simulation worker.',
+        tone: 'info',
+      };
+    case 'candidate.declined':
+      return { title: `Not approved: ${d.candidate?.name ?? 'a candidate'}`, body: d.reason ?? '', tone: 'neutral' };
     case 'candidate.requeued':
       return { title: 'Simulation requeued', body: d.error ?? 'The worker stopped responding.', tone: 'neutral' };
     case 'campaign.ended':

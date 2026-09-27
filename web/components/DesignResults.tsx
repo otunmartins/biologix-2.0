@@ -143,8 +143,10 @@ function SimulationPanel({ sim, status }: { sim: SimulationJob; status: Candidat
       <div className="eyebrow mb-1.5">OpenMM simulation · against {sim.structure_id || 'no structure yet'}</div>
       {status === 'queued' && (
         <p className="text-sm leading-relaxed text-slate-600">
-          {sim.structure_id
-            ? 'Queued. Waiting for a simulation worker; the queue runs highest triage score first.'
+          {sim.structure_id && !sim.approved_at
+            ? 'Waiting for approval. Each simulation takes hours of GPU time, so an admin approves it before it runs.'
+            : sim.structure_id
+            ? 'Approved. Waiting for the simulation worker; approved runs go highest triage score first.'
             : 'Queued before structures were asked for. Queue it again with the biologic’s PDB ID or UniProt accession to run it.'}
           {sim.error && <span className="mt-1 block text-slate-500">{sim.error}</span>}
         </p>

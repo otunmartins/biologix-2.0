@@ -1071,6 +1071,12 @@ def main_test():
                          f"VALUES (%s, {expires}, %s)", (uid, token))
     saved_url = os.environ.get("DATABASE_URL")
     os.environ["DATABASE_URL"] = TEST_DB
+    # Alice approves simulations, and so is also free of the one-at-a-time cap;
+    # bob is an ordinary user. Case and spacing in the setting must not matter.
+    saved_admins = os.environ.get("ADMIN_EMAILS")
+    os.environ["ADMIN_EMAILS"] = " Alice@Example.org , someone@else.org"
+    for k in ("RUNPOD_API_KEY", "RUNPOD_POD_ID"):
+        os.environ.pop(k, None)
     try:
         client = TestClient(main.app)
 
@@ -1294,6 +1300,18 @@ def main_test():
             print("ok  worker: routes off without WORKER_TOKEN, 401 on a bad one; queueing needs the "
                   "biologic's PDB/UniProt id and attaches it to jobs queued without one")
 
+            # Nothing runs until an admin approves it.
+            assert client.post("/worker/claim", json={"worker": "w1"}, headers=W).status_code == 204, \
+                "an unapproved job must not reach the worker"
+
+            def approve(*job_ids):
+                for j in job_ids:
+                    r = client.post(f"/design/simulations/{j}/approve", headers=as_("tok-alice"))
+                    assert r.status_code == 200, r.text
+                    assert r.json()["pod"].startswith("not configured"), r.json()
+            approve(*ids)
+            print("ok  approval: a queued job is not claimable until an admin approves it")
+
             # Claims come highest score first, each job to exactly one worker.
             j1 = client.post("/worker/claim", json={"worker": "w1"}, headers=W)
             assert j1.status_code == 200, j1.text
@@ -1365,6 +1383,8 @@ def main_test():
             assert r.json()["queued"] == 1
             state = {c["id"]: c for c in CS.candidates_for(conn, cid)}
             assert state[j2["job_id"]]["status"] == "queued" and state[j2["job_id"]]["simulation"]["error"] is None
+            assert state[j2["job_id"]]["simulation"]["approved_at"] is None, \
+                "queuing again needs approving again"
             print("ok  worker: a failed run keeps its error, and can be queued again")
 
             # A worker that goes silent loses its job: requeued, then failed after MAX_ATTEMPTS.
@@ -1406,6 +1426,7 @@ def main_test():
             r = client.post("/design/queue", headers=as_("tok-alice"),
                             json={"candidate_ids": [new[0]["id"]], "structure_id": "9ZZZ"})
             assert r.json()["queued"] == 1
+            approve(new[0]["id"], new[1]["id"])
             # new[1] scores 101: claimed first. 9ZZZ (new[0], 100) cannot be fetched.
             j = client.post("/worker/claim", json={"worker": "w6"}, headers=W).json()
             assert j["job_id"] == new[1]["id"] and j["protein"] == "Trp-cage"
@@ -1426,6 +1447,53 @@ def main_test():
                       "candidate.requeued"):
                 assert k in evs, (k, evs)
             print("ok  worker: every step of a simulation is in the campaign's history")
+
+            # --- spending controls: an ordinary user, one at a time, admin approval ---
+            cid3 = CS.create_campaign(conn, goal2, owner_id=bob)
+            bobs = CS.add_candidates(conn, cid3, 1, [{**it, "score": 50 + i} for i, it in enumerate(items)])
+            b0, b1 = bobs[0]["id"], bobs[1]["id"]
+            r = client.post("/design/queue", headers=as_("tok-bob"), json={"candidate_ids": [b0, b1]})
+            assert r.status_code == 409 and r.json()["detail"]["code"] == "one_at_a_time", r.text
+            assert {c["status"] for c in CS.candidates_for(conn, cid3)} == {"benchmarked"}, \
+                "a refused request queues nothing"
+            assert client.post("/design/queue", headers=as_("tok-bob"),
+                               json={"candidate_ids": [b0]}).json()["queued"] == 1
+            r = client.post("/design/queue", headers=as_("tok-bob"), json={"candidate_ids": [b1]})
+            assert r.status_code == 409 and [a["id"] for a in r.json()["detail"]["active"]] == [b0], r.text
+            print("ok  approval: an ordinary user can have one simulation waiting or running, "
+                  "and a refused request queues nothing")
+
+            assert client.get("/design/queue", headers=as_("tok-bob")).json()["admin"] is False
+            assert client.get("/design/queue", headers=as_("tok-alice")).json()["admin"] is True
+            assert client.get("/design/simulations", headers=as_("tok-bob")).status_code == 403
+            assert client.post(f"/design/simulations/{b0}/approve", headers=as_("tok-bob")).status_code == 403
+            assert client.get("/design/simulations").status_code == 401
+            jobs = client.get("/design/simulations", headers=as_("tok-alice")).json()["jobs"]
+            mine = next(j for j in jobs if j["id"] == b0)
+            assert mine["owner_email"] == "bob@example.org" and mine["simulation"]["approved_at"] is None
+            assert jobs[0]["simulation"]["approved_at"] is None, "awaiting approval is listed first"
+            assert client.post("/worker/claim", json={"worker": "w7"}, headers=W).status_code == 204
+            approve(b0)
+            assert client.post(f"/design/simulations/{b0}/approve",
+                               headers=as_("tok-alice")).status_code == 409, "approving twice is refused"
+            j = client.post("/worker/claim", json={"worker": "w7"}, headers=W).json()
+            assert j["job_id"] == b0
+            assert client.post(f"/design/simulations/{b0}/decline", json={"reason": "x"},
+                               headers=as_("tok-alice")).status_code == 409, "a running job cannot be declined"
+            assert client.post("/design/queue", headers=as_("tok-bob"),
+                               json={"candidate_ids": [b1]}).status_code == 409, "a running job counts"
+            CS.finish(conn, b0, "w7", error="drained by the test")
+            assert client.post("/design/queue", headers=as_("tok-bob"),
+                               json={"candidate_ids": [b1]}).json()["queued"] == 1
+            r = client.post(f"/design/simulations/{b1}/decline", json={"reason": "use a Fab entry"},
+                            headers=as_("tok-alice"))
+            assert r.status_code == 200, r.text
+            gone = {c["id"]: c for c in CS.candidates_for(conn, cid3)}[b1]
+            assert gone["status"] == "failed" and gone["simulation"]["error"] == "Not approved: use a Fab entry"
+            evs = [e["kind"] for e in main.history.events_for(conn, cid3, owner_id=bob)]
+            assert "candidate.approved" in evs and "candidate.declined" in evs, evs
+            print("ok  approval: only an admin sees every job and approves or declines; approving "
+                  "releases it to the worker; a declined job tells the user why")
         finally:
             main.accessibility._fetch = real_fetch
             os.environ.pop("WORKER_TOKEN", None)
@@ -1434,6 +1502,10 @@ def main_test():
             os.environ.pop("DATABASE_URL", None)
         else:
             os.environ["DATABASE_URL"] = saved_url
+        if saved_admins is None:
+            os.environ.pop("ADMIN_EMAILS", None)
+        else:
+            os.environ["ADMIN_EMAILS"] = saved_admins
 
     # --- orchestration (advisory campaign controller) -------------------------
     OR = main.orchestrator

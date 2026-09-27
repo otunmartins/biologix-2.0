@@ -10,11 +10,13 @@ import { Info, Molecule, Spinner, Triangle } from '@/components/icons';
 import BenchmarkPanel from '@/components/BenchmarkPanel';
 import UserMenu, { type SessionUser } from '@/components/UserMenu';
 import HistoryView from '@/components/history/HistoryView';
+import Approvals from '@/components/Approvals';
 import {
   API_URL,
   endCampaign,
   getCampaign,
   getHealth,
+  getIsAdmin,
   iterateDesign,
   queueCandidates,
   runScreen,
@@ -213,7 +215,7 @@ function LoadingState({ elapsed }: { elapsed: number }) {
   );
 }
 
-type Workflow = 'screen' | 'design' | 'history';
+type Workflow = 'screen' | 'design' | 'history' | 'approvals';
 
 interface CampaignView {
   campaignId: string;
@@ -263,6 +265,7 @@ export default function Workbench({ user }: { user: SessionUser }) {
   );
 
   const [api, setApi] = useState<ApiState>({ kind: 'checking' });
+  const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -282,6 +285,9 @@ export default function Workbench({ user }: { user: SessionUser }) {
       .catch((e) => {
         if (e.name !== 'AbortError') setApi({ kind: 'down' });
       });
+    getIsAdmin(ctrl.signal)
+      .then(setIsAdmin)
+      .catch(() => {});
     return () => ctrl.abort();
   }, []);
 
@@ -479,7 +485,7 @@ export default function Workbench({ user }: { user: SessionUser }) {
                   status: 'queued',
                   simulation: {
                     structure_id: sid, attempts: 0, started_at: null, heartbeat_at: null,
-                    finished_at: null, progress: null, result: null, error: null,
+                    finished_at: null, progress: null, result: null, error: null, approved_at: null,
                   },
                 }
               : x,
@@ -527,7 +533,7 @@ export default function Workbench({ user }: { user: SessionUser }) {
   // Ctrl/Cmd+Enter runs from anywhere, including inside the textareas.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !loading && workflow !== 'history') {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !loading && (workflow === 'screen' || workflow === 'design')) {
         e.preventDefault();
         // In a running campaign, Ctrl+Enter runs the next iteration.
         (workflow === 'design' ? (campaign ? iterateNext : design) : run)();
@@ -608,6 +614,7 @@ export default function Workbench({ user }: { user: SessionUser }) {
               ['screen', 'Screen'],
               ['design', 'Design'],
               ['history', 'History'],
+              ...(isAdmin ? ([['approvals', 'Approvals']] as const) : []),
             ] as const
           ).map(([w, label]) => (
             <button
@@ -632,7 +639,9 @@ export default function Workbench({ user }: { user: SessionUser }) {
         </div>
       </header>
 
-      {workflow === 'history' ? (
+      {workflow === 'approvals' ? (
+        <Approvals />
+      ) : workflow === 'history' ? (
         <HistoryView onOpenScreen={openScreen} onRerunScreen={rerunScreen} onOpenCampaign={openCampaign} />
       ) : (
         <div className="flex flex-1 flex-col lg:min-h-0 lg:flex-row">
