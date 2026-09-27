@@ -12,81 +12,29 @@ provider "aws" {
   region = var.region
 }
 
-# Default VPC — fine for one box. Nothing here needs private subnets yet.
-data "aws_vpc" "default" {
-  default = true
+# Lightsail, not EC2: this account's EC2 on-demand vCPU quota is 1 and AWS
+# would not raise it, so even a t3.large cannot launch. Lightsail instances do
+# not count against that quota. It is still a plain Ubuntu box reached over
+# SSH, so everything after `terraform apply` (Docker Compose, Caddy, the deploy
+# workflow) is unchanged.
+
+# Only the public half is uploaded. Terraform never sees the private key, so it
+# is not in the state file; it lives on your machine and in the EC2_SSH_KEY
+# GitHub secret.
+resource "aws_lightsail_key_pair" "screen" {
+  name       = "${var.name}-key"
+  public_key = file(pathexpand(var.ssh_public_key_path))
 }
 
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
-}
+resource "aws_lightsail_instance" "screen" {
+  name              = var.name
+  availability_zone = "${var.region}a"
+  blueprint_id      = var.blueprint_id
+  bundle_id         = var.bundle_id
+  key_pair_name     = aws_lightsail_key_pair.screen.name
 
-resource "aws_security_group" "screen" {
-  name        = "${var.name}-sg"
-  description = "Excipient Screen — web + ssh"
-  vpc_id      = data.aws_vpc.default.id
-
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.ssh_cidr]
-  }
-
-  ingress {
-    description = "HTTP"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "HTTPS (Caddy needs this open for the ACME challenge too)"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = { Name = "${var.name}-sg" }
-}
-
-# Canonical publishes the current Ubuntu AMI id per region as a public SSM
-# parameter, so there's nothing to look up by hand and nothing to go stale.
-# When you move to a GPU box, pass a Deep Learning AMI via -var="ami_id=ami-xxxx":
-#   aws ec2 describe-images --owners amazon --region us-east-1 \
-#     --filters "Name=name,Values=Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04)*" \
-#     --query 'reverse(sort_by(Images,&CreationDate))[:5].[ImageId,Name]' --output table
-data "aws_ssm_parameter" "ubuntu" {
-  name = "/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id"
-}
-
-resource "aws_instance" "screen" {
-  ami                    = var.ami_id != "" ? var.ami_id : data.aws_ssm_parameter.ubuntu.value
-  instance_type          = var.instance_type
-  key_name               = var.key_name
-  subnet_id              = data.aws_subnets.default.ids[0]
-  vpc_security_group_ids = [aws_security_group.screen.id]
-
-  root_block_device {
-    volume_size = var.root_volume_gb
-    volume_type = "gp3"
-  }
-
-  # Installs Docker on a plain Ubuntu AMI. It's a no-op on a Deep Learning AMI,
-  # which ships Docker and the NVIDIA container toolkit already.
+  # Runs once, as root, on first boot: installs Docker. Changing it replaces the
+  # instance, so leave it alone once the box is up.
   user_data = <<-EOT
     #!/bin/bash
     set -eux
@@ -108,9 +56,41 @@ resource "aws_instance" "screen" {
   tags = { Name = var.name }
 }
 
-# Static IP, so a DNS A record survives a stop/start of the instance.
-resource "aws_eip" "screen" {
-  instance = aws_instance.screen.id
-  domain   = "vpc"
-  tags     = { Name = "${var.name}-eip" }
+# Static IP, so the DNS A record and the EC2_HOST secret survive a stop/start
+# or a rebuilt instance. Free while attached.
+resource "aws_lightsail_static_ip" "screen" {
+  name = "${var.name}-ip"
+}
+
+resource "aws_lightsail_static_ip_attachment" "screen" {
+  static_ip_name = aws_lightsail_static_ip.screen.name
+  instance_name  = aws_lightsail_instance.screen.name
+}
+
+# The instance firewall. This resource owns the whole list: anything not here is
+# closed, including the ports Lightsail opens by default.
+resource "aws_lightsail_instance_public_ports" "screen" {
+  instance_name = aws_lightsail_instance.screen.name
+
+  port_info {
+    protocol  = "tcp"
+    from_port = 22
+    to_port   = 22
+    cidrs     = [var.ssh_cidr]
+  }
+
+  port_info {
+    protocol  = "tcp"
+    from_port = 80
+    to_port   = 80
+    cidrs     = ["0.0.0.0/0"]
+  }
+
+  # Caddy needs 443, and 80 above for the ACME challenge.
+  port_info {
+    protocol  = "tcp"
+    from_port = 443
+    to_port   = 443
+    cidrs     = ["0.0.0.0/0"]
+  }
 }

@@ -5,32 +5,27 @@ variable "region" {
 }
 
 variable "name" {
-  description = "Name tag / prefix for everything this stack creates"
+  description = "Name for everything this stack creates"
   type        = string
   default     = "excipient-screen"
 }
 
-variable "ami_id" {
-  description = "Leave empty to use the current Ubuntu 22.04 LTS AMI for the region (looked up automatically). Set this to a Deep Learning AMI ID when you move to a GPU instance for Stage 3."
+variable "bundle_id" {
+  description = "Lightsail plan. large_3_0 is 2 vCPU, 8 GB RAM, 160 GB SSD (about $44/month): the RDKit API and the Next.js build need the 8 GB. List others with: aws lightsail get-bundles --region us-east-2"
   type        = string
-  default     = ""
+  default     = "large_3_0"
 }
 
-variable "key_name" {
-  description = "Existing EC2 key pair name to SSH in with"
+variable "blueprint_id" {
+  description = "The OS image. Ubuntu 24.04 LTS, supported to 2029."
   type        = string
+  default     = "ubuntu_24_04"
 }
 
-variable "instance_type" {
-  description = "Nothing in api/ touches the GPU yet, so this defaults to a cheap CPU box. Switch to g5.xlarge (plus a Deep Learning ami_id and a G/VT quota increase) when the OpenMM stage starts."
+variable "ssh_public_key_path" {
+  description = "Public half of the key you and the deploy workflow SSH in with. Make it once: ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/excipient-screen"
   type        = string
-  default     = "t3.large"
-}
-
-variable "root_volume_gb" {
-  description = "Root volume size. The RDKit and Node images need well over the 8 GB default."
-  type        = number
-  default     = 40
+  default     = "~/.ssh/excipient-screen.pub"
 }
 
 variable "ssh_cidr" {

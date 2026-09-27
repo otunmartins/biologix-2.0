@@ -124,30 +124,40 @@ per address instead.
 
 ## Deploy to AWS
 
-Defaults to a `t3.large` (8 GB RAM) on the current Ubuntu 22.04 AMI: no AMI to look up, and no
-GPU quota request to wait on. It runs the whole app. Simulations need a GPU and run elsewhere
-(see "OpenMM simulations" below).
+One **AWS Lightsail** instance in us-east-2: `large_3_0`, 2 vCPU, 8 GB RAM, 160 GB SSD, Ubuntu
+24.04, about $44/month. It runs the whole app. Simulations need a GPU and run elsewhere (see
+"OpenMM simulations" below).
 
-**1. Credentials and a key pair** (one time):
+Why Lightsail and not EC2: this account's EC2 on-demand vCPU quota is 1, and AWS would not raise
+it, so even a `t3.large` cannot launch. Lightsail instances do not count against that quota. It is
+still a plain Ubuntu box you SSH into, so everything from step 3 on is the same as it would be on
+EC2. (The GitHub secrets keep their `EC2_` names from then.)
+
+**1. Credentials and an SSH key** (one time):
 
 ```bash
-aws configure                 # access key, secret, default region
-aws ec2 create-key-pair --key-name excipient-screen \
-  --query KeyMaterial --output text > excipient-screen.pem
+aws configure                 # an IAM user's key (AKIA...), not the account id; region us-east-2
+aws sts get-caller-identity   # prints your account and user when the credentials work
+ssh-keygen -t ed25519 -N "" -C "excipient-screen deploy" -f ~/.ssh/excipient-screen
 ```
+
+A key of its own, not your personal one: its private half becomes a GitHub secret. Terraform
+uploads only the `.pub` half, so the private key never lands in Terraform's state.
 
 **2. Apply:**
 
 ```bash
 cd terraform
 terraform init
-terraform apply -var="key_name=excipient-screen"
+terraform plan                # 5 to add: key pair, instance, firewall, static IP, attachment
+terraform apply
 ```
 
 Leave `ssh_cidr` at its default. Deploys SSH in from GitHub's runners, whose addresses change,
 so restricting it to your own IP blocks every deploy. Login is key-only.
 
-This prints a public IP. It's an Elastic IP, so it survives a stop/start of the instance.
+This prints the public IP. It's a Lightsail static IP, so it survives a stop/start and even a
+rebuilt instance. Docker installs itself on first boot; give it two or three minutes before step 4.
 
 **3. Point your domain at it.** At your DNS provider, add an A record for the domain (or a
 subdomain) with the IP from step 2. Google sign-in needs a real domain: it won't redirect to a
@@ -156,7 +166,7 @@ bare IP.
 **4. Get the code on the box and bring it up:**
 
 ```bash
-ssh -i excipient-screen.pem ubuntu@<the-ip>
+ssh -i ~/.ssh/excipient-screen ubuntu@<the-ip>
 git clone https://github.com/otunmartins/biologix-2.0.git && cd biologix-2.0
 cp .env.example .env    # then fill it in, below
 docker compose up -d --build    # first build is slow: RDKit + a Next.js build
@@ -178,7 +188,7 @@ workflow looks, unless you set an `EC2_APP_DIR` secret.
 ```bash
 gh secret set EC2_HOST --body <the-ip>
 gh secret set EC2_USER --body ubuntu
-gh secret set EC2_SSH_KEY < excipient-screen.pem
+gh secret set EC2_SSH_KEY < ~/.ssh/excipient-screen
 gh secret set EC2_HOST_KEY --body "$(ssh-keyscan <the-ip> 2>/dev/null)"
 gh variable set SITE_URL --body https://<your-domain>
 gh variable set DEPLOY_ENABLED --body true
@@ -197,7 +207,7 @@ Two things that bite here:
 
 **No GPU here.** This box never runs simulations: the OpenMM worker runs on a RunPod GPU pod and
 pulls its work from this box over HTTPS (see "OpenMM simulations" below). The account has no AWS
-G-instance quota, so don't point `instance_type` at a GPU type.
+GPU quota either.
 
 ## What's real vs. simplified right now
 
