@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
 import { signOutAndReturn } from '@/app/actions';
 
 export interface SessionUser {
@@ -19,7 +20,7 @@ function initials(user: SessionUser) {
     .join('');
 }
 
-export default function UserMenu({ user }: { user: SessionUser }) {
+export default function UserMenu({ user, isAdmin = false }: { user: SessionUser; isAdmin?: boolean }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -66,6 +67,16 @@ export default function UserMenu({ user }: { user: SessionUser }) {
             {user.name && <div className="truncate text-sm font-semibold text-slate-900">{user.name}</div>}
             {user.email && <div className="truncate text-xs text-slate-500">{user.email}</div>}
           </div>
+          {isAdmin && (
+            <Link
+              href="/admin"
+              role="menuitem"
+              className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-100"
+            >
+              Admin
+              <span className="text-xs text-slate-400">dashboard &amp; approvals</span>
+            </Link>
+          )}
           <form action={signOutAndReturn}>
             <button
               type="submit"

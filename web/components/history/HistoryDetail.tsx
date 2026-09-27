@@ -197,6 +197,8 @@ function describe(e: HistoryEvent): { title: string; body: string | null; tone: 
         body: d.tier === 'cpu' ? 'As a CPU preview: a short run on a CPU worker.' : 'As a full GPU run.',
         tone: 'info',
       };
+    case 'candidate.stopped':
+      return { title: `Stopped: ${d.candidate?.name ?? 'a candidate'}`, body: d.reason ?? '', tone: 'bad' };
     case 'candidate.declined':
       return { title: `Not approved: ${d.candidate?.name ?? 'a candidate'}`, body: d.reason ?? '', tone: 'neutral' };
     case 'candidate.requeued':

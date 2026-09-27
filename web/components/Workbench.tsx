@@ -10,14 +10,12 @@ import { Info, Molecule, Spinner, Triangle } from '@/components/icons';
 import BenchmarkPanel from '@/components/BenchmarkPanel';
 import UserMenu, { type SessionUser } from '@/components/UserMenu';
 import HistoryView from '@/components/history/HistoryView';
-import Approvals from '@/components/Approvals';
 import SimulationsView from '@/components/SimulationsView';
 import {
   API_URL,
   endCampaign,
   getCampaign,
   getHealth,
-  getIsAdmin,
   iterateDesign,
   queueCandidates,
   runScreen,
@@ -216,7 +214,7 @@ function LoadingState({ elapsed }: { elapsed: number }) {
   );
 }
 
-type Workflow = 'screen' | 'design' | 'simulations' | 'history' | 'approvals';
+type Workflow = 'screen' | 'design' | 'simulations' | 'history';
 
 interface CampaignView {
   campaignId: string;
@@ -254,7 +252,7 @@ function campaignFromState(s: CampaignState): CampaignView {
 }
 
 // The signed-in app. app/page.tsx renders it only once there is a session.
-export default function Workbench({ user }: { user: SessionUser }) {
+export default function Workbench({ user, isAdmin = false }: { user: SessionUser; isAdmin?: boolean }) {
   const [workflow, setWorkflow] = useState<Workflow>('screen');
   const [mode, setMode] = useState<Mode>('form');
   const [designPrompt, setDesignPrompt] = useState('');
@@ -266,7 +264,6 @@ export default function Workbench({ user }: { user: SessionUser }) {
   );
 
   const [api, setApi] = useState<ApiState>({ kind: 'checking' });
-  const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -286,9 +283,6 @@ export default function Workbench({ user }: { user: SessionUser }) {
       .catch((e) => {
         if (e.name !== 'AbortError') setApi({ kind: 'down' });
       });
-    getIsAdmin(ctrl.signal)
-      .then(setIsAdmin)
-      .catch(() => {});
     return () => ctrl.abort();
   }, []);
 
@@ -617,7 +611,6 @@ export default function Workbench({ user }: { user: SessionUser }) {
               ['design', 'Design'],
               ['simulations', 'Simulations'],
               ['history', 'History'],
-              ...(isAdmin ? ([['approvals', 'Approvals']] as const) : []),
             ] as const
           ).map(([w, label]) => (
             <button
@@ -638,13 +631,11 @@ export default function Workbench({ user }: { user: SessionUser }) {
         </nav>
         <div className="flex items-center gap-3">
           <ApiBadge api={api} />
-          <UserMenu user={user} />
+          <UserMenu user={user} isAdmin={isAdmin} />
         </div>
       </header>
 
-      {workflow === 'approvals' ? (
-        <Approvals />
-      ) : workflow === 'simulations' ? (
+      {workflow === 'simulations' ? (
         <SimulationsView onOpenCampaign={(id) => getCampaign(id).then(openCampaign).catch((e) => setError((e as Error).message))} />
       ) : workflow === 'history' ? (
         <HistoryView onOpenScreen={openScreen} onRerunScreen={rerunScreen} onOpenCampaign={openCampaign} />

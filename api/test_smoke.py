@@ -1478,11 +1478,23 @@ def main_test():
                                headers=as_("tok-alice")).status_code == 409, "approving twice is refused"
             j = client.post("/worker/claim", json={"worker": "w7"}, headers=W).json()
             assert j["job_id"] == b0
-            assert client.post(f"/design/simulations/{b0}/decline", json={"reason": "x"},
-                               headers=as_("tok-alice")).status_code == 409, "a running job cannot be declined"
             assert client.post("/design/queue", headers=as_("tok-bob"),
                                json={"candidate_ids": [b1]}).status_code == 409, "a running job counts"
-            CS.finish(conn, b0, "w7", error="drained by the test")
+            assert client.post(f"/design/simulations/{b0}/approve", json={"tier": "cpu"},
+                               headers=as_("tok-alice")).status_code == 409, "a running job cannot be re-tiered"
+            # An admin can stop a running job: the worker learns at its next heartbeat.
+            r = client.post(f"/design/simulations/{b0}/decline", json={"reason": "out of budget"},
+                            headers=as_("tok-alice"))
+            assert r.status_code == 200 and r.json()["stopped"] is True, r.text
+            assert client.post(f"/worker/jobs/{b0}/heartbeat", json={"worker": "w7"},
+                               headers=W).status_code == 409, "the worker must learn it was stopped"
+            assert client.post(f"/worker/jobs/{b0}/result", json={"worker": "w7", "result": result},
+                               headers=W).status_code == 409, "a stopped job's late result is refused"
+            stopped = {c["id"]: c for c in CS.candidates_for(conn, cid3)}[b0]
+            assert stopped["status"] == "failed" and \
+                stopped["simulation"]["error"] == "Stopped by an admin: out of budget"
+            assert client.post(f"/design/simulations/{b0}/decline", json={"reason": "x"},
+                               headers=as_("tok-alice")).status_code == 409, "a finished job cannot be denied"
             assert client.post("/design/queue", headers=as_("tok-bob"),
                                json={"candidate_ids": [b1]}).json()["queued"] == 1
             r = client.post(f"/design/simulations/{b1}/decline", json={"reason": "use a Fab entry"},
@@ -1491,9 +1503,12 @@ def main_test():
             gone = {c["id"]: c for c in CS.candidates_for(conn, cid3)}[b1]
             assert gone["status"] == "failed" and gone["simulation"]["error"] == "Not approved: use a Fab entry"
             evs = [e["kind"] for e in main.history.events_for(conn, cid3, owner_id=bob)]
-            assert "candidate.approved" in evs and "candidate.declined" in evs, evs
-            print("ok  approval: only an admin sees every job and approves or declines; approving "
-                  "releases it to the worker; a declined job tells the user why")
+            assert {"candidate.approved", "candidate.declined", "candidate.stopped"} <= set(evs), evs
+            admin = client.get("/design/simulations", headers=as_("tok-alice")).json()
+            assert {b0, b1} <= {x["id"] for x in admin["recent"]}, "denied and stopped jobs are listed"
+            assert any(w["name"] == "w7" and w["tier"] == "gpu" for w in admin["workers"]), admin["workers"]
+            print("ok  approval: only an admin sees every job and approves or denies any active one; "
+                  "a running job is stopped and its worker told; a denied job tells the user why")
 
             # --- CPU fallback: a short preview when no GPU is available ------------
             spare = next(c for c in CS.candidates_for(conn, cid2) + CS.candidates_for(conn, cid)
@@ -1507,6 +1522,12 @@ def main_test():
                             headers=as_("tok-alice"))
             assert r.status_code == 200 and r.json()["tier"] == "cpu", r.text
             assert r.json()["pod"].startswith("not needed"), "a CPU preview must not start the GPU pod"
+            assert client.post(f"/design/simulations/{spare['id']}/approve", json={"tier": "cpu"},
+                               headers=as_("tok-alice")).status_code == 409, "approving twice alike is refused"
+            for t in ("gpu", "cpu"):  # an approved job no worker has taken can switch tier
+                r = client.post(f"/design/simulations/{spare['id']}/approve", json={"tier": t},
+                                headers=as_("tok-alice"))
+                assert r.status_code == 200 and r.json()["tier"] == t, r.text
             assert client.post("/worker/claim", json={"worker": "gpu1", "platform": "CUDA"},
                                headers=W).status_code == 204, "a GPU worker must not take a CPU preview"
             assert client.post("/worker/claim", json={"worker": "gpu0"},
@@ -1543,6 +1564,28 @@ def main_test():
             assert client.get("/design/my-simulations").status_code == 401
             print("ok  simulations tab: lists only your runs, active first; each opens with its "
                   "own history; someone else's is a 404")
+
+            # The admin dashboard: counts across every user, and none of their content.
+            assert client.get("/design/admin/stats", headers=as_("tok-bob")).status_code == 403
+            assert client.get("/design/admin/stats").status_code == 401
+            r = client.get("/design/admin/stats", params={"days": 30}, headers=as_("tok-alice"))
+            assert r.status_code == 200, r.text
+            st = r.json()
+            n = lambda sql: conn.execute(sql).fetchone()["n"]
+            assert st["totals"]["polymers"] == n("SELECT COUNT(*) AS n FROM candidate")
+            assert st["totals"]["screens"] == n("SELECT COUNT(*) AS n FROM screen_run") > 0
+            assert st["totals"]["users"] == n("SELECT COUNT(*) AS n FROM users") >= 2
+            assert len(st["series"]["dates"]) == len(st["series"]["screens"]) == 30
+            assert sum(st["series"]["screens"]) == st["totals"]["screens"], "every test screen is today"
+            assert sum(st["screens"]["grades"].values()) > 0 and set(st["screens"]["grades"]) == set("ABCDE")
+            assert sum(b["n"] for b in st["simulations"]["gamma23"]) >= 1, "the -2.4 result is binned"
+            assert st["simulations"]["by_tier"].get("cpu", 0) >= 1
+            text = r.text
+            for secret in (PS80, SEQ, "IgG1 mAb", "keep my mAb stable", "Trp-cage", "1L2Y", "1IGT",
+                           "alice@example.org", "bob@example.org"):
+                assert secret not in text, f"the dashboard leaked user content: {secret[:30]}"
+            print("ok  admin dashboard: platform-wide counts, trends and distributions for admins only, "
+                  "with no excipient, structure, protein, prompt or email in it")
         finally:
             main.accessibility._fetch = real_fetch
             os.environ.pop("WORKER_TOKEN", None)

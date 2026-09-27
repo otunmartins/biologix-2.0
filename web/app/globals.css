@@ -48,3 +48,37 @@
     @apply rounded border border-slate-300 bg-white px-1.5 py-0.5 font-mono text-[11px] text-slate-600;
   }
 }
+
+/* Admin dashboard charts (components/admin). Validated with the dataviz palette
+   checker: categorical slots in this fixed order, the grade ramp as an ordinal
+   blue, Gamma23 as a blue<->red diverging pair about a gray zero. The app has no
+   dark theme yet, so only the light steps are defined. */
+.viz-root {
+  --surface-1: #fcfcfb;
+  --ink-1: #0b0b0b;
+  --ink-2: #52514e;
+  --ink-muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --series-screens: #2a78d6;
+  --series-polymers: #eb6834;
+  --series-sims: #1baf7a;
+  --series-users: #4a3aa7;
+  /* For splits that are not one of the four metrics above. */
+  --cat-magenta: #e87ba4;
+  --cat-yellow: #eda100;
+  --ramp-1: #104281;
+  --ramp-2: #1c5cab;
+  --ramp-3: #2a78d6;
+  --ramp-4: #5598e7;
+  --ramp-5: #86b6ef;
+  --div-neg-2: #1c5cab;
+  --div-neg-1: #86b6ef;
+  --div-mid: #d6d5ce;
+  --div-pos-1: #f09a99;
+  --div-pos-2: #c53a3a;
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+}

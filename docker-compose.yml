@@ -29,6 +29,8 @@ services:
       - AUTH_URL=${WEB_ORIGIN}
       # Sessions live in the same Postgres the API checks them against.
       - DATABASE_URL=${DATABASE_URL}
+      # Who may open /admin; the API checks the same list on every admin call.
+      - ADMIN_EMAILS=${ADMIN_EMAILS:-}
     # The API creates the users and sessions tables at startup; a sign-in that
     # beat it there would fail on a missing table.
     depends_on:

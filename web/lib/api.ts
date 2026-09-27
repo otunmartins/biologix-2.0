@@ -462,6 +462,22 @@ export type HistoryItem = ScreenSummary | CampaignSummary;
 export interface AdminJob extends StoredCandidate {
   campaign_id: string;
   owner_email: string | null;
+  updated_at?: string;
+}
+
+export interface WorkerSeen {
+  name: string;
+  platform: string;
+  tier?: SimTier;
+  last_seen: string;
+}
+
+export interface AdminSimulations {
+  jobs: AdminJob[];
+  recent: AdminJob[];
+  workers: WorkerSeen[];
+  pod_autostart: boolean;
+  cpu_preview_ns: number;
 }
 
 async function detailOf(res: Response): Promise<string> {
@@ -469,16 +485,7 @@ async function detailOf(res: Response): Promise<string> {
   return typeof body?.detail === 'string' ? body.detail : `Server returned ${res.status}`;
 }
 
-// Whether the signed-in user approves simulations. False on any error: the
-// approvals tab is simply not shown.
-export async function getIsAdmin(signal?: AbortSignal): Promise<boolean> {
-  const res = await call('/design/queue?limit=1', { signal });
-  return res.ok ? Boolean((await res.json()).admin) : false;
-}
-
-export async function getSimulations(
-  signal?: AbortSignal,
-): Promise<{ jobs: AdminJob[]; pod_autostart: boolean }> {
+export async function getSimulations(signal?: AbortSignal): Promise<AdminSimulations> {
   const res = await call('/design/simulations', { signal });
   if (!res.ok) throw new Error(await detailOf(res));
   return res.json();
@@ -521,13 +528,74 @@ export async function getMySimulation(
   return res.json();
 }
 
-export async function declineSimulation(id: string, reason: string): Promise<void> {
+// Denies a waiting or approved job, or stops a running one. True when it stopped a run.
+export async function declineSimulation(id: string, reason: string): Promise<boolean> {
   const res = await call(`/design/simulations/${encodeURIComponent(id)}/decline`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ reason }),
   });
   if (!res.ok) throw new Error(await detailOf(res));
+  return Boolean((await res.json()).stopped);
+}
+
+// ---- the admin dashboard: platform-wide counts, never anyone's content ----
+
+export interface Bin {
+  lo: number | null;
+  hi: number | null;
+  n: number;
+}
+
+export interface AdminStats {
+  generated_at: string;
+  window_days: number;
+  totals: Record<
+    | 'users' | 'active_users_7d' | 'active_users_30d' | 'screens' | 'screens_ok' | 'screens_failed'
+    | 'campaigns' | 'iterations' | 'polymers' | 'simulations_requested' | 'simulations_done'
+    | 'simulations_running' | 'simulations_waiting' | 'simulations_approved' | 'measurements'
+    | 'tokens_in' | 'tokens_out' | 'model_requests',
+    number
+  >;
+  previous: Record<'screens' | 'polymers' | 'campaigns' | 'simulations', number>;
+  series: {
+    dates: string[];
+    screens: number[];
+    polymers: number[];
+    campaigns: number[];
+    simulations: number[];
+    active_users: number[];
+    users_cumulative: number[];
+  };
+  screens: {
+    worst_verdict: Record<string, number>;
+    endpoint_verdicts: Record<string, number>;
+    grades: Record<string, number>;
+    routes: Record<string, number>;
+    needs_testing: number;
+    duration_median_s: number | null;
+    duration_p90_s: number | null;
+  };
+  polymers: {
+    by_backbone: Record<string, number>;
+    by_status: Record<string, number>;
+    by_format: Record<string, number>;
+    target_temp_c: Bin[];
+    score_quartiles: number[];
+  };
+  simulations: {
+    by_status: Record<'waiting' | 'approved' | 'running' | 'done' | 'failed', number>;
+    by_tier: Record<string, number>;
+    gamma23: Bin[];
+    gamma23_excluded: number;
+    gamma23_accumulated: number;
+  };
+}
+
+export async function getAdminStats(days: number, signal?: AbortSignal): Promise<AdminStats> {
+  const res = await call(`/design/admin/stats?days=${days}`, { signal });
+  if (!res.ok) throw new Error(await detailOf(res));
+  return res.json();
 }
 
 export interface HistoryEvent {
@@ -544,6 +612,7 @@ export interface HistoryEvent {
     | 'candidate.requeued'
     | 'candidate.approved'
     | 'candidate.declined'
+    | 'candidate.stopped'
     | 'campaign.ended'
     | 'campaign.reopened';
   data: Record<string, any>;

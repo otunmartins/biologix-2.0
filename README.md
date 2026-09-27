@@ -550,6 +550,20 @@ request, not a run:
   API has `RUNPOD_API_KEY` and `RUNPOD_POD_ID`), and the worker stops it after
   `IDLE_STOP_MINUTES` with nothing to claim.
 
+**The admin screen, `/admin`.** For the app's owner (the emails in `ADMIN_EMAILS`, which both
+the API and the web server read). Anyone else gets a 404 from the server, not a hidden tab; the
+API checks every admin request on its own as well. It has two parts:
+
+- **Dashboard.** Platform-wide numbers for tracking: polymers designed, excipient screens,
+  campaigns, simulations, users (dated by first activity) and model tokens, each with its trend
+  against the previous period; daily activity; screen outcomes, evidence grades and routes;
+  the designer's pipeline, backbones and campaign goals; simulation states and the Γ23
+  distribution. **Counts only**: `api/stats.py` aggregates and never selects an excipient,
+  protein, prompt, structure or email, and the smoke test checks the response for them.
+- **Approvals.** Every user's waiting, approved and running simulations. Approve as a GPU run
+  or a CPU preview, switch an approved job's kind before a worker takes it, deny it, or stop it
+  while it runs (the worker drops it at its next heartbeat). Shows which workers are online.
+
 **Following them: the Simulations tab.** Every user sees their own simulations across all
 campaigns (waiting, running, done, failed), and each opens with its result and its own slice of
 history: queued, approved (and as what), each attempt, and how it ended.

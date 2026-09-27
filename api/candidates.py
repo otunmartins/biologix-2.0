@@ -382,30 +382,53 @@ def _job_info(conn: psycopg.Connection, row: dict) -> dict:
 
 def approve(conn: psycopg.Connection, candidate_id: str, admin_id: int,
             tier: str = "gpu") -> dict | None:
-    """Let a worker of this tier run this job. None unless it is queued, not yet
-    approved, and has a structure to run against (one without could not be claimed)."""
+    """Let a worker of this tier run this job, or move an approved job that no
+    worker has taken yet to the other tier. None unless it is queued, has a
+    structure to run against, and is not already approved for this tier."""
     if tier not in TIERS:
         raise ValueError(f"tier must be one of {TIERS}")
     with db.tx(conn):
         row = conn.execute(
             "UPDATE candidate SET sim_approved_at=now(), sim_approved_by=%s, sim_tier=%s, "
             "  updated_at=%s "
-            "WHERE id=%s AND status='queued' AND sim_approved_at IS NULL AND sim_structure_id <> '' "
-            "RETURNING *", (admin_id, tier, _now(), candidate_id)).fetchone()
+            "WHERE id=%s AND status='queued' AND sim_structure_id <> '' "
+            "  AND (sim_approved_at IS NULL OR sim_tier IS DISTINCT FROM %s) "
+            "RETURNING *", (admin_id, tier, _now(), candidate_id, tier)).fetchone()
         return _job_info(conn, row) if row else None
 
 
 def decline(conn: psycopg.Connection, candidate_id: str, reason: str) -> dict | None:
-    """Take a waiting job out of the queue without running it. It ends 'failed'
-    with the reason, so the user sees why and can queue it again. A running job
-    cannot be declined: its GPU time is already being spent."""
+    """Deny any active job: waiting, approved, or running. It ends 'failed' with
+    the reason, so the user sees why and can queue it again. A running job is
+    stopped: its worker is cleared, so the worker's next heartbeat (within a
+    minute) gets a 409 and it abandons the run, and a late result is refused.
+    Returns the job with 'was' set to the status it had, or None."""
     with db.tx(conn):
+        prev = conn.execute("SELECT status FROM candidate WHERE id=%s FOR UPDATE",
+                            (candidate_id,)).fetchone()
+        if prev is None or prev["status"] not in ACTIVE:
+            return None
+        why = "Stopped by an admin" if prev["status"] == "simulating" else "Not approved"
         row = conn.execute(
-            "UPDATE candidate SET status='failed', sim_error=%s, sim_approved_at=NULL, "
-            "  sim_approved_by=NULL, sim_tier=NULL, updated_at=%s "
-            "WHERE id=%s AND status='queued' RETURNING *",
-            (f"Not approved: {reason}"[:2000], _now(), candidate_id)).fetchone()
-        return _job_info(conn, row) if row else None
+            "UPDATE candidate SET status='failed', sim_error=%s, sim_worker=NULL, "
+            "  sim_approved_at=NULL, sim_approved_by=NULL, sim_tier=NULL, sim_progress=NULL, "
+            "  sim_finished_at=CASE WHEN status='simulating' THEN now() ELSE sim_finished_at END, "
+            "  updated_at=%s "
+            "WHERE id=%s RETURNING *",
+            (f"{why}: {reason}"[:2000], _now(), candidate_id)).fetchone()
+        return {**_job_info(conn, row), "was": prev["status"]}
+
+
+def recent_finished(conn: psycopg.Connection, limit: int = 20) -> list[dict]:
+    """Every user's most recently finished or denied jobs, for the admin."""
+    rows = conn.execute(
+        "SELECT c.*, u.email AS owner_email FROM candidate c "
+        "JOIN campaign cp ON cp.id=c.campaign_id LEFT JOIN users u ON u.id=cp.owner_id "
+        "WHERE c.status IN ('simulated','failed') "
+        "  AND (c.sim_attempts > 0 OR c.sim_error IS NOT NULL OR c.sim_result IS NOT NULL) "
+        "ORDER BY c.updated_at DESC LIMIT %s", (limit,)).fetchall()
+    return [{**_hydrate(r), "campaign_id": r["campaign_id"], "owner_email": r["owner_email"],
+             "updated_at": r["updated_at"]} for r in rows]
 
 
 def all_active(conn: psycopg.Connection, limit: int = 200) -> list[dict]:

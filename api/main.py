@@ -57,6 +57,7 @@ from polymer import PolymerSpec
 import precedent
 import profile
 import runpod
+import stats
 import users
 
 # ---------------------------------------------------------------------------
@@ -1454,12 +1455,29 @@ CPU_PREVIEW_NS = float(os.environ.get("SIM_CPU_PREVIEW_NS", "1.0"))
 CPU_PREVIEW_EQUIL_NS = float(os.environ.get("SIM_CPU_PREVIEW_EQUIL_NS", "0.1"))
 
 
+# Which workers have asked for work lately, and on what. In memory: it answers
+# "is a CPU or GPU worker actually online right now?", which needs no history.
+_WORKERS: dict[str, dict] = {}
+
+
+def _seen(name: str, platform: str | None = None) -> None:
+    w = _WORKERS.setdefault(name, {"platform": platform or "?"})
+    if platform:
+        w["platform"] = platform
+        w["tier"] = "cpu" if platform.strip().upper() in ("CPU", "REFERENCE") else "gpu"
+    w["last_seen"] = datetime.now(timezone.utc).isoformat()
+
+
 @app.get("/design/simulations")
 def simulations_view(admin_id: int = Depends(users.current_admin)):
-    """Every user's simulations that are waiting or running."""
+    """The admin screen: every user's waiting and running jobs, the most recent
+    finished or denied ones, and which workers have checked in."""
     conn = candidates.connect()
     try:
-        return {"jobs": candidates.all_active(conn), "pod_autostart": runpod.configured()}
+        return {"jobs": candidates.all_active(conn), "recent": candidates.recent_finished(conn),
+                "workers": [{"name": k, **v} for k, v in sorted(
+                    _WORKERS.items(), key=lambda kv: kv[1]["last_seen"], reverse=True)],
+                "pod_autostart": runpod.configured(), "cpu_preview_ns": CPU_PREVIEW_NS}
     finally:
         conn.close()
 
@@ -1472,13 +1490,29 @@ def simulation_approve(job_id: str, body: Approve | None = None,
     try:
         job = candidates.approve(conn, job_id, admin_id, tier)
         if job is None:
-            raise HTTPException(status_code=409, detail="not a queued, unapproved job with a structure")
+            raise HTTPException(status_code=409, detail=(
+                "only a waiting job with a structure can be approved, and not twice for the same "
+                "kind of run; a running job can only be stopped"))
         _log_sim(conn, job, "candidate.approved", {"tier": tier})
     finally:
         conn.close()
     # Only a GPU run needs the RunPod pod; a CPU preview goes to a CPU worker.
     pod = runpod.start_pod() if tier == "gpu" else "not needed: a CPU worker runs this preview"
     return {"ok": True, "tier": tier, "pod": pod}
+
+
+@app.get("/design/admin/stats")
+def admin_stats(days: int = Query(90, ge=7, le=365), admin_id: int = Depends(users.current_admin)):
+    """The admin dashboard: platform-wide counts, trends and distributions.
+    Aggregates only -- see stats.py for what may and may not appear here."""
+    # history.connect has campaigns, candidates, screens and events; the measurement
+    # table is the one it does not create.
+    conn = history.connect()
+    try:
+        db.init_schema(conn, measurements.SCHEMA)
+        return stats.dashboard(conn, days)
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1524,9 +1558,11 @@ def simulation_decline(job_id: str, body: Decline, admin_id: int = Depends(users
     try:
         job = candidates.decline(conn, job_id, body.reason)
         if job is None:
-            raise HTTPException(status_code=409, detail="only a job still waiting can be declined")
-        _log_sim(conn, job, "candidate.declined", {"reason": body.reason})
-        return {"ok": True}
+            raise HTTPException(status_code=409, detail="only a waiting, approved or running job can be denied")
+        stopped = job["was"] == "simulating"
+        _log_sim(conn, job, "candidate.stopped" if stopped else "candidate.declined",
+                 {"reason": body.reason})
+        return {"ok": True, "stopped": stopped}
     finally:
         conn.close()
 
@@ -1665,6 +1701,7 @@ def worker_claim(hello: WorkerClaim, request: Request):
     AlphaFold, the same code the liability scan uses) and handed over whole, so
     the worker needs no network access beyond this API."""
     _worker_auth(request)
+    _seen(hello.worker, hello.platform)
     conn = history.connect()
     try:
         for row in candidates.requeue_stale(conn):
@@ -1723,6 +1760,7 @@ def worker_claim(hello: WorkerClaim, request: Request):
 def worker_heartbeat(job_id: str, body: WorkerProgress, request: Request):
     """409 means the job is no longer this worker's: stop and drop it."""
     _worker_auth(request)
+    _seen(body.worker)
     conn = candidates.connect()
     try:
         if not candidates.heartbeat(conn, job_id, body.worker, body.progress):
