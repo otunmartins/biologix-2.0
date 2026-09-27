@@ -106,5 +106,5 @@ jobs:
       - name: docker-compose.yml parses
         run: cp .env.example .env && docker compose config -q
 
-      - name: ...with the worker and its GPU override
-        run: COMPOSE_PROFILES=worker docker compose -f docker-compose.yml -f docker-compose.gpu.yml config -q
+      - name: ...with the worker profile
+        run: COMPOSE_PROFILES=worker docker compose config -q

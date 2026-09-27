@@ -195,16 +195,9 @@ Two things that bite here:
 - The frontend, API, and Caddy's reverse proxy all share one origin in the deployed stack, so
   there's no CORS issue in production. The CORS middleware in `api/main.py` is there for local dev.
 
-**When you move to a GPU instance later:** request the quota increase first — new AWS accounts
-default to a vCPU limit of 0 for the G/VT families, so `terraform apply` fails outright on a fresh
-account. Service Quotas → EC2 → "Running On-Demand G and VT instances" → request at least 4 vCPUs
-for a g5.xlarge. Approval takes anywhere from minutes to a couple of days. Then apply with
-`-var="instance_type=g5.xlarge" -var="ami_id=<a Deep Learning AMI>"`.
-
-**Before relying on GPU passthrough for anything (OpenMM later):** confirm it actually works —
-`docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi` should print your GPU.
-The Deep Learning AMI usually has the NVIDIA driver and container toolkit preinstalled, but check
-before you build anything that depends on it.
+**No GPU here.** This box never runs simulations: the OpenMM worker runs on a RunPod GPU pod and
+pulls its work from this box over HTTPS (see "OpenMM simulations" below). The account has no AWS
+G-instance quota, so don't point `instance_type` at a GPU type.
 
 ## What's real vs. simplified right now
 
@@ -538,19 +531,38 @@ the default 1,500-residue cap once solvated. Use a Fab or Fc entry.
 can reach the API. It heartbeats every minute; a job whose worker goes quiet for 20 minutes is
 requeued, and failed after three attempts. Jobs run highest triage score first.
 
-**Turning it on** on a box with an NVIDIA GPU and Docker:
+**Turning it on: a RunPod GPU pod.** The EC2 box has no GPU (AWS's G-instance quota is not
+available on this account), so the worker runs on RunPod and reaches the API through its public
+URL; Caddy routes `/worker*` to the API. The app must already be deployed on its domain with HTTPS.
 
-1. In the server `.env`: `WORKER_TOKEN=<openssl rand -hex 32>`, `COMPOSE_PROFILES=worker` and
-   `COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml`.
-2. Confirm the GPU reaches containers:
-   `docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi`.
-3. Deploy as usual; `docker compose logs -f worker` shows each job's progress.
+1. **A token.** On the server, add `WORKER_TOKEN=<openssl rand -hex 32>` to `.env` and run
+   `docker compose up -d api` so the API picks it up. Check it:
+   `curl -X POST https://<your-domain>/worker/claim` should now answer 401 (bad token), not 503.
+2. **The image.** Merging to main runs `.github/workflows/worker-image.yml`, which publishes
+   `ghcr.io/otunmartins/biologix-worker:latest` (or run it by hand from the Actions tab). The
+   first time, open the package on GitHub (profile → Packages → biologix-worker → Package
+   settings) and set its visibility to **Public**, so RunPod can pull it without credentials.
+3. **A template.** RunPod → Templates → New Template, type Pod:
+   - Container image: `ghcr.io/otunmartins/biologix-worker:latest`
+   - Container disk: 20 GB (the image is about 6.5 GB unpacked). No volume, no exposed ports.
+   - Environment variables: `API_URL=https://<your-domain>`, `WORKER_TOKEN=<the same token>`,
+     `OPENMM_PLATFORM=CUDA`, and `IDLE_STOP_MINUTES=30`. Mark `WORKER_TOKEN` as a secret.
+4. **A pod.** Deploy a Pod from the template on one GPU, with **On-Demand** pricing, not Spot:
+   a pre-empted spot pod loses the run in progress. An RTX 4090, L4 or A40 is plenty, since OpenMM
+   runs one small system per GPU. Use the CUDA filter to pick hosts with CUDA 12.x or newer
+   (the image needs an NVIDIA driver ≥ 525).
+5. **Check it.** The pod's logs should show `platforms [..., 'CUDA']` on the first line, then
+   claim queued candidates. A queued candidate's card switches to "Running: ..." with the
+   current stage.
 
-A worker somewhere else (a rented GPU) runs the same image with `API_URL=https://<your-domain>`
-and the same `WORKER_TOKEN`; Caddy routes `/worker*` to the API.
+**Cost control.** A pod bills every hour it is up, busy or not. With `IDLE_STOP_MINUTES` set,
+the worker stops its own pod once the queue has been empty that long, using the pod-scoped API
+key RunPod puts in every pod. Stopped pods cost only a little for disk. After queueing new
+candidates, start the pod again from the RunPod console. If the stop call fails, the log says so;
+stop the pod by hand then, or it keeps billing.
 
 **Timing.** A 20 ns run of a Fab-sized system (about 100,000 atoms) takes roughly 3 to 6 hours on
-an A10G. On a CPU it would take days, so the CPU is used only for the smoke test
+an A10G-class GPU. On a CPU it would take days, so the CPU is used only for the smoke test
 (`python worker/smoke.py`, and in CI), which proves every stage runs: about 15 minutes on two
 cores, 12,817 atoms for a few picoseconds.
 

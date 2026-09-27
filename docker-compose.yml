@@ -59,11 +59,10 @@ services:
       - iid_cache:/cache
     restart: unless-stopped
 
-  # The OpenMM simulation worker (worker/). Off unless the "worker" profile is
-  # on -- COMPOSE_PROFILES=worker in .env -- because it is a multi-GB image that
-  # only earns its keep on a box with a GPU. On one, also layer
-  # docker-compose.gpu.yml so the container can see it. It reaches the API over
-  # the compose network; a worker elsewhere uses the public URL instead.
+  # The OpenMM simulation worker (worker/), for trying it locally on a CPU:
+  # `docker compose --profile worker up`. Off by default because it is a
+  # multi-GB image. Real runs happen on a RunPod GPU pod using the published
+  # image, which reaches the API through its public URL instead.
   worker:
     build: ./worker
     profiles: ["worker"]
