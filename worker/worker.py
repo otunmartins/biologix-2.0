@@ -11,6 +11,10 @@ that can reach the API: the GPU box itself, or a rented GPU elsewhere.
     WORKER_TOKEN   the same secret the API has
     WORKER_NAME    shown on each job; defaults to the hostname
     POLL_SECONDS   how long to sleep when the queue is empty (default 30)
+    IDLE_STOP_MINUTES  stop after this long with an empty queue (default 0: never).
+                   On a RunPod pod it stops the pod itself, via the pod-scoped
+                   RUNPOD_API_KEY RunPod injects, so an idle GPU stops billing;
+                   anywhere else the process just exits.
     SIM_*          simulation settings, see simulate.Settings
 
 While a job runs, a background thread heartbeats every minute with progress.
@@ -36,6 +40,7 @@ API_URL = os.environ.get("API_URL", "http://api:8000").rstrip("/")
 TOKEN = os.environ.get("WORKER_TOKEN", "")
 NAME = os.environ.get("WORKER_NAME") or socket.gethostname()
 POLL = float(os.environ.get("POLL_SECONDS", "30"))
+IDLE_STOP = float(os.environ.get("IDLE_STOP_MINUTES", "0")) * 60
 BEAT = 60.0
 
 
@@ -102,6 +107,26 @@ def run_one(client: httpx.Client) -> bool:
     return True
 
 
+def stop() -> None:
+    """The queue has been empty for IDLE_STOP_MINUTES: stop paying for the GPU."""
+    pod, key = os.environ.get("RUNPOD_POD_ID"), os.environ.get("RUNPOD_API_KEY")
+    if pod and key:
+        log(f"idle for {IDLE_STOP / 60:g} min; stopping RunPod pod {pod}")
+        try:
+            r = httpx.post(f"https://rest.runpod.io/v1/pods/{pod}/stop",
+                           headers={"Authorization": f"Bearer {key}"}, timeout=60)
+            r.raise_for_status()
+            # The container is killed from outside; wait for it rather than
+            # exit, which RunPod would answer by restarting us.
+            time.sleep(600)
+        except httpx.HTTPError as e:
+            log(f"could not stop the pod ({type(e).__name__}: {e}); "
+                "stop it in the RunPod console or it keeps billing")
+    else:
+        log(f"idle for {IDLE_STOP / 60:g} min; exiting")
+    sys.exit(0)
+
+
 def main() -> None:
     if not TOKEN:
         sys.exit("WORKER_TOKEN is not set")
@@ -111,6 +136,7 @@ def main() -> None:
                  for i in range(openmm.Platform.getNumPlatforms())]
     log(f"worker {NAME}: OpenMM {openmm.__version__}, platforms {platforms}, API {API_URL}")
     headers = {"Authorization": f"Bearer {TOKEN}"}
+    idle_since = time.monotonic()
     with httpx.Client(base_url=API_URL, headers=headers, timeout=120) as client:
         while True:
             try:
@@ -120,7 +146,11 @@ def main() -> None:
                 had_job = False
             if once:
                 return
-            if not had_job:
+            if had_job:
+                idle_since = time.monotonic()
+            elif IDLE_STOP and time.monotonic() - idle_since >= IDLE_STOP:
+                stop()
+            else:
                 time.sleep(POLL)
 
 

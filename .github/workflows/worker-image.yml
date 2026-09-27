@@ -1,0 +1,45 @@
+name: Worker image
+
+# Publishes the OpenMM worker's image to GitHub's container registry, where the
+# RunPod GPU pod pulls it from: ghcr.io/<owner>/biologix-worker. The EC2 box
+# never runs the worker, so the deploy workflow does not touch it.
+#
+# :latest is what a RunPod template should use; each build is also tagged with
+# its commit so a result's engine line can be traced back to an exact image.
+on:
+  push:
+    branches: [main]
+    paths: ["worker/**", ".github/workflows/worker-image.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: worker-image
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR wants the owner in lower case; github.repository_owner may not be.
+      - name: Image name
+        id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/biologix-worker" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./worker
+          push: true
+          tags: |
+            ${{ steps.name.outputs.image }}:latest
+            ${{ steps.name.outputs.image }}:${{ github.sha }}
