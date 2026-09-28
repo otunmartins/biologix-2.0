@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import {
+  plainError,
   resolveStructure,
   type CandidateStatus,
   type DesignGoal,
@@ -202,7 +203,7 @@ export function SimulationPanel({
             : sim.structure_id
             ? 'Approved as a GPU run. Waiting for the GPU worker; approved runs go highest triage score first.'
             : 'Queued before structures were asked for. Queue it again with the biologic’s PDB ID or UniProt accession to run it.'}
-          {sim.error && <span className="mt-1 block text-slate-500">{sim.error}</span>}
+          {sim.error && <span className="mt-1 block text-slate-500">{plainError(sim.error)}</span>}
         </p>
       )}
       {status === 'simulating' && (
@@ -212,7 +213,7 @@ export function SimulationPanel({
       )}
       {status === 'failed' && (
         <p className="text-sm leading-relaxed text-alert">
-          Failed{sim.attempts > 1 ? ` after ${sim.attempts} attempts` : ''}: {sim.error}
+          Failed{sim.attempts > 1 ? ` after ${sim.attempts} attempts` : ''}: {plainError(sim.error)}
         </p>
       )}
       {status === 'simulated' && r && (() => {

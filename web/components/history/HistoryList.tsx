@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
-import type { HistoryItem, Verdict } from '@/lib/api';
+import { IS_DEV, type HistoryItem, type Verdict } from '@/lib/api';
 import { dayKey, dayLabel, timeOfDay } from '@/lib/when';
 import { VERDICT_STYLE } from '../badges';
 import { Spinner } from '../icons';
@@ -59,7 +59,8 @@ function Title({ item }: { item: HistoryItem }) {
 function Meta({ item }: { item: HistoryItem }) {
   if (item.kind === 'screen') {
     if (item.status === 'failed') {
-      return <span className="text-alert">Failed · {item.error?.replace(/^agent run failed: /, '').slice(0, 60)}</span>;
+      // The raw error is for developers; the full text stays on the record.
+      return <span className="text-alert">{IS_DEV ? `Failed · ${item.error?.replace(/^agent run failed: /, '').slice(0, 60)}` : 'Failed · did not finish'}</span>;
     }
     return (
       <>
