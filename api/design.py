@@ -210,7 +210,11 @@ class DesignGoal(BaseModel):
     # a polyanion binds a net-positive protein, which is complexation, not
     # stabilisation. None means unknown, and no charge rule is applied.
     net_charge: float | None = None
-    ph: float | None = None
+    ph: float | None = Field(default=None, ge=0, le=14)
+    # Solution conditions the user states, which the simulation then runs at
+    # (conditions.py); None when unstated, and the default is used and says so.
+    salt_mm: float | None = Field(default=None, ge=0, le=5000)
+    polymer_wv_percent: float | None = Field(default=None, gt=0, le=50)
     notes: str = Field(default="", max_length=1000)
     # The biologic itself, as a PDB ID (1IGT) or UniProt accession (P01857, whose
     # AlphaFold model is used). What the OpenMM worker simulates the polymer

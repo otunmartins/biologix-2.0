@@ -260,6 +260,9 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
   const [designPrompt, setDesignPrompt] = useState('');
   const [campaign, setCampaign] = useState<CampaignView | null>(null);
   const [queueingId, setQueueingId] = useState<string | null>(null);
+  // Shown on the candidate's own card: the page-level notice is scrolled far
+  // out of view by then, which made a refused queue look like a dead button.
+  const [queueError, setQueueError] = useState<{ id: string; message: string } | null>(null);
   const [form, setForm] = useState<Form>(DEFAULT_FORM);
   const [freeText, setFreeText] = useState(
     'Is polysorbate 80 a concern for my antibody given subcutaneously, stored at room temperature?',
@@ -479,11 +482,28 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
     setWorkflow('design');
   }, []);
 
+  const campaignId = campaign?.campaignId;
   const queueCandidate = useCallback(async (c: StoredCandidate, structureId: string) => {
     setQueueingId(c.id);
-    setError(null);
+    setQueueError(null);
     try {
-      await queueCandidates([c.id], structureId);
+      const r = await queueCandidates([c.id], structureId);
+      if (r.queued === 0) {
+        // The server changed nothing: the candidate is already queued, running or
+        // done there. Say so and show what it holds, rather than a card that
+        // claims a queue the admin never sees.
+        setQueueError({
+          id: c.id,
+          message: 'Not queued: this candidate is already waiting, running or finished. Its card now shows its current state.',
+        });
+        const s = await getCampaign(campaignId ?? '');
+        setCampaign((prev) =>
+          prev && prev.campaignId === s.campaign_id
+            ? { ...prev, goal: s.goal, candidates: Object.values(s.candidates_by_iteration).flat() }
+            : prev,
+        );
+        return;
+      }
       setCampaign((prev) => {
         if (!prev) return prev;
         const sid = structureId.toUpperCase() || prev.goal.structure_id || '';
@@ -507,16 +527,15 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
         };
       });
     } catch (e) {
-      setError((e as Error).message);
+      setQueueError({ id: c.id, message: (e as Error).message });
     } finally {
       setQueueingId(null);
     }
-  }, []);
+  }, [campaignId]);
 
   // While any candidate is waiting on or running a simulation, refresh the
   // campaign now and then so progress and results appear without a reload.
   const activeSims = campaign?.candidates.some((c) => c.status === 'queued' || c.status === 'simulating');
-  const campaignId = campaign?.campaignId;
   useEffect(() => {
     if (!activeSims || !campaignId) return;
     const ctl = new AbortController();
@@ -731,6 +750,8 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
                     onScreen={screenCandidate}
                     onQueue={queueCandidate}
                     queueing={queueingId}
+                    queueError={queueError}
+                    prompt={campaign.prompt}
                   />
                 ) : (
                   <DesignEmpty />
