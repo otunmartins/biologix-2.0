@@ -1,4 +1,6 @@
-# Excipient Screen — Next.js + FastAPI + Terraform
+# Biologix 2.0 — Next.js + FastAPI + Terraform
+
+By [Algonix AI](#). Excipient triage, polymer design and molecular dynamics for biologic formulations.
 
 A triage tool: give it an excipient, a protein sequence, a route, a dose, and a storage
 temperature, and it returns a short dossier of per-endpoint verdicts and protein liability flags.
