@@ -47,7 +47,7 @@ export default function AdminApp({ user }: { user: SessionUser }) {
           ))}
         </nav>
         <div className="flex items-center gap-3">
-          <Link href="/" className="rounded-lg px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-100">
+          <Link href="/screen" className="rounded-lg px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-100">
             ← Back to app
           </Link>
           <UserMenu user={user} />

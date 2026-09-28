@@ -1,6 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
+import { usePathname, useRouter } from 'next/navigation';
 import DesignPanel, { type CurrentExperiment } from '@/components/DesignPanel';
 import DesignResults from '@/components/DesignResults';
 import Results from '@/components/Results';
@@ -218,6 +220,19 @@ function LoadingState({ elapsed }: { elapsed: number }) {
 
 type Workflow = 'screen' | 'design' | 'results' | 'history';
 
+const TABS: readonly [Workflow, string][] = [
+  ['screen', 'Screen'],
+  ['design', 'Design'],
+  ['results', 'Results'],
+  ['history', 'History'],
+];
+
+// The tab is the first part of the address: /design, /history and so on.
+function workflowOf(pathname: string): Workflow {
+  const first = pathname.split('/')[1];
+  return TABS.find(([w]) => w === first)?.[0] ?? 'screen';
+}
+
 interface CampaignView {
   campaignId: string;
   iteration: number;
@@ -253,9 +268,12 @@ function campaignFromState(s: CampaignState): CampaignView {
   };
 }
 
-// The signed-in app. app/page.tsx renders it only once there is a session.
+// The signed-in app, mounted once by app/(workspace)/layout.tsx for every tab,
+// so its state outlives moving between them. Which tab is showing is the URL's.
 export default function Workbench({ user, isAdmin = false }: { user: SessionUser; isAdmin?: boolean }) {
-  const [workflow, setWorkflow] = useState<Workflow>('screen');
+  const workflow = workflowOf(usePathname());
+  const router = useRouter();
+  const setWorkflow = useCallback((w: Workflow) => router.push(`/${w}`), [router]);
   const [mode, setMode] = useState<Mode>('form');
   const [designPrompt, setDesignPrompt] = useState('');
   const [campaign, setCampaign] = useState<CampaignView | null>(null);
@@ -463,7 +481,7 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
     setLoading(false);
     setError(r.status === 'failed' ? r.error : null);
     setWorkflow('screen');
-  }, []);
+  }, [setWorkflow]);
 
   const rerunScreen = useCallback(
     (r: ScreenRecord) => {
@@ -480,7 +498,7 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
     setLoading(false);
     setError(null);
     setWorkflow('design');
-  }, []);
+  }, [setWorkflow]);
 
   const campaignId = campaign?.campaignId;
   const queueCandidate = useCallback(async (c: StoredCandidate, structureId: string) => {
@@ -598,7 +616,7 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
     setWorkflow('screen');
     setDossier(null);
     setError(null);
-  }, []);
+  }, [setWorkflow]);
 
   const currentExperiment: CurrentExperiment | null = campaign && {
     prompt: campaign.prompt,
@@ -638,28 +656,18 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
         <BiologixLockup />
 
         <nav className="order-last flex w-full rounded-lg bg-slate-100 p-1 text-sm font-medium sm:order-none sm:w-auto">
-          {(
-            [
-              ['screen', 'Screen'],
-              ['design', 'Design'],
-              ['results', 'Results'],
-              ['history', 'History'],
-            ] as const
-          ).map(([w, label]) => (
-            <button
+          {TABS.map(([w, label]) => (
+            <Link
               key={w}
-              type="button"
-              onClick={() => {
-                setWorkflow(w);
-                setError(null);
-              }}
-              aria-current={workflow === w}
-              className={`flex-1 rounded-md px-4 py-1.5 transition sm:flex-none ${
+              href={`/${w}`}
+              onClick={() => setError(null)}
+              aria-current={workflow === w ? 'page' : undefined}
+              className={`flex-1 rounded-md px-4 py-1.5 text-center transition sm:flex-none ${
                 workflow === w ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'
               }`}
             >
               {label}
-            </button>
+            </Link>
           ))}
         </nav>
         <div className="flex items-center gap-3">
