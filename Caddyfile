@@ -2,6 +2,20 @@
 #   SITE_ADDRESS=:80                 -> plain HTTP, fine for a bare EC2 IP
 #   SITE_ADDRESS=screen.example.com  -> Caddy gets a Let's Encrypt cert on its own
 {$SITE_ADDRESS::80} {
+	# One JSON line per request, to Docker's log (capped at 3 x 10 MB by
+	# /etc/docker/daemon.json): `docker compose logs caddy` shows who asked for
+	# what, with status and timing. Headers that carry credentials are redacted.
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>headers>Cookie delete
+				request>headers>Authorization delete
+			}
+		}
+	}
+
 	# The API, under its own prefix, which is stripped before it reaches it
 	# (/_api/design/iterate arrives as /design/iterate). The web's pages have the
 	# same names as API routes -- /screen, /design, /history -- so the API cannot

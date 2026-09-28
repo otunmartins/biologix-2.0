@@ -19,7 +19,8 @@ services:
     build:
       context: ./web
       args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+        # Only for a local build; the deploy builds on GitHub with PUBLIC_API_URL.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
     environment:
       # Sign-in (web/auth.ts). Read at runtime, unlike NEXT_PUBLIC_API_URL, so
       # changing these needs a restart, not a rebuild.
