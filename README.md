@@ -534,14 +534,28 @@ It is **not an m-value**: that needs the unfolded state as well. A result is sti
 experiment agrees.
 
 **The system** (`worker/simulate.py`): the structure from RCSB or AlphaFold (low-confidence
-AlphaFold termini trimmed, internal gaps filled by PDBFixer, protonated at the goal's pH), Amber
-ff14SB for the protein, OpenFF Sage 2.2 with NAGL AM1-BCC charges for the polymer, TIP3P with
-0.15 M NaCl, 5% w/v polymer (at least 4 chains), C-alpha atoms restrained to hold the native fold,
-4 fs with hydrogen mass repartitioning, 1 ns equilibration and 20 ns production by default.
+AlphaFold termini trimmed, internal gaps filled by PDBFixer), Amber ff14SB for the protein, OpenFF
+Sage 2.2 with NAGL AM1-BCC charges for the polymer, TIP3P water, at least 4 polymer chains, C-alpha
+atoms restrained to hold the native fold, 4 fs with hydrogen mass repartitioning, 1 ns
+equilibration and 20 ns production by default.
 
-**The target structure.** Give a PDB ID or UniProt accession in the design prompt, or when
-queueing the first candidate; the campaign remembers it. Whole IgGs (about 1,300 residues) are over
-the default 1,500-residue cap once solvated. Use a Fab or Fc entry.
+**The conditions follow the request** (`api/conditions.py`). Temperature, pH, salt and polymer
+concentration are read from what the user wrote ("40 °C", "pH 5.5", "in PBS", "2% polymer") and
+the worker runs at them: the thermostat, the protein's protonation, the NaCl added and the chains
+packed. Anything unstated takes a default (25 °C, pH 7, 150 mM NaCl, 5% w/v) and is shown as a
+default on the card before the run. A value beyond what a simulation can take is held to the limit
+(0 to 95 °C, pH 2 to 12, up to 1 M salt, 0.5 to 20% w/v) with a note, and shelf life, route and a
+freeze-dried form are noted as not simulated. The worker reports what it applied
+(`SimulationResult.conditions`), and that, not the request, is what the measurement records.
+
+**The target structure** (`api/structures.py`). Name the biologic in any words ("adalimumab",
+"Humira, a TNF antibody", "human insulin") and the API finds its structure: an ID in the text wins;
+otherwise the PDB entries whose every protein chain is that biologic (not bound to its target, not a
+relative such as its receptor, not a hybrid), unmodified and human first, then the smallest; otherwise
+the reviewed UniProt entry, run as its AlphaFold model. Nothing found means the user is asked for an
+ID, never a stand-in. The queue box shows the pick, why, and alternatives, and the campaign remembers
+it. A crystal holding several copies (4NYL, the adalimumab Fab, has four) is sent to the worker as one
+copy when the whole is over the 1,500-residue cap.
 
 **How the worker runs.** It pulls jobs from the API over HTTP (`/worker/*`), authenticated by
 `WORKER_TOKEN`, so it needs no database credentials and can run on this box or anywhere else that

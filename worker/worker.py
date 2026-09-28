@@ -102,6 +102,12 @@ def settings_for(job: dict) -> simulate.Settings:
         if k in (job.get("settings") or {}):
             setattr(s, k, float(job["settings"][k]))
     s.preview = (job.get("settings") or {}).get("tier") == "cpu"
+    # The solution the user asked for: salt and polymer concentration per job
+    # (api/conditions.py has already held them to what a simulation can take).
+    asked = (job.get("conditions") or {}).get("values") or {}
+    for k in ("salt_mm", "polymer_wv_percent"):
+        if asked.get(k) is not None:
+            setattr(s, k, float(asked[k]))
     return s
 
 

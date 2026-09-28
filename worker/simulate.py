@@ -53,6 +53,7 @@ class Settings:
     timestep_fs: float = 4.0
     padding_nm: float = 2.5          # protein to box edge; the bulk domain lives here
     polymer_wv_percent: float = 5.0  # polymer concentration in the box, % w/v
+    salt_mm: float = 150.0           # NaCl added to the water, mM
     min_chains: int = 4
     max_chains: int = 40
     r_local_nm: float = 1.0
@@ -222,11 +223,19 @@ def run(job: dict, s: Settings, progress=lambda msg: None, should_stop=lambda: F
 
     t0 = time.time()
     notes: list[str] = []
-    temperature_k = float(job.get("temperature_c", 25.0)) + 273.15
-    ph = float(job.get("ph") or 7.0)
-    if job.get("format") == "lyophilised":
+    # The conditions the user asked for (api/conditions.py); a job from an API
+    # before "conditions" existed carries temperature and pH at the top level.
+    cond = job.get("conditions") or {}
+    asked = cond.get("values") or {}
+    temperature_k = float(asked.get("temperature_c", job.get("temperature_c", 25.0))) + 273.15
+    ph = float(asked.get("ph", job.get("ph") or 7.0))
+    notes += list(cond.get("notes") or [])
+    if not cond and job.get("format") == "lyophilised":
         notes.append("the biologic is lyophilised, but this is a solution simulation: it says how "
                      "the polymer distributes around the protein in water, not in the dried cake")
+    if abs(ph - 7.0) > 0.01:
+        notes.append(f"the protein is protonated for pH {ph:g}; the polymer keeps the charge "
+                     "states it was drawn with")
 
     progress("preparing the protein")
     top, pos, pnotes, n_res = prepare_protein(job["structure"]["mmcif"], job["structure"]["predicted"],
@@ -273,7 +282,7 @@ def run(job: dict, s: Settings, progress=lambda msg: None, should_stop=lambda: F
     for xyz in copies:
         modeller.add(ptop, xyz * unit.nanometer)
     modeller.addSolvent(ff, model="tip3p", boxSize=openmm.Vec3(L, L, L) * unit.nanometer,
-                        ionicStrength=0.15 * unit.molar, neutralize=True)
+                        ionicStrength=s.salt_mm / 1000 * unit.molar, neutralize=True)
 
     progress("creating the system")
     system = ff.createSystem(modeller.topology, nonbondedMethod=PME,
@@ -381,7 +390,11 @@ def run(job: dict, s: Settings, progress=lambda msg: None, should_stop=lambda: F
         "temperature_k": round(temperature_k, 2),
         "n_chains": n_chains,
         "engine": f"OpenMM {openmm.__version__}, {platform_name}",
-        "forcefields": f"Amber ff14SB / OpenFF 2.2.0 with {charge_model} charges / TIP3P, 0.15 M NaCl",
+        "forcefields": f"Amber ff14SB / OpenFF 2.2.0 with {charge_model} charges / TIP3P, "
+                       f"{s.salt_mm:g} mM NaCl",
+        # What was applied, whatever was asked: the record of what ran.
+        "conditions": {"temperature_c": round(temperature_k - 273.15, 2), "ph": ph,
+                       "salt_mm": s.salt_mm, "polymer_wv_percent": s.polymer_wv_percent},
         "structure_source": job["structure"].get("source", ""),
         "n_atoms": len(atoms),
         "wall_seconds": round(time.time() - t0, 1),

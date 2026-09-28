@@ -1,13 +1,15 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   getCampaign,
   getScreenRecord,
+  queueCandidates,
   type CampaignState,
   type HistoryEvent,
   type HistoryItem,
   type ScreenRecord,
+  type StoredCandidate,
 } from '@/lib/api';
 import { duration, fullStamp, timeOfDay } from '@/lib/when';
 import DesignResults, { GoalChips } from '../DesignResults';
@@ -17,8 +19,8 @@ import ScreenProvenance from './ScreenProvenance';
 import Sparkline from './Sparkline';
 
 // One experiment from the history, in full: what was asked, what came back, and
-// how it was produced. Opening it in the workspace is the only way to act on
-// it, so nothing here changes the record.
+// how it was produced. Queuing a candidate for simulation is the one action
+// taken from here; everything else happens in the workspace.
 
 const FORM_LABELS: Record<string, string> = {
   excipient: 'Excipient',
@@ -241,7 +243,36 @@ export function EventTimeline({ events }: { events: HistoryEvent[] }) {
   );
 }
 
-function CampaignDetail({ state, onOpen }: { state: CampaignState; onOpen: (s: CampaignState) => void }) {
+function CampaignDetail({ state: initial, onOpen }: { state: CampaignState; onOpen: (s: CampaignState) => void }) {
+  const [state, setState] = useState(initial);
+  const [queueingId, setQueueingId] = useState<string | null>(null);
+  const [queueError, setQueueError] = useState<{ id: string; message: string } | null>(null);
+  useEffect(() => setState(initial), [initial]);
+
+  // Whatever the server did, the reloaded campaign shows it; a refusal is said
+  // on the candidate's card.
+  const queue = useCallback(
+    async (c: StoredCandidate, structureId: string) => {
+      setQueueingId(c.id);
+      setQueueError(null);
+      try {
+        const r = await queueCandidates([c.id], structureId);
+        if (r.queued === 0) {
+          setQueueError({
+            id: c.id,
+            message: 'Not queued: this candidate is already waiting, running or finished. Its card now shows its current state.',
+          });
+        }
+        setState(await getCampaign(initial.campaign_id));
+      } catch (e) {
+        setQueueError({ id: c.id, message: (e as Error).message });
+      } finally {
+        setQueueingId(null);
+      }
+    },
+    [initial.campaign_id],
+  );
+
   const candidates = Object.values(state.candidates_by_iteration).flat();
   const best = state.metrics_history.map((m) => m.best_score_so_far);
   const bestNow = best.filter((v): v is number => v !== null).at(-1);
@@ -317,6 +348,10 @@ function CampaignDetail({ state, onOpen }: { state: CampaignState; onOpen: (s: C
           limits={state.limits}
           verdict="Data gap: test"
           readOnly
+          onQueue={queue}
+          queueing={queueingId}
+          queueError={queueError}
+          prompt={state.prompt ?? ''}
         />
       </section>
     </div>

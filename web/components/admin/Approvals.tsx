@@ -141,6 +141,9 @@ export default function Approvals({ onWaiting }: { onWaiting?: (n: number) => vo
     try {
       setNotice(await fn());
       await load();
+      // A polling worker takes an approved job within seconds; look again soon so
+      // the row shows it running rather than waiting out the 20 s refresh.
+      setTimeout(() => load(), 8000);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -228,7 +231,7 @@ export default function Approvals({ onWaiting }: { onWaiting?: (n: number) => vo
                     {j.status === 'queued' && (
                       <button type="button" disabled={busy === j.id || !waiting} onClick={() => setChoosing(j)}
                         title={waiting ? undefined : 'Cannot run until the user names the biologic’s PDB ID or UniProt accession'}
-                        className={`${btn} disabled:cursor-not-allowed${j.simulation?.approved_at ? 'border border-slate-300 text-slate-700 hover:bg-slate-50' : 'bg-slate-900 text-white hover:bg-slate-700'}`}>
+                        className={`${btn} disabled:cursor-not-allowed ${j.simulation?.approved_at ? 'border border-slate-300 text-slate-700 hover:bg-slate-50' : 'bg-slate-900 text-white hover:bg-slate-700'}`}>
                         {j.simulation?.approved_at ? 'Switch' : 'Approve'}
                       </button>
                     )}

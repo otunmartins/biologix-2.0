@@ -100,6 +100,10 @@ export interface DesignGoal {
   // The biologic's PDB ID or UniProt accession; what simulations run against.
   // Absent on campaigns started before it existed.
   structure_id?: string;
+  // Solution conditions the user stated; a simulation runs at them (lib/conditions.ts).
+  ph?: number | null;
+  salt_mm?: number | null;
+  polymer_wv_percent?: number | null;
 }
 
 export interface Candidate {
@@ -185,7 +189,11 @@ export interface SimulationResult {
   // The worker saved the last frame for the 3D view (absent on older runs).
   has_snapshot?: boolean;
   notes: string[];
+  // What the worker actually applied (absent on runs from before it reported them).
+  conditions?: Partial<Record<ConditionKey, number>>;
 }
+
+export type ConditionKey = 'temperature_c' | 'ph' | 'salt_mm' | 'polymer_wv_percent';
 
 // The simulation job on a candidate, once it has been queued.
 export interface SimulationJob {
@@ -831,6 +839,25 @@ export function getScreenRecord(id: string, signal?: AbortSignal): Promise<Scree
 
 export function getCampaign(id: string, signal?: AbortSignal): Promise<CampaignState> {
   return getJson(`/design/campaign/${encodeURIComponent(id)}`, signal);
+}
+
+export interface ResolvedStructure {
+  structure_id: string;
+  title: string;
+  source: string;
+  residues: number | null;
+  why: string;
+  alternatives: Omit<ResolvedStructure, 'alternatives'>[];
+}
+
+// The structure to simulate for a biologic named in the user's words, or null
+// when nothing fits (then the user is asked for an ID). See api/structures.py.
+export async function resolveStructure(q: string, signal?: AbortSignal): Promise<ResolvedStructure | null> {
+  const r = await getJson<{ found: boolean } & ResolvedStructure>(
+    `/structure/resolve?q=${encodeURIComponent(q.slice(0, 300))}`,
+    signal,
+  );
+  return r.found ? r : null;
 }
 
 // "New experiment": closes the campaign. It stays in history and reopens if continued.

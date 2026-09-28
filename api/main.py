@@ -49,6 +49,7 @@ import exposure
 import history
 import interactions
 import calibration
+import conditions
 import measurements
 import tg_model
 from design import DesignGoal
@@ -60,6 +61,7 @@ import profile
 import results
 import runpod
 import stats
+import structures
 import users
 
 # ---------------------------------------------------------------------------
@@ -943,6 +945,13 @@ Fill the fields from their words and nothing else:
   exposed_residues   - only residues they explicitly say are exposed or liable (Met, Trp,
               Cys, Lys, His, Asn). Empty list if they did not say. Never guess from the
               protein's name.
+  ph        - the formulation pH if they state one (e.g. "pH 5.5"), else null
+  salt_mm   - the salt (ionic strength) in mM NaCl-equivalent if they state it:
+              "150 mM NaCl" is 150, "0.1 M salt" is 100, "PBS" or "saline" is 150,
+              "no salt"/"salt-free" is 0. Null if they do not mention salt or a buffer
+              that implies it.
+  polymer_wv_percent - the polymer or excipient concentration in % w/v if they state
+              one ("2% polymer" is 2, "20 mg/mL" is 2). Null otherwise.
   notes     - anything else that constrains the formulation, briefly
   structure_id       - a PDB ID (4 characters, starting with a digit, e.g. 1IGT) or a
               UniProt accession (e.g. P01857) ONLY if they wrote one. Never look one up
@@ -1327,12 +1336,26 @@ def design_queue(req: QueueRequest, user_id: int = Depends(users.current_user)):
             # Fall back to the structure the campaign's goal names. Every campaign
             # the request touches must agree on one, or the caller must say which.
             goals = conn.execute(
-                "SELECT DISTINCT cp.goal FROM candidate c JOIN campaign cp ON cp.id=c.campaign_id "
-                "WHERE c.id = ANY(%s) AND cp.owner_id=%s", (req.candidate_ids, user_id)).fetchall()
-            found = {(json.loads(g["goal"]).get("structure_id") or "").strip().upper() for g in goals}
+                "SELECT DISTINCT cp.goal, cp.prompt FROM candidate c JOIN campaign cp "
+                "ON cp.id=c.campaign_id WHERE c.id = ANY(%s) AND cp.owner_id=%s",
+                (req.candidate_ids, user_id)).fetchall()
+            parsed = [json.loads(g["goal"]) for g in goals]
+            found = {(g.get("structure_id") or "").strip().upper() for g in parsed}
+            # The biologic as the goal names it, or else as the user's prompt does.
+            named = {((json.loads(g["goal"]).get("protein") or g["prompt"] or "")).strip()
+                     for g in goals} - {""}
             if len(found) == 1 and "" not in found:
                 structure_id = found.pop()
-            elif goals:
+            elif len(found) == 1 and len(named) == 1:
+                # The goal names the biologic but no structure: look it up rather
+                # than asking. Nothing found still asks (below).
+                try:
+                    hit = structures.resolve(named.pop())
+                except httpx.HTTPError:
+                    hit = None
+                if hit:
+                    structure_id = hit["structure_id"]
+            if not structure_id and goals:
                 raise HTTPException(status_code=422, detail={
                     "code": "structure_required",
                     "message": "Give the biologic's PDB ID or UniProt accession: the simulation "
@@ -1352,9 +1375,9 @@ def design_queue(req: QueueRequest, user_id: int = Depends(users.current_user)):
                                 + (f", and {names} already is." if names else
                                    "; queue a single candidate.")),
                     "active": e.active})
-            if req.structure_id:
+            if structure_id:
                 # Remembered on each campaign whose goal named none, so the user is
-                # asked once per campaign rather than once per candidate.
+                # asked (or it is looked up) once per campaign, not per candidate.
                 for row in conn.execute(
                         "SELECT DISTINCT cp.id, cp.goal FROM candidate c JOIN campaign cp "
                         "ON cp.id=c.campaign_id WHERE c.id = ANY(%s) AND cp.owner_id=%s",
@@ -1602,6 +1625,21 @@ def my_simulation_snapshot(job_id: str, user_id: int = Depends(users.current_use
     return Response(pdb, media_type="chemical/x-pdb", headers={"Cache-Control": "private, max-age=86400"})
 
 
+@app.get("/structure/resolve")
+def structure_resolve(q: str = Query(..., min_length=1, max_length=300),
+                      user_id: int = Depends(users.current_user)):
+    """The structure to simulate for a biologic named in the user's own words
+    ("adalimumab", "human insulin", a sentence, or an ID): what it is, why it
+    was picked, and a few alternatives. {"found": false} when nothing fits,
+    rather than a stand-in. See structures.py."""
+    try:
+        hit = structures.resolve(q.strip())
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502,
+                            detail=f"the structure databases did not answer ({type(e).__name__})") from e
+    return {"found": hit is not None, **(hit or {})}
+
+
 @app.get("/structure/model/{structure_id}")
 def structure_model(structure_id: str, user_id: int = Depends(users.current_user)):
     """A biologic's 3D structure as mmCIF, from RCSB or AlphaFold DB -- the same
@@ -1717,6 +1755,9 @@ class SimulationResult(BaseModel):
     # A short CPU run, not converged. Kept on the candidate, never a measurement.
     preview: bool = False
     notes: list[str] = Field(default_factory=list, max_length=20)
+    # The conditions the worker actually applied (conditions.py keys): what ran,
+    # which may differ from what was asked if the worker predates a condition.
+    conditions: dict[str, float] = Field(default_factory=dict, max_length=20)
     # The last frame, protein and polymer heavy atoms only, as PDB text
     # (worker/snapshot.py): the 3D view. Stored apart from the result.
     snapshot_pdb: str | None = Field(default=None, max_length=8_000_000)
@@ -1753,7 +1794,10 @@ def _record_simulation(job: dict, r: SimulationResult) -> str | None:
                            if r.bulk_chain_molar else f"{r.n_chains} chains in the box"),
             quantity="gamma23", value=r.gamma23, sd=r.gamma23_se,
             n_replicates=max(1, len(r.gamma23_blocks)),
-            buffer="water, 0.15 M NaCl (simulated)", ph=goal.get("ph") or 7.0,
+            # What the worker applied; a worker from before it reported them ran
+            # the old fixed 0.15 M NaCl and the goal's pH.
+            buffer=f"water, {r.conditions.get('salt_mm', 150.0):g} mM NaCl (simulated)",
+            ph=r.conditions.get("ph", goal.get("ph") or 7.0),
             format="liquid", stress=f"{r.temperature_k - 273.15:.0f} C",
             method="MD preferential interaction (two-domain)", instrument=r.engine[:120],
             source="simulation", simulation_detail=_sim_detail(r),
@@ -1798,6 +1842,11 @@ def worker_claim(hello: WorkerClaim, request: Request):
             sid = cand["simulation"]["structure_id"]
             try:
                 cif, source, predicted = accessibility._fetch(sid)
+                # A crystal with several copies of the molecule, too big for the
+                # worker whole: send one copy, and say so in the source.
+                cif, trimmed = structures.fit_for_worker(cif)
+                if trimmed:
+                    source = f"{source}; {trimmed}"
             except Exception as e:
                 err = f"could not fetch structure {sid}: {type(e).__name__}: {e}"[:500]
                 done = candidates.finish(conn, cand["id"], hello.worker, error=err)
@@ -1813,14 +1862,18 @@ def worker_claim(hello: WorkerClaim, request: Request):
             settings = ({"tier": "cpu", "production_ns": CPU_PREVIEW_NS,
                          "equilibration_ns": CPU_PREVIEW_EQUIL_NS}
                         if hello.tier == "cpu" else {"tier": "gpu"})
+            cond = conditions.for_goal(goal)
             return {
                 "job_id": cand["id"],
                 "candidate": {k: cand.get(k) for k in (
                     "id", "name", "screened_oligomer_smiles", "screened_units",
                     "repeat_unit_smiles", "composition", "charge")},
-                # Simulated at the temperature the biologic has to survive.
-                "temperature_c": goal.get("target_temp_c") if goal.get("target_temp_c") is not None else 25.0,
-                "ph": goal.get("ph") or 7.0,
+                # Simulated at the conditions the user asked for (conditions.py):
+                # temperature and pH also at the top level, for a worker built
+                # before "conditions" existed.
+                "temperature_c": cond["values"]["temperature_c"],
+                "ph": cond["values"]["ph"],
+                "conditions": cond,
                 "format": goal.get("format", "liquid"),
                 "protein": goal.get("protein", ""),
                 "structure": {"id": sid, "source": source, "predicted": predicted, "mmcif": cif},

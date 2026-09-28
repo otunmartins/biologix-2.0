@@ -1,11 +1,20 @@
 'use client';
 
-import { useState } from 'react';
-import type { CandidateStatus, DesignGoal, SimulationJob, StoredCandidate } from '@/lib/api';
+import { useEffect, useState } from 'react';
+import {
+  resolveStructure,
+  type CandidateStatus,
+  type DesignGoal,
+  type ResolvedStructure,
+  type SimulationJob,
+  type StoredCandidate,
+} from '@/lib/api';
 import { GradeBox } from './badges';
 import { CheckCircle, Chevron, Flask, Info, Triangle } from './icons';
 import MolViewer from '@/components/MolViewer';
 import Structure, { Smiles } from './Structure';
+import { formatCondition, planned } from '@/lib/conditions';
+import type { ConditionKey } from '@/lib/api';
 
 interface Props {
   goal: DesignGoal;
@@ -18,7 +27,12 @@ interface Props {
   // structure ('' when the campaign's goal already names one).
   onQueue?: (c: StoredCandidate, structureId: string) => void;
   queueing?: string | null;
-  // History shows a campaign as it stood; acting on it happens in the workspace.
+  // What the user asked, for finding the biologic when the goal names none.
+  prompt?: string;
+  // Why the last queue attempt failed, shown on that candidate's card.
+  queueError?: { id: string; message: string } | null;
+  // History shows a campaign as it stood: no screening from there, though a
+  // candidate can still be queued when onQueue is given.
   readOnly?: boolean;
 }
 
@@ -30,6 +44,9 @@ export function GoalChips({ goal: g }: { goal: DesignGoal }) {
     g.duration_months !== null ? `${g.duration_months} months` : null,
     g.format,
     g.exposed_residues.length ? `exposed ${g.exposed_residues.join(', ')}` : null,
+    g.ph != null ? `pH ${g.ph}` : null,
+    g.salt_mm != null ? `${g.salt_mm} mM salt` : null,
+    g.polymer_wv_percent != null ? `${g.polymer_wv_percent}% w/v polymer` : null,
     g.structure_id ? `structure ${g.structure_id}` : null,
   ].filter(Boolean) as string[];
   return (
@@ -240,7 +257,13 @@ export function SimulationPanel({
               </p>
             )}
             <p className="text-xs leading-relaxed text-slate-500">
-              {r.production_ns} ns at {Math.round(r.temperature_k - 273.15)} °C, {r.n_chains} chains,{' '}
+              {r.production_ns} ns at{' '}
+              {r.conditions
+                ? (Object.entries(r.conditions) as [ConditionKey, number][])
+                    .map(([k, v]) => formatCondition(k, v))
+                    .join(', ')
+                : `${Math.round(r.temperature_k - 273.15)} °C`}
+              , {r.n_chains} chains,{' '}
               {r.n_atoms.toLocaleString()} atoms, {r.n_frames} frames; {r.engine}; {r.forcefields}.{' '}
               {r.structure_source}. Chains per protein; the protein&rsquo;s backbone held to its native structure.
               {r.notes.length > 0 && ` ${r.notes.join('. ')}.`}
@@ -279,35 +302,169 @@ export function SimulationPanel({
   );
 }
 
+// The structure for the biologic the campaign names, looked up by the API
+// (api/structures.py) once per name and remembered for the page's life.
+const resolved = new Map<string, Promise<ResolvedStructure | null>>();
+
+function useResolvedStructure(query: string): ResolvedStructure | null | undefined {
+  const q = query.trim();
+  const [hit, setHit] = useState<{ q: string; value: ResolvedStructure | null } | null>(null);
+  useEffect(() => {
+    if (!q) return;
+    let live = true;
+    if (!resolved.has(q)) resolved.set(q, resolveStructure(q).catch(() => null));
+    resolved.get(q)!.then((value) => live && setHit({ q, value }));
+    return () => {
+      live = false;
+    };
+  }, [q]);
+  if (!q) return null;
+  return hit?.q === q ? hit.value : undefined; // undefined: still looking
+}
+
+// What is in the box, and why: the entry found for the named biologic, or that
+// nothing was found and an ID is needed.
+function StructureNote({
+  protein,
+  suggested,
+  sid,
+  onPick,
+}: {
+  protein: string;
+  suggested: ResolvedStructure | null | undefined;
+  sid: string;
+  onPick: (id: string) => void;
+}) {
+  const name = protein.trim().slice(0, 80);
+  if (!name) {
+    return (
+      <p className="w-full text-xs text-slate-500">
+        The campaign does not name the biologic, so type its PDB ID or UniProt accession.
+      </p>
+    );
+  }
+  if (suggested === undefined) {
+    return <p className="w-full text-xs text-slate-500">Looking up the structure of {name}…</p>;
+  }
+  if (suggested === null) {
+    return (
+      <p className="w-full text-xs text-slate-500">
+        No structure of &ldquo;{name}&rdquo; alone was found in the PDB or UniProt. Type its PDB ID or UniProt
+        accession.
+      </p>
+    );
+  }
+  if (sid.trim().toUpperCase() !== suggested.structure_id.toUpperCase()) return null;
+  return (
+    <div className="w-full space-y-1 text-xs leading-relaxed text-slate-500">
+      <p>
+        <b className="font-semibold text-slate-700">{suggested.structure_id}</b>
+        {suggested.title && <> &middot; {suggested.title}</>} &middot; {suggested.source}. Found for &ldquo;{name}
+        &rdquo;: {suggested.why}.
+      </p>
+      {suggested.alternatives.length > 0 && (
+        <p>
+          Others:{' '}
+          {suggested.alternatives.map((a, i) => (
+            <span key={a.structure_id}>
+              {i > 0 && ', '}
+              <button
+                type="button"
+                className="font-mono text-slate-700 underline decoration-slate-300 underline-offset-2 hover:decoration-slate-500"
+                title={a.title}
+                onClick={() => onPick(a.structure_id)}
+              >
+                {a.structure_id}
+              </button>
+            </span>
+          ))}
+          . Or type your own.
+        </p>
+      )}
+    </div>
+  );
+}
+
+// The conditions a simulation of this candidate would run at: the request's
+// where it stated them, the default where it did not. Change them by saying so
+// in the request.
+function PlannedConditions({ goal }: { goal: DesignGoal }) {
+  const conds = planned(goal);
+  const unstated = conds.filter((x) => !x.fromRequest).length;
+  return (
+    <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-2.5 text-xs leading-relaxed text-slate-600">
+      <span className="font-semibold text-slate-700">Simulated at </span>
+      {conds.map((x, i) => (
+        <span key={x.key}>
+          {i > 0 && ', '}
+          {x.fromRequest ? (
+            <b className="font-semibold text-slate-800">{x.text}</b>
+          ) : (
+            <span>
+              {x.text} <span className="text-slate-400">(default)</span>
+            </span>
+          )}
+        </span>
+      ))}
+      .{' '}
+      {unstated > 0
+        ? 'Bold values come from your request; say a different temperature, pH, salt or polymer concentration in it to change the rest.'
+        : 'All from your request.'}{' '}
+      Shelf life, route and a freeze-dried form are not simulated: the run is nanoseconds, in solution.
+    </div>
+  );
+}
+
 // Queue (or re-queue) for simulation. Asks for the biologic's structure when the
 // campaign's goal does not name one: the run is against that protein.
 function QueueControl({
   status,
   needsStructure,
+  protein,
   onQueue,
   queueing,
+  error,
 }: {
   status: CandidateStatus;
   needsStructure: boolean;
+  protein: string;
   onQueue: (structureId: string) => void;
   queueing: boolean;
+  error?: string;
 }) {
+  const suggested = useResolvedStructure(needsStructure ? protein : '');
   const [sid, setSid] = useState('');
+  const [edited, setEdited] = useState(false);
   const [needsId, setNeedsId] = useState(false);
+  // Fill the box with what was found, unless the user has typed their own.
+  useEffect(() => {
+    if (suggested && !edited) setSid(suggested.structure_id);
+  }, [suggested, edited]);
   const canQueue = status === 'benchmarked' || status === 'failed';
+  const refused = error && (
+    <p className="w-full text-xs text-alert" role="alert">
+      {error}
+    </p>
+  );
   if (!canQueue) {
     return (
-      <button type="button" className="btn-ghost" disabled>
-        {status === 'simulated' ? 'Simulated ✓' : status === 'simulating' ? 'Simulating…' : 'Queued for simulation ✓'}
-      </button>
+      <>
+        <button type="button" className="btn-ghost" disabled>
+          {status === 'simulated' ? 'Simulated ✓' : status === 'simulating' ? 'Simulating…' : 'Queued for simulation ✓'}
+        </button>
+        {refused}
+      </>
     );
   }
   const label = queueing ? 'Queuing…' : status === 'failed' ? 'Queue again' : 'Queue for simulation';
   if (!needsStructure) {
     return (
-      <button type="button" className="btn-ghost" onClick={() => onQueue('')} disabled={queueing}>
-        {label}
-      </button>
+      <>
+        <button type="button" className="btn-ghost" onClick={() => onQueue('')} disabled={queueing}>
+          {label}
+        </button>
+        {refused}
+      </>
     );
   }
   return (
@@ -326,6 +483,7 @@ function QueueControl({
           value={sid}
           onChange={(e) => {
             setSid(e.target.value);
+            setEdited(true);
             setNeedsId(false);
           }}
           aria-invalid={needsId}
@@ -337,12 +495,14 @@ function QueueControl({
       <button type="submit" className="btn-ghost" disabled={queueing}>
         {label}
       </button>
+      <StructureNote protein={protein} suggested={suggested} sid={sid} onPick={(id) => { setSid(id); setEdited(true); }} />
       {needsId && (
         <p className="w-full text-xs text-alert" role="alert">
           A simulation runs the polymer against your protein, so it needs the protein&rsquo;s structure: type its PDB ID
           (e.g. 1IGT) or UniProt accession (e.g. P01857), then queue.
         </p>
       )}
+      {refused}
     </form>
   );
 }
@@ -354,8 +514,11 @@ function CandidateCard({
   onScreen,
   onQueue,
   queueing,
+  queueError,
   readOnly,
   structureId,
+  protein,
+  goal,
 }: {
   c: StoredCandidate;
   defaultOpen: boolean;
@@ -363,9 +526,12 @@ function CandidateCard({
   // The campaign's biologic, for the 3D view; a queued job's own structure wins.
   structureId?: string;
   onScreen: () => void;
-  onQueue: (structureId: string) => void;
+  onQueue?: (structureId: string) => void;
   queueing: boolean;
+  queueError?: string;
   readOnly?: boolean;
+  protein: string;
+  goal: DesignGoal;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   const clean = c.alerts_fired.length === 0;
@@ -467,17 +633,25 @@ function CandidateCard({
 
           {c.simulation && c.status !== 'benchmarked' && <SimulationPanel sim={c.simulation} status={c.status} candidateId={c.id} />}
 
-          {!readOnly && (
+          {onQueue && (c.status === 'benchmarked' || c.status === 'failed') && <PlannedConditions goal={goal} />}
+
+          {(!readOnly || onQueue) && (
             <div className="flex flex-wrap items-end gap-2">
-              <button type="button" className="btn-ghost" onClick={onScreen}>
-                Screen this candidate →
-              </button>
-              <QueueControl
-                status={c.status}
-                needsStructure={needsStructure}
-                onQueue={onQueue}
-                queueing={queueing}
-              />
+              {!readOnly && (
+                <button type="button" className="btn-ghost" onClick={onScreen}>
+                  Screen this candidate →
+                </button>
+              )}
+              {onQueue && (
+                <QueueControl
+                  status={c.status}
+                  needsStructure={needsStructure}
+                  protein={protein}
+                  onQueue={onQueue}
+                  queueing={queueing}
+                  error={queueError}
+                />
+              )}
             </div>
           )}
         </div>
@@ -494,7 +668,9 @@ export default function DesignResults({
   onScreen,
   onQueue,
   queueing = null,
+  queueError = null,
   readOnly = false,
+  prompt = '',
 }: Props) {
   // Newest iteration first; within an iteration, highest score first.
   const iterations = Array.from(new Set(candidates.map((c) => c.iteration))).sort((a, b) => b - a);
@@ -546,9 +722,12 @@ export default function DesignResults({
                   defaultOpen={c.id === topId}
                   needsStructure={!goal.structure_id}
                   structureId={goal.structure_id}
+                  protein={goal.protein || prompt}
+                  goal={goal}
                   onScreen={() => onScreen?.(c)}
-                  onQueue={(sid) => onQueue?.(c, sid)}
+                  onQueue={onQueue && ((sid) => onQueue(c, sid))}
                   queueing={queueing === c.id}
+                  queueError={queueError?.id === c.id ? queueError.message : undefined}
                   readOnly={readOnly}
                 />
               ))}
