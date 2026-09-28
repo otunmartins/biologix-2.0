@@ -6,8 +6,9 @@ import DesignResults from '@/components/DesignResults';
 import Results from '@/components/Results';
 import ScreenForm, { type Mode } from '@/components/ScreenForm';
 import { GradeBox } from '@/components/badges';
-import { Info, Molecule, Spinner, Triangle } from '@/components/icons';
+import { Info, Spinner, Triangle } from '@/components/icons';
 import BenchmarkPanel from '@/components/BenchmarkPanel';
+import { BiologixLockup } from '@/components/brand';
 import UserMenu, { type SessionUser } from '@/components/UserMenu';
 import HistoryView from '@/components/history/HistoryView';
 import ResultsView from '@/components/ResultsView';
@@ -615,12 +616,7 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
     <div className="flex min-h-screen flex-col lg:h-screen">
       {/* On a phone the tabs drop to a second, full-width row; from sm up it is one row. */}
       <header className="flex shrink-0 flex-wrap items-center justify-between gap-y-2 border-b border-slate-200 bg-white px-4 py-2 sm:h-14 sm:flex-nowrap sm:px-5 sm:py-0">
-        <div className="flex items-center gap-2.5">
-          <span className="grid h-8 w-8 place-items-center rounded-lg bg-slate-900 text-white">
-            <Molecule className="h-[18px] w-[18px]" />
-          </span>
-          <span className="whitespace-nowrap text-[15px] font-semibold tracking-tight text-slate-900">Excipient Screen</span>
-        </div>
+        <BiologixLockup />
 
         <nav className="order-last flex w-full rounded-lg bg-slate-100 p-1 text-sm font-medium sm:order-none sm:w-auto">
           {(

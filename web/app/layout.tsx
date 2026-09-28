@@ -10,8 +10,9 @@ const sans = IBM_Plex_Sans({
 const mono = IBM_Plex_Mono({ subsets: ['latin'], weight: ['400', '500'], variable: '--font-mono' });
 
 export const metadata: Metadata = {
-  title: 'Excipient Screen',
-  description: 'Chemistry-only excipient triage for biologic formulations.',
+  title: 'Biologix 2.0',
+  description: 'Excipient triage, polymer design and molecular dynamics for biologic formulations. By Algonix AI.',
+  applicationName: 'Biologix 2.0',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

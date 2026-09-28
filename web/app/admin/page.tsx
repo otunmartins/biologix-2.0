@@ -7,7 +7,7 @@ import { isAdminEmail } from '@/lib/admin';
 // a plain 404, so the page does not even admit to existing.
 export const dynamic = 'force-dynamic';
 
-export const metadata = { title: 'Admin · Excipient Screen' };
+export const metadata = { title: 'Admin · Biologix 2.0' };
 
 export default async function AdminPage() {
   const session = await auth();

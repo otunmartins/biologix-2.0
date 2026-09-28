@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
-import { Molecule } from '@/components/icons';
+import { BiologixLockup } from '@/components/brand';
 import UserMenu, { type SessionUser } from '@/components/UserMenu';
 import Approvals from './Approvals';
 import Dashboard from './Dashboard';
@@ -20,14 +20,7 @@ export default function AdminApp({ user }: { user: SessionUser }) {
   return (
     <div className="min-h-screen bg-[#f9f9f7]">
       <header className="sticky top-0 z-30 flex flex-wrap items-center justify-between gap-y-2 border-b border-slate-200 bg-white/90 px-4 py-2 backdrop-blur sm:h-14 sm:flex-nowrap sm:px-5 sm:py-0">
-        <div className="flex items-center gap-2.5">
-          <span className="grid h-8 w-8 place-items-center rounded-lg bg-gradient-to-br from-[#2a78d6] via-[#4a3aa7] to-[#eb6834] text-white">
-            <Molecule className="h-[18px] w-[18px]" />
-          </span>
-          <span className="whitespace-nowrap text-[15px] font-semibold tracking-tight text-slate-900">
-            Excipient Screen <span className="font-normal text-slate-400">· Admin</span>
-          </span>
-        </div>
+        <BiologixLockup suffix="Admin" />
         <nav className="order-last flex w-full rounded-lg bg-slate-100 p-1 text-sm font-medium sm:order-none sm:w-auto" aria-label="Admin sections">
           {(
             [
