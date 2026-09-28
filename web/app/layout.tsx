@@ -15,9 +15,16 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  // suppressHydrationWarning: browser extensions (Grammarly, ColorZilla, Dark
+  // Reader, password managers, translators) add attributes to <html> and <body>
+  // before React loads, which React reports as a hydration mismatch. It covers
+  // only these two elements' own attributes -- everything inside them is still
+  // checked, so a real mismatch in the app is still reported.
   return (
-    <html lang="en" className={`${sans.variable} ${mono.variable}`}>
-      <body className="font-sans">{children}</body>
+    <html lang="en" className={`${sans.variable} ${mono.variable}`} suppressHydrationWarning>
+      <body className="font-sans" suppressHydrationWarning>
+        {children}
+      </body>
     </html>
   );
 }
