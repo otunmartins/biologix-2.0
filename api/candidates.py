@@ -492,6 +492,22 @@ def simulation(conn: psycopg.Connection, candidate_id: str, *, owner_id: int) ->
     return _with_campaign(row) if row else None
 
 
+def simulation_any(conn: psycopg.Connection, candidate_id: str) -> dict | None:
+    """Any user's simulation, for an admin (the route checks that first), with
+    who it belongs to."""
+    row = conn.execute(
+        "SELECT c.*, cp.goal AS campaign_goal, cp.owner_id AS owner_id, u.email AS owner_email "
+        "FROM candidate c JOIN campaign cp ON cp.id=c.campaign_id LEFT JOIN users u ON u.id=cp.owner_id "
+        "WHERE c.id=%s", (candidate_id,)).fetchone()
+    return {**_with_campaign(row), "owner_id": row["owner_id"], "owner_email": row["owner_email"]} if row else None
+
+
+def snapshot_any(conn: psycopg.Connection, candidate_id: str) -> str | None:
+    """Any run's 3D snapshot, for an admin (the route checks that first)."""
+    row = conn.execute("SELECT pdb FROM sim_snapshot WHERE candidate_id=%s", (candidate_id,)).fetchone()
+    return row["pdb"] if row else None
+
+
 def _with_campaign(row: dict) -> dict:
     goal = json.loads(row["campaign_goal"]) if row.get("campaign_goal") else {}
     return {**_hydrate(row), "campaign_id": row["campaign_id"], "updated_at": row["updated_at"],

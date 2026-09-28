@@ -526,6 +526,8 @@ export interface MySimulation extends StoredCandidate {
   campaign_id: string;
   updated_at: string;
   campaign: { protein: string; format: string; target_temp_c: number | null };
+  // Only in the admin's view of someone's run: whose it is.
+  owner_email?: string | null;
 }
 
 export async function getMySimulations(
@@ -536,11 +538,14 @@ export async function getMySimulations(
   return res.json();
 }
 
+// One simulation in full. `admin`: any user's run, through the admin's route.
 export async function getMySimulation(
   id: string,
   signal?: AbortSignal,
+  admin = false,
 ): Promise<{ simulation: MySimulation; events: HistoryEvent[]; cpu_preview_ns: number }> {
-  const res = await call(`/design/my-simulations/${encodeURIComponent(id)}`, { signal });
+  const base = admin ? '/design/simulations' : '/design/my-simulations';
+  const res = await call(`${base}/${encodeURIComponent(id)}`, { signal });
   if (!res.ok) throw new Error(await detailOf(res));
   return res.json();
 }
@@ -641,8 +646,9 @@ async function getText(path: string, signal?: AbortSignal): Promise<string> {
   return res.text();
 }
 
-export function getSimulationSnapshot(id: string, signal?: AbortSignal): Promise<string> {
-  return getText(`/design/my-simulations/${encodeURIComponent(id)}/snapshot.pdb`, signal);
+export function getSimulationSnapshot(id: string, signal?: AbortSignal, admin = false): Promise<string> {
+  const base = admin ? '/design/simulations' : '/design/my-simulations';
+  return getText(`${base}/${encodeURIComponent(id)}/snapshot.pdb`, signal);
 }
 
 export function getStructureModel(structureId: string, signal?: AbortSignal): Promise<string> {

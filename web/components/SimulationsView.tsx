@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { SimulationPanel } from '@/components/DesignResults';
+import SimulationReport from '@/components/SimulationReport';
 import { EventTimeline } from '@/components/history/HistoryDetail';
 import { Spinner, Triangle } from '@/components/icons';
 import { getMySimulation, getMySimulations, type HistoryEvent, type MySimulation } from '@/lib/api';
@@ -45,10 +46,15 @@ export function SimulationDetail({
   id,
   onClose,
   onOpenCampaign,
+  admin = false,
 }: {
   id: string;
   onClose: () => void;
-  onOpenCampaign: (campaignId: string) => void;
+  // Absent when the viewer cannot open the run's campaign (an admin looking at
+  // another user's run).
+  onOpenCampaign?: (campaignId: string) => void;
+  // Any user's run, through the admin's routes (the Approvals screen).
+  admin?: boolean;
 }) {
   const [data, setData] = useState<{ simulation: MySimulation; events: HistoryEvent[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -58,7 +64,7 @@ export function SimulationDetail({
     let timer: ReturnType<typeof setTimeout> | undefined;
     const load = async () => {
       try {
-        const d = await getMySimulation(id, ctl.signal);
+        const d = await getMySimulation(id, ctl.signal, admin);
         setData(d);
         setError(null);
         // Keep an open, running simulation current; stop once it has finished.
@@ -72,7 +78,7 @@ export function SimulationDetail({
       ctl.abort();
       clearTimeout(timer);
     };
-  }, [id]);
+  }, [id, admin]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
@@ -81,6 +87,8 @@ export function SimulationDetail({
   }, [onClose]);
 
   const s = data?.simulation;
+  // A finished run gets the full report, and the room for it.
+  const report = s?.status === 'simulated' && s.simulation?.result ? s.simulation : null;
   return (
     <div
       className="fixed inset-0 z-40 flex items-end justify-center bg-slate-900/40 sm:items-center sm:p-6"
@@ -92,7 +100,7 @@ export function SimulationDetail({
         aria-modal="true"
         aria-label="Simulation"
         onClick={(e) => e.stopPropagation()}
-        className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-t-2xl bg-white shadow-xl sm:rounded-2xl"
+        className={`flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-xl sm:rounded-2xl ${report ? 'max-w-4xl' : 'max-w-2xl'}`}
       >
         <div className="flex items-start justify-between gap-3 border-b border-slate-200 px-5 py-4">
           <div className="min-w-0">
@@ -102,6 +110,7 @@ export function SimulationDetail({
               <p className="mt-0.5 text-sm text-slate-500">
                 {s.campaign.protein || 'Unnamed biologic'} · {s.campaign.format || 'format not given'}
                 {s.campaign.target_temp_c !== null && ` · ${s.campaign.target_temp_c} °C`}
+                {s.owner_email && ` · ${s.owner_email}`}
               </p>
             )}
           </div>
@@ -125,7 +134,9 @@ export function SimulationDetail({
           )}
           {s && (
             <>
-              {s.simulation ? (
+              {report ? (
+                <SimulationReport sim={report} candidateId={s.id} name={s.name} admin={admin} />
+              ) : s.simulation ? (
                 <SimulationPanel sim={s.simulation} status={s.status} candidateId={s.id} />
               ) : (
                 <p className="text-sm text-slate-600">
@@ -150,9 +161,11 @@ export function SimulationDetail({
             <span className="text-xs text-slate-400" title={fullStamp(s.updated_at)}>
               Triage score {s.score.toFixed(1)}
             </span>
-            <button type="button" className="btn-primary" onClick={() => onOpenCampaign(s.campaign_id)}>
-              Open campaign
-            </button>
+            {onOpenCampaign && (
+              <button type="button" className="btn-primary" onClick={() => onOpenCampaign(s.campaign_id)}>
+                Open campaign
+              </button>
+            )}
           </div>
         )}
       </div>

@@ -40,6 +40,7 @@ export default function MolViewer({
   hasSnapshot,
   polymerSmiles,
   contacts = [],
+  admin = false,
 }: {
   structureId?: string;
   candidateId?: string;
@@ -47,6 +48,8 @@ export default function MolViewer({
   // The candidate's screened chain, drawn beside the protein when there is no snapshot.
   polymerSmiles?: string;
   contacts?: Contact[];
+  // The snapshot through the admin's route: any user's run.
+  admin?: boolean;
 }) {
   const el = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<any>(null);
@@ -65,7 +68,7 @@ export default function MolViewer({
         const [$3Dmol, protein, chain] = await Promise.all([
           import('3dmol'),
           snapshot
-            ? getSimulationSnapshot(candidateId!, ctl.signal)
+            ? getSimulationSnapshot(candidateId!, ctl.signal, admin)
             : structureId
               ? getStructureModel(structureId, ctl.signal)
               : Promise.resolve(null),
@@ -127,7 +130,7 @@ export default function MolViewer({
     };
     // contacts are part of the picture; a new set redraws it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [structureId, candidateId, snapshot, polymerSmiles, JSON.stringify(top)]);
+  }, [structureId, candidateId, snapshot, polymerSmiles, admin, JSON.stringify(top)]);
 
   // A translucent surface shows the protein's shape the polymer is working against.
   useEffect(() => {
