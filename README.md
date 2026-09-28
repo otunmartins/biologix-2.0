@@ -113,6 +113,13 @@ the result was produced (`api/history.py`):
 - **Campaigns**: an append-only event log of started (with the words typed and the model that
   read the goal from them), each iteration's metrics, candidates queued, ended, and reopened.
 
+Every screen also records **where it came from** (`screen_run.origin`): the Screen tab, or a
+designed candidate handed over with **Screen this candidate** (with that candidate's id). The two
+are different questions, so they are reported apart: a designed candidate's screen counts as
+polymer-design work in Results and on the admin dashboard, never as excipient screening, and
+History labels it. Screens saved before the field existed were sorted once, by name: a designed
+candidate is screened under its own generated name.
+
 Nothing in history is edited or deleted. **New experiment** ends the campaign on screen (an
 event, and `ended_at`); continuing it from History reopens it. If a screen's record cannot be
 written, the user still gets the dossier, with a notice that it was not saved.
@@ -554,19 +561,40 @@ request, not a run:
 the API and the web server read). Anyone else gets a 404 from the server, not a hidden tab; the
 API checks every admin request on its own as well. It has two parts:
 
-- **Dashboard.** Platform-wide numbers for tracking: polymers designed, excipient screens,
-  campaigns, simulations, users (dated by first activity) and model tokens, each with its trend
-  against the previous period; daily activity; screen outcomes, evidence grades and routes;
-  the designer's pipeline, backbones and campaign goals; simulation states and the Γ23
-  distribution. **Counts only**: `api/stats.py` aggregates and never selects an excipient,
-  protein, prompt, structure or email, and the smoke test checks the response for them.
+- **Dashboard.** Platform-wide numbers for tracking growth: polymers designed, excipient
+  screens, campaigns, simulations, users (dated by first activity) and model tokens, each with
+  its trend against the previous period; daily activity and **events per day by kind** (screens,
+  campaigns started and iterated, simulations sent, approved, run and failed); screen outcomes,
+  evidence grades and coverage, liabilities by severity and routes; the designer's pipeline,
+  backbones, campaign goals and depth (candidates and iterations per campaign), and designed
+  candidates screened in full; simulation states and the Γ23 distribution with its
+  two-standard-error calls. **Counts only**: `api/stats.py` aggregates over the app's own
+  vocabulary and never selects an excipient, protein, prompt, structure or email, and the smoke
+  test checks the whole response for them.
 - **Approvals.** Every user's waiting, approved and running simulations. Approve as a GPU run
   or a CPU preview, switch an approved job's kind before a worker takes it, deny it, or stop it
   while it runs (the worker drops it at its next heartbeat). Shows which workers are online.
 
-**Following them: the Simulations tab.** Every user sees their own simulations across all
-campaigns (waiting, running, done, failed), and each opens with its result and its own slice of
-history: queued, approved (and as what), each attempt, and how it ended.
+**Following them: the Results tab.** Each user sees only their own work (`api/results.py`), as
+two separate reports:
+
+- **Excipient screening**: their Screen-tab runs, with **evidence coverage** (the share of a
+  dossier's endpoints that are Precedented or Supported: how much is known, not how safe), the
+  worst verdict and evidence grade of each, liabilities, and every excipient ranked by coverage.
+- **Polymer design**: the candidates their campaigns generated, per-campaign triage summaries
+  (never pooled: the score is only comparable within a campaign), the candidates screened in
+  full, and their **simulations**: a Γ23 forest plot with ±2 SE bars and the candidate card's
+  call (excluded, accumulates, no clear preference), then every run, each of which opens with
+  its result and its own slice of history: queued, approved (and as what), each attempt, and
+  how it ended.
+
+**The 3D view.** Every candidate can be seen in 3D (3Dmol.js, loaded on demand). Before any
+simulation, it is one RDKit conformer of the screened chain set *beside* the biologic's ribbon,
+labelled as an illustration. After a run, it is the run's last frame: the worker saves protein and
+polymer heavy atoms, each chain at its periodic image nearest the protein (`worker/snapshot.py`),
+the API keeps it in its own table and serves it only to the run's owner, and the residues the
+polymer touched most are picked out. Structures come through the API behind sign-in
+(`/structure/model/<id>`), first model only, so an NMR entry is not drawn as a stack.
 
 **A CPU worker on your own machine**, for previews with no GPU. It reuses the worker image and
 reaches the API on the host:
