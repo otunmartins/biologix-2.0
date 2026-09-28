@@ -26,17 +26,28 @@ import main  # noqa: E402
 # The stores are Postgres now, so the suite needs a database of its own: it DROPs
 # and recreates the domain tables so a rerun is never polluted by the last one.
 # Point TEST_DATABASE_URL at a separate Neon branch (or a second local database),
-# never at the one the app uses.
-TEST_DB = os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL", "")
+# never at the one the app uses. No fallback to DATABASE_URL: that is production
+# now, and one missing line in a .env would have this suite wipe it.
+TEST_DB = os.environ.get("TEST_DATABASE_URL", "")
+
+
+def _refuse_production(url: str) -> None:
+    """Stop before any DROP if the test database is the app's own or production's."""
+    same = {os.environ.get(k, "").strip() for k in ("DATABASE_URL", "NEON_PROD_DATABASE_URL")} - {""}
+    if url.strip() in same:
+        raise SystemExit("TEST_DATABASE_URL is the app's own database; this suite DROPs "
+                         "tables. Point it at a separate database.")
 
 
 def fresh_store(module):
     """A connection to the test database with this module's tables freshly made."""
     if not TEST_DB.strip():
         raise SystemExit(
-            "set TEST_DATABASE_URL (or DATABASE_URL) to a Postgres connection string. "
-            "Locally:  docker run -d --name biologix-pg -e POSTGRES_PASSWORD=devpass "
-            "-e POSTGRES_USER=biologix -e POSTGRES_DB=biologix -p 5432:5432 postgres:16")
+            "set TEST_DATABASE_URL to a Postgres connection string of its own (this suite "
+            "DROPs tables, so never the app's database). Locally:  docker run -d --name "
+            "biologix-pg -e POSTGRES_PASSWORD=devpass -e POSTGRES_USER=biologix "
+            "-e POSTGRES_DB=biologix -p 5432:5432 postgres:16  and use .../biologix_test")
+    _refuse_production(TEST_DB)
     conn = main.db.connect(TEST_DB)
     with main.db.tx(conn):
         # CASCADE and the order together: candidate references campaign,
