@@ -443,6 +443,14 @@ surfactants, preservatives, chelators, cyclodextrins and cosolvents — 51 resol
 across five routes rather than an exact level, so the suite doesn't break the next time FDA adds
 a row, only when precedent is lost.
 
+**The smoke test never goes online.** `test_smoke.py` pins real answers from PubChem, openFDA, the
+FDA Inactive Ingredient file, RCSB and AlphaFold, but replays them from
+`api/testdata/http_cassette.json.gz` (`api/http_replay.py`), so an outage at any of them cannot
+fail CI or block a deploy, and every run sees the same data. When the code starts asking for
+something new, the missing request is named on stderr; re-record with
+`HTTP_RECORD=1 python test_smoke.py` (the recording is saved only if every check passes). To see
+whether live FDA data has drifted, run `test_breadth.py`, which stays live on purpose.
+
 ### Why only two of RDKit's published alert catalogs are enabled
 
 RDKit ships eleven published filter sets. Most of them are actively harmful here. They were built

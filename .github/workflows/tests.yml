@@ -52,9 +52,11 @@ jobs:
           "
 
       - name: Smoke test
-        # test_breadth.py is left out on purpose: it hits PubChem, fda.gov and
-        # openFDA, so it fails whenever one of them is slow, not when the code is
-        # wrong. Run it by hand before a release that touches the screen.
+        # Offline: every PubChem, openFDA, fda.gov, RCSB and AlphaFold response it
+        # needs is replayed from api/testdata/http_cassette.json.gz, so an outage
+        # there cannot fail this job. test_breadth.py is left out on purpose: it
+        # stays live, to catch FDA data drifting. Run it by hand before a release
+        # that touches the screen.
         run: >-
           docker run --rm --network host
           -e TEST_DATABASE_URL=postgresql://biologix:devpass@localhost:5432/biologix_test

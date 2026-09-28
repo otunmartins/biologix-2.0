@@ -22,6 +22,16 @@ from pydantic_ai.messages import ModelResponse, ToolCallPart  # noqa: E402
 from pydantic_ai.models.function import AgentInfo, FunctionModel  # noqa: E402
 
 import main  # noqa: E402
+import http_replay  # noqa: E402
+
+# No live services: every HTTP call is answered from testdata/http_cassette.json.gz
+# (http_replay.py), so an outage at PubChem, openFDA, fda.gov, RCSB or AlphaFold
+# cannot fail this suite. HTTP_RECORD=1 re-records it from the live services.
+save_recording = http_replay.install(record=os.environ.get("HTTP_RECORD") == "1")
+# The FDA Inactive Ingredient file too: a fresh cache directory, so it comes from
+# the cassette like everything else rather than from whatever copy this machine has.
+import tempfile  # noqa: E402
+main.precedent.CACHE_DIR = tempfile.mkdtemp(prefix="iid-test-")
 
 # The stores are Postgres now, so the suite needs a database of its own: it DROPs
 # and recreates the domain tables so a rerun is never polluted by the last one.
@@ -1784,6 +1794,7 @@ def main_test():
 
     print()
     print("all checks passed")
+    save_recording()
 
 if __name__ == "__main__":
     main_test()
