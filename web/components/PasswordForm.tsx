@@ -1,6 +1,7 @@
 'use client';
 
-import { useFormState, useFormStatus } from 'react-dom';
+import { useActionState } from 'react';
+import { useFormStatus } from 'react-dom';
 import { registerWithPassword, signInWithPassword, type PasswordState } from '@/app/actions';
 import { Spinner, Triangle } from '@/components/icons';
 
@@ -79,8 +80,8 @@ function Fields({ mode, state }: { mode: Mode; state: PasswordState }) {
 
 // The mode is owned by AuthCard, so the heading and the Google button follow it.
 export default function PasswordForm({ mode, onMode }: { mode: Mode; onMode: (m: Mode) => void }) {
-  const [signInState, signInAction] = useFormState(signInWithPassword, INITIAL);
-  const [registerState, registerAction] = useFormState(registerWithPassword, INITIAL);
+  const [signInState, signInAction] = useActionState(signInWithPassword, INITIAL);
+  const [registerState, registerAction] = useActionState(registerWithPassword, INITIAL);
 
   return (
     <div>
