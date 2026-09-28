@@ -2,29 +2,19 @@
 #   SITE_ADDRESS=:80                 -> plain HTTP, fine for a bare EC2 IP
 #   SITE_ADDRESS=screen.example.com  -> Caddy gets a Let's Encrypt cert on its own
 {$SITE_ADDRESS::80} {
-	handle /screen* {
+	# The API, under its own prefix, which is stripped before it reaches it
+	# (/_api/design/iterate arrives as /design/iterate). The web's pages have the
+	# same names as API routes -- /screen, /design, /history -- so the API cannot
+	# share the root with them: NEXT_PUBLIC_API_URL is https://<domain>/_api.
+	handle_path /_api/* {
 		reverse_proxy api:8000
 	}
-	# The polymer designer and its active-learning campaign endpoints:
-	# /design, /design/iterate, /design/queue, /design/campaign/<id>. Without the
-	# wildcard these fall through to the web container and 404, which looks like a
-	# broken designer rather than a missing route.
-	handle /design* {
-		reverse_proxy api:8000
-	}
-	# Structure drawings and the per-user history. Same trap as /design*: a path
-	# missing here falls through to Next.js and 404s there.
-	handle /structure* {
-		reverse_proxy api:8000
-	}
-	handle /history* {
-		reverse_proxy api:8000
-	}
+	# At the root as well, for callers that are not the web app: the deploy's
+	# health check, and the simulation worker on a rented GPU, whose API_URL is
+	# the bare domain. The queue is token-protected by the API itself.
 	handle /health {
 		reverse_proxy api:8000
 	}
-	# The simulation worker's queue, for a worker running somewhere other than
-	# this box (a rented GPU). Token-protected by the API itself.
 	handle /worker* {
 		reverse_proxy api:8000
 	}

@@ -86,6 +86,12 @@ jobs:
                 || { echo "::error::\$var missing from .env on the instance; deploy aborted"; exit 1; }
             done
 
+            # The web reaches the API under /_api (Caddyfile): the bare domain
+            # would send the app's own fetches to its pages. Built into the
+            # bundle, so a wrong value is a broken site, not a warning.
+            grep -qE '^NEXT_PUBLIC_API_URL=.+/_api/?$' .env \
+              || { echo "::error::NEXT_PUBLIC_API_URL in .env must end in /_api (e.g. https://<domain>/_api); deploy aborted"; exit 1; }
+
             git fetch --prune origin
             git reset --hard origin/main
 

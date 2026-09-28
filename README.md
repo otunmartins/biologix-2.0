@@ -175,7 +175,9 @@ docker compose exec api python -c "import urllib.request; print(urllib.request.u
 In `.env`: `ANTHROPIC_API_KEY`, Neon's **pooled** `DATABASE_URL`, the three sign-in values
 (`AUTH_SECRET`, `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`), and your domain in the last three:
 `SITE_ADDRESS=<your-domain>`, `WEB_ORIGIN=https://<your-domain>`,
-`NEXT_PUBLIC_API_URL=https://<your-domain>`. Caddy gets the HTTPS certificate on its own once
+`NEXT_PUBLIC_API_URL=https://<your-domain>/_api` (the API lives under `/_api`, because the app's
+pages `/screen`, `/design` and `/history` share names with API routes; the deploy refuses a value
+without it). Caddy gets the HTTPS certificate on its own once
 DNS points at the box. The health check should show `model_configured`, `database.reachable`
 and `tg_model` all true.
 
