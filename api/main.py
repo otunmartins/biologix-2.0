@@ -273,6 +273,10 @@ class ScreenRequest(BaseModel):
     # The form exactly as the user filled it, kept only for their history so
     # "open in workspace" can refill it. Never read by the screen itself.
     form: dict | None = None
+    # Set when a designed candidate was handed over with "Screen this candidate":
+    # the screen is then reported with the designer's work, not as an excipient
+    # screen. A label only; the screen itself never reads it.
+    candidate_id: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
     def _form_is_small(self):
@@ -1950,7 +1954,7 @@ def _record_screen(user_id: int, req: ScreenRequest, deps: "ScreenDeps", result,
             return history.record_screen(
                 conn, user_id, request=request, dossier=dossier, error=error,
                 provenance=_jsonable(provenance), started_at=started,
-                finished_at=datetime.now(timezone.utc))
+                finished_at=datetime.now(timezone.utc), candidate_id=req.candidate_id)
         finally:
             conn.close()
     except Exception as e:

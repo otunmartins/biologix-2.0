@@ -97,6 +97,7 @@ function withDefaults(d: AdminStats): AdminStats {
     polymers: {
       ...d.polymers,
       candidates_per_campaign: d.polymers.candidates_per_campaign ?? [],
+      screened_in_full: d.polymers.screened_in_full ?? {},
       iterations_per_campaign: d.polymers.iterations_per_campaign ?? [],
       alert_free: d.polymers.alert_free ?? null,
     },
@@ -271,7 +272,7 @@ export default function Dashboard() {
 
       <Section title="Excipient screens">
         <div className="grid gap-4 lg:grid-cols-3">
-          <ChartCard title="Outcomes" subtitle="Each screen's worst verdict across its endpoints" className="lg:col-span-2"
+          <ChartCard title="Outcomes" subtitle="Each screen's worst verdict across its endpoints. Screens of designed candidates are counted under Campaign depth" className="lg:col-span-2"
             table={{ head: ['Worst verdict', 'Screens'], rows: VERDICT.map(([v]) => [v, data.screens.worst_verdict[v] ?? 0]) }}>
             <ShareBar parts={VERDICT.map(([label, color, icon]) => ({ label, color, icon, value: data.screens.worst_verdict[label] ?? 0 }))} />
             <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -347,7 +348,7 @@ export default function Dashboard() {
       </Section>
 
       <Section title="Campaign depth">
-        <div className="grid gap-4 lg:grid-cols-3">
+        <div className="grid gap-4 lg:grid-cols-2">
           <ChartCard title="Candidates per campaign" subtitle="How many polymers each campaign generated"
             table={{ head: ['Candidates', 'Campaigns'], rows: data.polymers.candidates_per_campaign.map((b) => [binLabel(b), b.n]) }}>
             <Columns bins={data.polymers.candidates_per_campaign.map((b) => ({ label: binLabel(b), value: b.n }))}
@@ -357,6 +358,10 @@ export default function Dashboard() {
             table={{ head: ['Iterations', 'Campaigns'], rows: data.polymers.iterations_per_campaign.map((b) => [binLabel(b), b.n]) }}>
             <Columns bins={data.polymers.iterations_per_campaign.map((b) => ({ label: binLabel(b), value: b.n }))}
               colors={data.polymers.iterations_per_campaign.map(() => C.polymers)} height={130} />
+          </ChartCard>
+          <ChartCard title="Candidates screened in full" subtitle="Designed polymers put through the excipient screen, by worst verdict. Counted here, not under Excipient screens"
+            table={{ head: ['Worst verdict', 'Candidates'], rows: VERDICT.map(([v]) => [v, data.polymers.screened_in_full[v] ?? 0]) }}>
+            <ShareBar parts={VERDICT.map(([label, color, icon]) => ({ label, color, icon, value: data.polymers.screened_in_full[label] ?? 0 }))} />
           </ChartCard>
           <ChartCard title="What gets generated" subtitle="Across every designed polymer">
             <div className="grid grid-cols-2 gap-3">

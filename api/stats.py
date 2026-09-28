@@ -70,6 +70,12 @@ def _daily(conn, sql: str, start: date, days: int, args=()) -> list[int]:
     return [got.get(start + timedelta(days=i), 0) for i in range(days)]
 
 
+# Screens of designed candidates ("Screen this candidate") are polymer-design
+# work, not excipient screening, so every excipient-screen metric reads only the
+# rest. Model usage and who was active still count every screen.
+XS = "(SELECT * FROM screen_run WHERE origin IS DISTINCT FROM 'design') screen_run"
+
+
 def dashboard(conn: psycopg.Connection, days: int = 90) -> dict:
     now = datetime.now(timezone.utc)
     today = now.date()
@@ -81,9 +87,9 @@ def dashboard(conn: psycopg.Connection, days: int = 90) -> dict:
 
     totals = {
         "users": _one(conn, "SELECT COUNT(*) AS v FROM users"),
-        "screens": _one(conn, "SELECT COUNT(*) AS v FROM screen_run"),
-        "screens_ok": _one(conn, "SELECT COUNT(*) AS v FROM screen_run WHERE status='ok'"),
-        "screens_failed": _one(conn, "SELECT COUNT(*) AS v FROM screen_run WHERE status='failed'"),
+        "screens": _one(conn, f"SELECT COUNT(*) AS v FROM {XS}"),
+        "screens_ok": _one(conn, f"SELECT COUNT(*) AS v FROM {XS} WHERE status='ok'"),
+        "screens_failed": _one(conn, f"SELECT COUNT(*) AS v FROM {XS} WHERE status='failed'"),
         "campaigns": _one(conn, "SELECT COUNT(*) AS v FROM campaign"),
         "iterations": _one(conn, "SELECT COUNT(*) AS v FROM iteration"),
         "polymers": _one(conn, "SELECT COUNT(*) AS v FROM candidate"),
@@ -110,7 +116,7 @@ def dashboard(conn: psycopg.Connection, days: int = 90) -> dict:
 
     series = {
         "dates": [(start + timedelta(days=i)).isoformat() for i in range(days)],
-        "screens": _daily(conn, "SELECT created_at::date AS d, COUNT(*) AS n FROM screen_run "
+        "screens": _daily(conn, f"SELECT created_at::date AS d, COUNT(*) AS n FROM {XS} "
                                 "WHERE created_at::date >= %s GROUP BY 1", start, days),
         "polymers": _daily(conn, f"SELECT ({cand_at})::date AS d, COUNT(*) AS n FROM candidate c "
                                  f"WHERE ({cand_at})::date >= %s GROUP BY 1", start, days),
@@ -124,7 +130,7 @@ def dashboard(conn: psycopg.Connection, days: int = 90) -> dict:
     }
     # The same window just before this one, so each headline can say which way it moved.
     previous = {
-        "screens": _one(conn, "SELECT COUNT(*) AS v FROM screen_run WHERE created_at::date >= %s "
+        "screens": _one(conn, f"SELECT COUNT(*) AS v FROM {XS} WHERE created_at::date >= %s "
                               "AND created_at::date < %s", (prev_start, start)),
         "polymers": _one(conn, f"SELECT COUNT(*) AS v FROM candidate c WHERE ({cand_at})::date >= %s "
                                f"AND ({cand_at})::date < %s", (prev_start, start)),
@@ -145,21 +151,21 @@ def dashboard(conn: psycopg.Connection, days: int = 90) -> dict:
         growth.append(running)
     series["users_cumulative"] = growth
 
-    grades = _counts(conn, "SELECT e->>'evidence_grade' AS k, COUNT(*) AS n FROM screen_run, "
+    grades = _counts(conn, f"SELECT e->>'evidence_grade' AS k, COUNT(*) AS n FROM {XS}, "
                            "jsonb_array_elements(dossier->'endpoints') e WHERE dossier IS NOT NULL GROUP BY 1")
-    endpoint_verdicts = _counts(conn, "SELECT e->>'verdict' AS k, COUNT(*) AS n FROM screen_run, "
+    endpoint_verdicts = _counts(conn, f"SELECT e->>'verdict' AS k, COUNT(*) AS n FROM {XS}, "
                                       "jsonb_array_elements(dossier->'endpoints') e "
                                       "WHERE dossier IS NOT NULL GROUP BY 1")
     durations = [r["s"] for r in conn.execute(
-        "SELECT EXTRACT(EPOCH FROM finished_at - created_at) AS s FROM screen_run "
+        f"SELECT EXTRACT(EPOCH FROM finished_at - created_at) AS s FROM {XS} "
         "WHERE status='ok' ORDER BY 1")]
     # Share of each finished screen's endpoints that some evidence speaks for
     # (results.py's evidence coverage), computed in SQL from verdict labels only.
     coverage = [float(r["c"]) for r in conn.execute(
         "SELECT AVG(CASE WHEN e->>'verdict' = ANY(%s) THEN 1.0 ELSE 0.0 END) AS c "
-        "FROM screen_run, jsonb_array_elements(dossier->'endpoints') e "
+        f"FROM {XS}, jsonb_array_elements(dossier->'endpoints') e "
         "WHERE dossier IS NOT NULL GROUP BY screen_run.id", (sorted(results.SUPPORTED),))]
-    liabilities = _counts(conn, "SELECT f->>'severity' AS k, COUNT(*) AS n FROM screen_run, "
+    liabilities = _counts(conn, f"SELECT f->>'severity' AS k, COUNT(*) AS n FROM {XS}, "
                                 "jsonb_array_elements(dossier->'liabilities') f "
                                 "WHERE dossier IS NOT NULL GROUP BY 1")
     screens = {
@@ -167,14 +173,14 @@ def dashboard(conn: psycopg.Connection, days: int = 90) -> dict:
         "coverage": _histogram(coverage, COVERAGE_EDGES),
         "liabilities": {k: liabilities.get(k, 0) for k in results.SEVERITIES},
         "worst_verdict": {v: 0 for v in VERDICTS} | _counts(
-            conn, "SELECT worst_verdict AS k, COUNT(*) AS n FROM screen_run "
+            conn, f"SELECT worst_verdict AS k, COUNT(*) AS n FROM {XS} "
                   "WHERE worst_verdict IS NOT NULL GROUP BY 1"),
         "endpoint_verdicts": {v: endpoint_verdicts.get(v, 0) for v in VERDICTS},
         "grades": {g: grades.get(g, 0) for g in GRADES},
         # Case-folded: the form and free text spell the same route differently.
         "routes": _counts(conn, "SELECT COALESCE(NULLIF(INITCAP(LOWER(TRIM(route))),''),'Not stated') AS k, "
-                                "COUNT(*) AS n FROM screen_run GROUP BY 1 ORDER BY 2 DESC"),
-        "needs_testing": _one(conn, "SELECT COUNT(*) AS v FROM screen_run WHERE needs_testing"),
+                                f"COUNT(*) AS n FROM {XS} GROUP BY 1 ORDER BY 2 DESC"),
+        "needs_testing": _one(conn, f"SELECT COUNT(*) AS v FROM {XS} WHERE needs_testing"),
         "duration_median_s": round(float(durations[len(durations) // 2]), 1) if durations else None,
         "duration_p90_s": round(float(durations[int(len(durations) * 0.9)]), 1) if durations else None,
     }
@@ -186,7 +192,11 @@ def dashboard(conn: psycopg.Connection, days: int = 90) -> dict:
         "SELECT COUNT(*) AS n, COUNT(DISTINCT iteration) AS it FROM candidate GROUP BY campaign_id").fetchall()
     alert_free = _one(conn, "SELECT COUNT(*) AS v FROM candidate WHERE "
                             "COALESCE(jsonb_array_length(payload::jsonb->'alerts_fired'), 0) = 0")
+    design_screens = _counts(conn, "SELECT COALESCE(worst_verdict, 'failed') AS k, COUNT(*) AS n "
+                                   "FROM screen_run WHERE origin = 'design' GROUP BY 1")
     polymers = {
+        # Designed candidates put through the full excipient screen, by worst verdict.
+        "screened_in_full": {v: design_screens.get(v, 0) for v in VERDICTS},
         "candidates_per_campaign": _histogram([r["n"] for r in per_campaign], CANDIDATE_EDGES),
         "iterations_per_campaign": _histogram([r["it"] for r in per_campaign], ITERATION_EDGES),
         "alert_free": round(alert_free / totals["polymers"], 3) if totals["polymers"] else None,

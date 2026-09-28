@@ -60,7 +60,8 @@ def _screens(conn: psycopg.Connection, owner_id: int) -> dict:
     rows = conn.execute(
         "SELECT id, created_at, status, excipient, protein, route, worst_verdict, needs_testing, "
         "dossier->'endpoints' AS endpoints, dossier->'liabilities' AS liabilities "
-        "FROM screen_run WHERE owner_id=%s ORDER BY created_at DESC", (owner_id,)).fetchall()
+        "FROM screen_run WHERE owner_id=%s AND origin IS DISTINCT FROM 'design' "
+        "ORDER BY created_at DESC", (owner_id,)).fetchall()
 
     worst = {v: 0 for v in VERDICTS}
     verdicts = {v: 0 for v in VERDICTS}
@@ -136,6 +137,12 @@ def _campaigns(conn: psycopg.Connection, owner_id: int) -> dict:
         "SELECT c.campaign_id, c.id, c.iteration, c.score, c.status, c.payload "
         "FROM candidate c JOIN campaign cp ON cp.id=c.campaign_id WHERE cp.owner_id=%s",
         (owner_id,)).fetchall()
+    # Designed candidates put through the full excipient screen: the designer's
+    # work, reported here and never among excipient screens. Latest per candidate.
+    screened = {r["candidate_id"]: r for r in conn.execute(
+        "SELECT DISTINCT ON (candidate_id) candidate_id, id, worst_verdict, needs_testing "
+        "FROM screen_run WHERE owner_id=%s AND origin='design' AND candidate_id IS NOT NULL "
+        "AND status='ok' ORDER BY candidate_id, created_at DESC", (owner_id,))}
     iters = conn.execute(
         "SELECT i.campaign_id, i.iteration, i.metrics FROM iteration i "
         "JOIN campaign cp ON cp.id=i.campaign_id WHERE cp.owner_id=%s ORDER BY i.iteration",
@@ -177,10 +184,12 @@ def _campaigns(conn: psycopg.Connection, owner_id: int) -> dict:
             "alert_free": (round(sum(1 for r in rows if not r["p"].get("alerts_fired")) / len(rows), 3)
                            if rows else None),
             "n_sent": sum(1 for r in rows if r["status"] != "benchmarked"),
+            "n_screened": sum(1 for r in rows if r["id"] in screened),
             "n_simulated": sum(1 for r in rows if r["status"] == "simulated"),
             "best_by_iteration": curve.get(cp["id"], []),
             "top": top and {"id": top["id"], "name": top["p"].get("name", ""), "score": top["score"],
-                            "status": top["status"]},
+                            "status": top["status"],
+                            "screen": screened[top["id"]]["worst_verdict"] if top["id"] in screened else None},
         })
 
     n = len(cands)
@@ -191,6 +200,11 @@ def _campaigns(conn: psycopg.Connection, owner_id: int) -> dict:
         "by_status": status,
         "alert_free": round(alert_free / n, 3) if n else None,
         "tg_in_domain": round(in_domain / domain_known, 3) if domain_known else None,
+        # Candidates given the full screen, and the worst verdict each reached.
+        "screened": {"total": len(screened),
+                     "worst_verdict": {v: sum(1 for r in screened.values() if r["worst_verdict"] == v)
+                                       for v in VERDICTS},
+                     "needs_testing": sum(1 for r in screened.values() if r["needs_testing"])},
         "per_campaign": out,
     }
 

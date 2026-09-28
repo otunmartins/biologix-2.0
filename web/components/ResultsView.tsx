@@ -12,8 +12,6 @@ import { ago, fullStamp } from '@/lib/when';
 // simulations those led to. The numbers come from api/results.py, which also
 // says what each score means and, as importantly, what it does not.
 
-type Section = 'screens' | 'candidates' | 'simulations';
-
 const VERDICT = [
   ['Precedented', 'var(--status-good)', '✓'],
   ['Supported without precedent', 'var(--series-screens)', '◆'],
@@ -104,16 +102,8 @@ function ScreensSection({ data, onOpenScreen }: { data: MyResults['screens']; on
         On the Screen tab, screen an excipient against your protein. Each one lands here with its evidence coverage.
       </Empty>
     );
-  const liab = data.liabilities;
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <MiniStat label="Average evidence coverage" value={pct(data.coverage_mean)} hint="endpoints with evidence" />
-        <MiniStat label="Need testing" value={`${data.needs_testing}`} hint={`of ${data.ok} finished`} />
-        <MiniStat label="High-severity liabilities" value={`${liab.high}`} hint={`${liab.moderate} moderate, ${liab.low} low`} />
-        <MiniStat label="Failed screens" value={`${data.failed}`} />
-      </div>
-
       <div className="grid gap-4 lg:grid-cols-2">
         <ChartCard
           title="Worst verdict per screen"
@@ -222,6 +212,7 @@ function CampaignCard({ c, onOpen }: { c: CampaignResult; onOpen: () => void }) 
               ['best score', c.best_score === null ? '—' : signed(c.best_score)],
               ['median', c.median_score === null ? '—' : signed(c.median_score)],
               ['alert-free', pct(c.alert_free)],
+              ['screened in full', `${c.n_screened}`],
               ['simulated', `${c.n_simulated}/${c.n_sent}`],
             ] as const
           ).map(([label, v]) => (
@@ -237,6 +228,7 @@ function CampaignCard({ c, onOpen }: { c: CampaignResult; onOpen: () => void }) 
         {c.top && (
           <div className="mt-2 truncate text-xs text-slate-500">
             Top candidate: <span className="text-slate-700">{c.top.name}</span>
+            {c.top.screen && <span> · screened: {c.top.screen}</span>}
           </div>
         )}
       </button>
@@ -265,12 +257,29 @@ function CandidatesSection({ data, onOpenCampaign }: { data: MyResults['design']
         <MiniStat label="Sent for simulation" value={`${sent}`} hint={`${data.by_status.simulated ?? 0} simulated`} />
       </div>
 
-      <ChartCard
-        title="Where every candidate stands"
-        table={{ head: ['Status', 'Candidates'], rows: STATUS.map(([k, label]) => [label, data.by_status[k] ?? 0]) }}
-      >
-        <ShareBar parts={STATUS.map(([k, label, color]) => ({ label, value: data.by_status[k] ?? 0, color }))} />
-      </ChartCard>
+      <div className="grid gap-4 lg:grid-cols-2">
+        <ChartCard
+          title="Where every candidate stands"
+          table={{ head: ['Status', 'Candidates'], rows: STATUS.map(([k, label]) => [label, data.by_status[k] ?? 0]) }}
+        >
+          <ShareBar parts={STATUS.map(([k, label, color]) => ({ label, value: data.by_status[k] ?? 0, color }))} />
+        </ChartCard>
+        <ChartCard
+          title="Candidates screened in full"
+          subtitle="Put through the excipient screen with “Screen this candidate”; each one's worst verdict."
+          table={{ head: ['Worst verdict', 'Candidates'], rows: VERDICT.map(([v]) => [v, data.screened.worst_verdict[v] ?? 0]) }}
+        >
+          {data.screened.total ? (
+            <ShareBar
+              parts={VERDICT.map(([v, color, icon]) => ({ label: v, value: data.screened.worst_verdict[v] ?? 0, color, icon }))}
+            />
+          ) : (
+            <p className="text-sm text-[color:var(--ink-muted)]">
+              None yet. Open a candidate on the Design tab and use “Screen this candidate”.
+            </p>
+          )}
+        </ChartCard>
+      </div>
 
       <div>
         <h3 className="mb-2 text-[15px] font-semibold text-[color:var(--ink-1)]">By campaign</h3>
@@ -367,7 +376,59 @@ function SimulationsSection({
 
 // ---------------------------------------------------------------------------
 
-const SECTION_KEY = 'results.section';
+// Two scopes that answer different questions and never share a report:
+// - Excipient screening: the Screen tab's own runs -- is this excipient known and
+//   safe enough to test at my route?
+// - Polymer design: what the designer generated, the candidates it put through
+//   the full screen ("Screen this candidate"), and the simulations they led to.
+type Scope = 'screening' | 'design';
+type DesignSection = 'candidates' | 'simulations';
+const SCOPE_KEY = 'results.scope';
+const DESIGN_KEY = 'results.design';
+
+function read(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+function write(key: string, v: string) {
+  try {
+    localStorage.setItem(key, v);
+  } catch {}
+}
+
+function Pills<K extends string>({
+  label,
+  value,
+  items,
+  onPick,
+}: {
+  label: string;
+  value: K | null;
+  items: readonly (readonly [K, string, number])[];
+  onPick: (k: K) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-2" role="tablist" aria-label={label}>
+      {items.map(([k, text, n]) => (
+        <button
+          key={k}
+          type="button"
+          role="tab"
+          aria-selected={value === k}
+          onClick={() => onPick(k)}
+          className={`rounded-full border px-3 py-1 text-sm font-medium transition ${
+            value === k ? 'border-slate-900 bg-slate-900 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'
+          }`}
+        >
+          {text} <span className="tabular-nums opacity-70">{n}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
 
 export default function ResultsView({
   onOpenCampaign,
@@ -378,7 +439,8 @@ export default function ResultsView({
 }) {
   const [data, setData] = useState<MyResults | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [section, setSection] = useState<Section | null>(null);
+  const [scope, setScope] = useState<Scope | null>(null);
+  const [designSection, setDesignSection] = useState<DesignSection | null>(null);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -403,30 +465,29 @@ export default function ResultsView({
     return () => clearInterval(t);
   }, [active, load]);
 
-  // Open where the user last was; otherwise on the newest kind of work they have.
+  // Open where the user last was; otherwise where their newest work is.
   useEffect(() => {
-    if (!data || section) return;
-    let saved: string | null = null;
-    try {
-      saved = localStorage.getItem(SECTION_KEY);
-    } catch {}
+    if (!data || scope) return;
     const sims = data.simulations.runs.length + active + data.simulations.by_state.failed;
-    setSection(
-      saved === 'screens' || saved === 'candidates' || saved === 'simulations'
-        ? saved
-        : sims
-          ? 'simulations'
-          : data.design.candidates
-            ? 'candidates'
-            : 'screens',
+    const savedScope = read(SCOPE_KEY);
+    const savedSection = read(DESIGN_KEY);
+    setScope(
+      savedScope === 'screening' || savedScope === 'design'
+        ? savedScope
+        : data.design.candidates || sims
+          ? 'design'
+          : 'screening',
     );
-  }, [data, section, active]);
+    setDesignSection(savedSection === 'candidates' || savedSection === 'simulations' ? savedSection : sims ? 'simulations' : 'candidates');
+  }, [data, scope, active]);
 
-  const pick = (s: Section) => {
-    setSection(s);
-    try {
-      localStorage.setItem(SECTION_KEY, s);
-    } catch {}
+  const pickScope = (v: Scope) => {
+    setScope(v);
+    write(SCOPE_KEY, v);
+  };
+  const pickSection = (v: DesignSection) => {
+    setDesignSection(v);
+    write(DESIGN_KEY, v);
   };
 
   const s = data?.simulations;
@@ -436,9 +497,8 @@ export default function ResultsView({
         <div className="eyebrow">Your work</div>
         <h1 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">Results</h1>
         <p className="mt-2 max-w-3xl text-sm leading-relaxed text-slate-600">
-          Every excipient you have screened, every candidate polymer your campaigns generated, and every simulation they led
-          to, with what each amounts to so far. Everything here is triage: it says what to test next, never that something is
-          safe.
+          Two separate reports: your excipient screening, and your polymer design with the simulations it led to. Everything
+          here is triage: it says what to test next, never that something is safe.
         </p>
       </div>
 
@@ -459,64 +519,105 @@ export default function ResultsView({
             ))}
           </div>
         </div>
-      ) : data && s ? (
+      ) : data && s && scope ? (
         <>
-          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-            <Tile
-              label="Excipient screens"
-              value={data.screens.total.toLocaleString()}
-              sub={`${data.screens.needs_testing} need testing`}
-              color="var(--series-screens)"
-            />
-            <Tile
-              label="Candidates generated"
-              value={data.design.candidates.toLocaleString()}
-              sub={`${data.design.campaigns} campaign${data.design.campaigns === 1 ? '' : 's'}, ${data.design.iterations} iterations`}
-              color="var(--series-polymers)"
-            />
-            <Tile
-              label="Simulations finished"
-              value={s.by_state.done.toLocaleString()}
-              sub={active ? `${active} waiting or running` : `${s.calls.excluded} excluded from the surface`}
-              color="var(--series-sims)"
-            />
-            <Tile
-              label="Evidence coverage"
-              value={pct(data.screens.coverage_mean)}
-              sub="average across your screens"
-              color="var(--series-users)"
-            />
-          </div>
-
-          <div className="flex flex-wrap gap-2" role="tablist" aria-label="Results section">
+          {/* The two reports: a segmented switch, since they are alternatives, not filters. */}
+          <div className="inline-flex rounded-lg bg-slate-100 p-1 text-sm font-medium" role="tablist" aria-label="Report">
             {(
               [
-                ['screens', 'Excipient screens', data.screens.total],
-                ['candidates', 'Candidates', data.design.candidates],
-                ['simulations', 'Simulations', s.by_state.done + active + s.by_state.failed],
+                ['screening', 'Excipient screening'],
+                ['design', 'Polymer design'],
               ] as const
-            ).map(([k, label, n]) => (
+            ).map(([k, label]) => (
               <button
                 key={k}
                 type="button"
                 role="tab"
-                aria-selected={section === k}
-                onClick={() => pick(k)}
-                className={`rounded-full border px-3 py-1 text-sm font-medium transition ${
-                  section === k
-                    ? 'border-slate-900 bg-slate-900 text-white'
-                    : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'
+                aria-selected={scope === k}
+                onClick={() => pickScope(k)}
+                className={`rounded-md px-4 py-1.5 transition ${
+                  scope === k ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'
                 }`}
               >
-                {label} <span className="tabular-nums opacity-70">{n}</span>
+                {label}
               </button>
             ))}
           </div>
 
-          {section === 'screens' && <ScreensSection data={data.screens} onOpenScreen={onOpenScreen} />}
-          {section === 'candidates' && <CandidatesSection data={data.design} onOpenCampaign={onOpenCampaign} />}
-          {section === 'simulations' && (
-            <SimulationsSection data={s} previewNs={data.cpu_preview_ns} onOpenCampaign={onOpenCampaign} />
+          {scope === 'screening' ? (
+            <>
+              <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+                <Tile
+                  label="Excipient screens"
+                  value={data.screens.total.toLocaleString()}
+                  sub={data.screens.failed ? `${data.screens.failed} failed` : 'from the Screen tab'}
+                  color="var(--series-screens)"
+                />
+                <Tile
+                  label="Need testing"
+                  value={data.screens.needs_testing.toLocaleString()}
+                  sub={`of ${data.screens.ok} finished`}
+                  color="var(--status-warning)"
+                />
+                <Tile
+                  label="Evidence coverage"
+                  value={pct(data.screens.coverage_mean)}
+                  sub="average across your screens"
+                  color="var(--ramp-2)"
+                />
+                <Tile
+                  label="High-severity liabilities"
+                  value={data.screens.liabilities.high.toLocaleString()}
+                  sub={`${data.screens.liabilities.moderate} moderate, ${data.screens.liabilities.low} low`}
+                  color="var(--status-critical)"
+                />
+              </div>
+              <ScreensSection data={data.screens} onOpenScreen={onOpenScreen} />
+            </>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+                <Tile
+                  label="Candidates generated"
+                  value={data.design.candidates.toLocaleString()}
+                  sub={`${data.design.campaigns} campaign${data.design.campaigns === 1 ? '' : 's'}, ${data.design.iterations} iterations`}
+                  color="var(--series-polymers)"
+                />
+                <Tile
+                  label="Screened in full"
+                  value={data.design.screened.total.toLocaleString()}
+                  sub={`${data.design.screened.needs_testing} need testing`}
+                  color="var(--series-screens)"
+                />
+                <Tile
+                  label="Simulations finished"
+                  value={s.by_state.done.toLocaleString()}
+                  sub={active ? `${active} waiting or running` : `${s.by_state.failed} failed`}
+                  color="var(--series-sims)"
+                />
+                <Tile
+                  label="Excluded from the surface"
+                  value={s.calls.excluded.toLocaleString()}
+                  sub="clearly, at two standard errors"
+                  color="var(--div-neg-2)"
+                />
+              </div>
+
+              <Pills
+                label="Polymer design section"
+                value={designSection}
+                onPick={pickSection}
+                items={[
+                  ['candidates', 'Candidates', data.design.candidates],
+                  ['simulations', 'Simulations', s.by_state.done + active + s.by_state.failed],
+                ] as const}
+              />
+
+              {designSection === 'candidates' && <CandidatesSection data={data.design} onOpenCampaign={onOpenCampaign} />}
+              {designSection === 'simulations' && (
+                <SimulationsSection data={s} previewNs={data.cpu_preview_ns} onOpenCampaign={onOpenCampaign} />
+              )}
+            </>
           )}
         </>
       ) : null}

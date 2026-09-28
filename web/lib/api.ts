@@ -388,6 +388,9 @@ export async function runScreen(
   // The form as filled in, kept in the user's history so it can be reopened.
   form: SavedForm | null,
   signal?: AbortSignal,
+  // A designed candidate handed over with "Screen this candidate": the screen is
+  // then reported with the designer's work, not as an excipient screen.
+  candidateId?: string,
 ): Promise<Dossier> {
   const res = await call('/screen', {
     method: 'POST',
@@ -397,6 +400,7 @@ export async function runScreen(
       ...(polymer ? { polymer } : {}),
       ...(exposure ? { exposure } : {}),
       ...(form ? { form } : {}),
+      ...(candidateId ? { candidate_id: candidateId } : {}),
     }),
     signal,
   });
@@ -427,6 +431,9 @@ export type SavedForm =
 
 export interface ScreenSummary {
   kind: 'screen';
+  // 'design' when it screened a designed candidate ("Screen this candidate").
+  origin?: 'excipient' | 'design';
+  candidate_id?: string | null;
   id: string;
   at: string;
   status: 'ok' | 'failed';
@@ -565,9 +572,11 @@ export interface CampaignResult {
   median_score: number | null;
   alert_free: number | null;
   n_sent: number;
+  n_screened: number;
   n_simulated: number;
   best_by_iteration: number[];
-  top: { id: string; name: string; score: number; status: CandidateStatus } | null;
+  // screen: the worst verdict of its full excipient screen, when it has had one.
+  top: { id: string; name: string; score: number; status: CandidateStatus; screen: string | null } | null;
 }
 
 export interface SimulationRun {
@@ -604,6 +613,8 @@ export interface MyResults {
     by_status: Record<CandidateStatus, number>;
     alert_free: number | null;
     tg_in_domain: number | null;
+    // Candidates given the full excipient screen ("Screen this candidate").
+    screened: { total: number; worst_verdict: Record<string, number>; needs_testing: number };
     per_campaign: CampaignResult[];
   };
   simulations: {
@@ -692,6 +703,8 @@ export interface AdminStats {
     duration_p90_s: number | null;
   };
   polymers: {
+    // Designed candidates put through the full excipient screen, by worst verdict.
+    screened_in_full: Record<string, number>;
     candidates_per_campaign: Bin[];
     iterations_per_campaign: Bin[];
     alert_free: number | null;
@@ -768,6 +781,7 @@ export interface ScreenRecord {
     polymer: PolymerSpec | null;
     exposure: ExposureInputs | null;
     form: SavedForm | null;
+    candidate_id?: string | null;
   };
   dossier: Dossier | null;
   error: string | null;

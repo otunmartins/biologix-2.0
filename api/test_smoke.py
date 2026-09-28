@@ -11,6 +11,7 @@ must be accepted once the precedent tool has actually returned a route match.
 
 import asyncio
 import json
+from datetime import datetime, timezone
 import os
 
 # The Anthropic provider wants a key at construction time. Nothing is ever sent —
@@ -1574,7 +1575,8 @@ def main_test():
             assert client.get("/design/my-results").status_code == 401
             res = client.get("/design/my-results", headers=as_("tok-alice")).json()
             n = lambda sql, *a: conn.execute(sql, a).fetchone()["n"]
-            assert res["screens"]["total"] == n("SELECT COUNT(*) AS n FROM screen_run WHERE owner_id=%s", alice)
+            assert res["screens"]["total"] == n("SELECT COUNT(*) AS n FROM screen_run WHERE owner_id=%s "
+                                                "AND origin IS DISTINCT FROM 'design'", alice)
             assert res["design"]["candidates"] == n(
                 "SELECT COUNT(*) AS n FROM candidate c JOIN campaign cp ON cp.id=c.campaign_id "
                 "WHERE cp.owner_id=%s", alice) > 0
@@ -1598,6 +1600,43 @@ def main_test():
             assert spare["id"] not in {x["id"] for x in bobs_view["simulations"]["runs"]}
             print("ok  results tab: your screens, candidates and simulations with their metrics; "
                   "smoke tests left out; nobody else's work")
+
+            # Where a screen came from: a designed candidate's screen is design work, reported
+            # with its campaign and never among excipient screens -- in Results or for the admin.
+            H, now_ = main.history, datetime.now(timezone.utc)
+            cand = next(c for c in CS.candidates_for(conn, cid) if c["status"] == "benchmarked")
+            dossier = {**_dossier("D", "Data gap: test"), "excipient": cand["name"]}
+            before = client.get("/design/my-results", headers=as_("tok-alice")).json()
+            admin0 = client.get("/design/admin/stats", headers=as_("tok-alice")).json()
+            sid_design = H.record_screen(conn, alice, request={"prompt": "x", "candidate_id": cand["id"]},
+                                         dossier=dossier, error=None, provenance={}, started_at=now_,
+                                         finished_at=now_, candidate_id=cand["id"])
+            sid_forged = H.record_screen(conn, bob, request={"prompt": "x"}, dossier=dossier, error=None,
+                                         provenance={}, started_at=now_, finished_at=now_,
+                                         candidate_id=cand["id"])
+            row = lambda s: conn.execute("SELECT origin, candidate_id FROM screen_run WHERE id=%s", (s,)).fetchone()
+            assert dict(row(sid_design)) == {"origin": "design", "candidate_id": cand["id"]}
+            assert dict(row(sid_forged)) == {"origin": "excipient", "candidate_id": None}, \
+                "someone else's candidate is not taken"
+            after = client.get("/design/my-results", headers=as_("tok-alice")).json()
+            assert after["screens"]["total"] == before["screens"]["total"], "not an excipient screen"
+            assert after["design"]["screened"]["total"] == before["design"]["screened"]["total"] + 1
+            assert next(c for c in after["design"]["per_campaign"] if c["id"] == cid)["n_screened"] >= 1
+            admin1 = client.get("/design/admin/stats", headers=as_("tok-alice")).json()
+            assert admin1["totals"]["screens"] == admin0["totals"]["screens"] + 1, "only bob's counts"
+            assert sum(admin1["polymers"]["screened_in_full"].values()) == \
+                sum(admin0["polymers"]["screened_in_full"].values()) + 1
+            hist = client.get("/history", params={"kind": "screen"}, headers=as_("tok-alice")).json()["items"]
+            assert next(i for i in hist if i["id"] == sid_design)["origin"] == "design"
+            # A screen saved before origin existed is sorted out by its name, once.
+            conn.execute("UPDATE screen_run SET origin=NULL, candidate_id=NULL WHERE id=%s", (sid_design,))
+            main.db.init_schema(conn, H.BACKFILL_ORIGIN, force=True)
+            back = dict(row(sid_design))
+            linked = conn.execute("SELECT payload FROM candidate WHERE id=%s", (back["candidate_id"],)).fetchone()
+            # Names can repeat across campaigns; a name match links the newest candidate by that name.
+            assert back["origin"] == "design" and json.loads(linked["payload"])["name"] == cand["name"], back
+            print("ok  scopes: a designed candidate's screen is reported with the design, never as an "
+                  "excipient screen; a forged candidate is ignored; old screens are sorted by name")
 
             # The 3D view: the run's last frame, kept apart from its result, only for its owner.
             stored = conn.execute("SELECT sim_result FROM candidate WHERE id=%s", (spare["id"],)).fetchone()
@@ -1629,7 +1668,8 @@ def main_test():
             st = r.json()
             n = lambda sql: conn.execute(sql).fetchone()["n"]
             assert st["totals"]["polymers"] == n("SELECT COUNT(*) AS n FROM candidate")
-            assert st["totals"]["screens"] == n("SELECT COUNT(*) AS n FROM screen_run") > 0
+            assert st["totals"]["screens"] == n("SELECT COUNT(*) AS n FROM screen_run "
+                                                "WHERE origin IS DISTINCT FROM 'design'") > 0,                 "excipient screens only: a designed candidate's screen is design work"
             assert st["totals"]["users"] == n("SELECT COUNT(*) AS n FROM users") >= 2
             assert len(st["series"]["dates"]) == len(st["series"]["screens"]) == 30
             assert sum(st["series"]["screens"]) == st["totals"]["screens"], "every test screen is today"
@@ -1640,7 +1680,7 @@ def main_test():
             assert st["simulations"]["previews"] >= 1, "the CPU preview is counted"
             assert sum(b["n"] for b in st["screens"]["coverage"]) == n(
                 "SELECT COUNT(DISTINCT id) AS n FROM screen_run, jsonb_array_elements(dossier->'endpoints') e "
-                "WHERE dossier IS NOT NULL")
+                "WHERE dossier IS NOT NULL AND origin IS DISTINCT FROM 'design'")
             assert st["screens"]["coverage_mean"] is not None and 0 <= st["screens"]["coverage_mean"] <= 1
             assert set(st["screens"]["liabilities"]) == {"high", "moderate", "low"}
             assert sum(b["n"] for b in st["polymers"]["candidates_per_campaign"]) == n(
