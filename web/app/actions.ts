@@ -19,11 +19,11 @@ export async function signOutAndReturn() {
 // field is not emptied; the password never is.
 export type PasswordState = { error: string | null; email: string };
 
-function clientIp(): string {
+async function clientIp(): Promise<string> {
   // Caddy sets X-Forwarded-For to the real client address and does not trust
   // one sent by the client, so the first entry is who is actually asking.
   // Absent in local dev, where every request is from this machine anyway.
-  return headers().get('x-forwarded-for')?.split(',')[0]?.trim() || 'local';
+  return (await headers()).get('x-forwarded-for')?.split(',')[0]?.trim() || 'local';
 }
 
 function field(form: FormData, name: string): string {
@@ -33,7 +33,7 @@ function field(form: FormData, name: string): string {
 
 export async function signInWithPassword(_prev: PasswordState, form: FormData): Promise<PasswordState> {
   const email = field(form, 'email');
-  const result = await checkPassword(email, field(form, 'password'), clientIp());
+  const result = await checkPassword(email, field(form, 'password'), await clientIp());
   if (!result.ok) return { error: result.error, email };
   await startSession(result.userId);
   // Outside any try/catch: redirect() works by throwing.
@@ -42,7 +42,7 @@ export async function signInWithPassword(_prev: PasswordState, form: FormData): 
 
 export async function registerWithPassword(_prev: PasswordState, form: FormData): Promise<PasswordState> {
   const email = field(form, 'email');
-  const result = await register(email, field(form, 'password'), field(form, 'name'), clientIp());
+  const result = await register(email, field(form, 'password'), field(form, 'name'), await clientIp());
   if (!result.ok) return { error: result.error, email };
   await startSession(result.userId);
   redirect('/');
