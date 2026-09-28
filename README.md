@@ -15,7 +15,7 @@ api/         FastAPI backend — wraps the PydanticAI agent behind /screen
              main.py the agent and tools, accessibility.py solvent accessibility,
              precedent.py the FDA precedent lookup
 terraform/   Provisions one EC2 instance to run it all
-docker-compose.yml, Caddyfile   The whole stack on that one instance
+docker-compose.yml, caddy/   The whole stack on that one instance (caddy/Caddyfile routes it)
 ```
 
 ## Run it locally first (no Docker, no AWS)
@@ -187,7 +187,7 @@ that address. If the new build fails any of it, the box rolls back to the previo
 
 Things that bite here:
 
-- The API lives under **`/_api`** in production (Caddyfile): the app's pages `/screen`, `/design`
+- The API lives under **`/_api`** in production (caddy/Caddyfile): the app's pages `/screen`, `/design`
   and `/history` share names with API routes. `PUBLIC_API_URL` must end in `/_api`; the image
   build refuses anything else. `/health` and `/worker*` stay at the root for the deploy check and
   the GPU worker.
