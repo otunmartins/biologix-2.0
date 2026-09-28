@@ -1374,8 +1374,14 @@ def main_test():
                       "contacts": [{"residue": "LYS 8 A", "fraction": 0.3}],
                       "engine": "OpenMM 8.2.0, CUDA", "forcefields": "Amber ff14SB / OpenFF 2.2.0 / TIP3P",
                       "structure_source": "RCSB PDB 1L2Y (experimental)", "n_atoms": 30000,
-                      "wall_seconds": 3600}
+                      "wall_seconds": 3600,
+                      "interaction_energy": {"total_kj": -310.5, "elec_kj": -120.0, "vdw_kj": -190.5},
+                      "liability_coverage": [{"class": "Oxidation", "n_sites": 2, "coverage": 0.2}],
+                      "stability": {"rmsd_nm": {"final": 0.21}, "q": {"final": 0.93}}}
             res = f"/worker/jobs/{j1['job_id']}/result"
+            r = client.post(res, json={"worker": "w1", "result": {**result, "stability": {"rmsf": [0.1] * 90_000}}},
+                            headers=W)
+            assert r.status_code == 422, "an oversized result is refused"
             assert client.post(res, json={"worker": "w2", "result": result}, headers=W).status_code == 409
             r = client.post(res, json={"worker": "w1", "result": {**result, "temperature_k": 1000}}, headers=W)
             assert r.status_code == 422, "an implausible result is refused"
@@ -1392,6 +1398,8 @@ def main_test():
                         if c["id"] == j1["job_id"])
             assert done["status"] == "simulated" and done["simulation"]["result"]["gamma23"] == -2.4
             assert done["simulation"]["result"]["gamma23_profile"] == {"0.6": -1.1, "1": -2.4}
+            assert done["simulation"]["result"]["interaction_energy"]["total_kj"] == -310.5
+            assert done["simulation"]["result"]["stability"]["q"]["final"] == 0.93
             assert client.post(res, json={"worker": "w1", "result": result}, headers=W).status_code == 409, \
                 "a job reports once"
             print("ok  worker: a result is checked, lands on the candidate, and is recorded as a "
@@ -1561,7 +1569,8 @@ def main_test():
             j = client.post("/worker/claim", json={"worker": "cpu1", "platform": "CPU"}, headers=W).json()
             assert j["job_id"] == spare["id"]
             assert j["settings"] == {"tier": "cpu", "production_ns": main.CPU_PREVIEW_NS,
-                                     "equilibration_ns": main.CPU_PREVIEW_EQUIL_NS}, j["settings"]
+                                     "equilibration_ns": main.CPU_PREVIEW_EQUIL_NS,
+                                     "stress_ns": main.CPU_PREVIEW_STRESS_NS}, j["settings"]
             before = conn.execute("SELECT COUNT(*) AS n FROM measurement").fetchone()["n"]
             r = client.post(f"/worker/jobs/{spare['id']}/result", headers=W,
                             json={"worker": "cpu1", "result": {**result, "production_ns": 1.0,

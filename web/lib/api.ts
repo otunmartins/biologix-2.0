@@ -191,6 +191,81 @@ export interface SimulationResult {
   notes: string[];
   // What the worker actually applied (absent on runs from before it reported them).
   conditions?: Partial<Record<ConditionKey, number>>;
+  // Tier 1 (worker/metrics.py), absent on runs from before it existed.
+  interaction_energy?: {
+    total_kj: number;
+    total_se: number | null;
+    elec_kj: number;
+    vdw_kj: number;
+    per_chain_kj: number;
+    per_residue: { residue: string; kj: number; elec_kj: number; vdw_kj: number }[];
+    repulsive: { residue: string; kj: number }[];
+    series: number[];
+    method: string;
+  } | null;
+  hbonds?: {
+    polymer_protein: number;
+    protein_water: number;
+    per_residue: { residue: string; per_frame: number }[];
+    series_polymer_protein: number[];
+    criterion: string;
+  } | null;
+  residence?: {
+    bound_fraction: number;
+    chain_mean_ps: number;
+    chain_max_ps: number;
+    binding_events: number;
+    residues: { residue: string; mean_ps: number; max_ps: number; events: number }[];
+    frame_ps: number;
+  } | null;
+  liability_coverage?: {
+    class: string;
+    why: string;
+    n_sites: number;
+    coverage: number;
+    residues: { residue: string; fraction: number }[];
+  }[];
+  self_association?: {
+    n_chains: number;
+    mean_largest_cluster: number;
+    max_cluster: number;
+    mean_clusters: number;
+    free_fraction: number;
+  } | null;
+  qc?: {
+    temperature_k: number;
+    temperature_sd: number;
+    target_k: number;
+    density_g_ml: number;
+    density_sd: number;
+    potential_drift_kj_per_ns: number;
+    ok: boolean;
+  } | null;
+  // Tier 2: the unrestrained stage at a stress temperature.
+  stability?: {
+    temperature_c: number;
+    ns: number;
+    n_frames: number;
+    rmsd_nm: { final: number; mean_last_half: number; max: number };
+    q: { final: number; mean_last_half: number; min: number; n_contacts: number };
+    rg_nm: { start: number; final: number };
+    sasa_nm2: { start: number; final: number; hydrophobic_start: number; hydrophobic_final: number };
+    secondary: { helix_start: number; strand_start: number; helix_final: number; strand_final: number; retained: number };
+    rmsf_top: { residue: string; nm: number }[];
+    rmsf: number[];
+    rmsf_residues: string[];
+    series: {
+      t_ns: number[];
+      rmsd: number[];
+      q: number[];
+      rg: number[];
+      t_slow_ns: number[];
+      sasa: number[];
+      hydrophobic_sasa: number[];
+      helix: number[];
+      strand: number[];
+    };
+  } | null;
 }
 
 export type ConditionKey = 'temperature_c' | 'ph' | 'salt_mm' | 'polymer_wv_percent';

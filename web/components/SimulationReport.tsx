@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { ChartCard, ForestPlot, HBars, type ForestRow } from '@/components/admin/charts';
 import { readGamma, TIER_LABEL } from '@/components/DesignResults';
 import MolViewer from '@/components/MolViewer';
+import SimulationMetrics from '@/components/SimulationMetrics';
 import { getSimulationSnapshot, type ConditionKey, type SimulationJob } from '@/lib/api';
 import { formatCondition } from '@/lib/conditions';
 
@@ -100,6 +101,12 @@ export default function SimulationReport({
     ['Engine', r.engine],
     ['Force fields', r.forcefields],
     ['Structure', r.structure_source || sim.structure_id],
+    ...(r.qc
+      ? [[
+          'Run check',
+          `${r.qc.temperature_k} ± ${r.qc.temperature_sd} K (asked ${r.qc.target_k} K), density ${r.qc.density_g_ml} g/mL${r.qc.ok ? '' : ' — temperature off target'}`,
+        ] as [string, string]]
+      : []),
     ['Compute time', duration(r.wall_seconds)],
     ...(sim.finished_at ? [['Finished', new Date(sim.finished_at).toLocaleString()] as [string, string]] : []),
   ];
@@ -181,6 +188,8 @@ export default function SimulationReport({
         )}
       </ChartCard>
 
+      <SimulationMetrics r={r} />
+
       {blocks.length > 1 && (
         <ChartCard
           title="Did the number settle?"
@@ -220,7 +229,7 @@ export default function SimulationReport({
             </p>
           )}
           <p className="mt-3 text-xs leading-relaxed text-[color:var(--ink-muted)]">
-            What the worker applied, which is what counts. Protein backbone held to its native structure.
+            What the worker applied, which is what counts. Protein backbone held to its native structure during production{r.stability ? `, then released for the stress stage at ${r.stability.temperature_c} °C` : ''}.
           </p>
         </section>
 

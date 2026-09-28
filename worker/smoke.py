@@ -32,7 +32,7 @@ job = {
 }
 
 result = simulate.run(job, simulate.Settings.from_env(), progress=lambda m: print("  " + m, flush=True))
-print(json.dumps({k: v for k, v in result.items() if k != "contacts"}, indent=1))
+print(json.dumps({k: v for k, v in result.items() if k not in ("contacts", "stability", "snapshot_pdb")}, indent=1)[:6000])
 
 required = {"gamma23", "gamma23_se", "production_ns", "temperature_k", "n_chains", "n_frames",
             "r_local_nm", "r_bulk_nm", "engine", "forcefields", "n_atoms", "wall_seconds"}
@@ -40,5 +40,11 @@ missing = required - set(result)
 assert not missing, f"result is missing {missing}"
 assert result["smoke"] is True and result["n_chains"] == 2 and result["n_frames"] >= 5, result
 assert abs(result["temperature_k"] - 298.15) < 0.01
+for k in ("interaction_energy", "hbonds", "residence", "liability_coverage", "self_association", "qc",
+          "stability"):
+    assert result.get(k) is not None, f"no {k} in the result"
+assert result["self_association"]["n_chains"] == 2, result["self_association"]
+assert result["stability"]["n_frames"] >= 5 and result["stability"]["rmsd_nm"]["final"] < 1.0, result["stability"]
+print(json.dumps({k: result[k] for k in ("interaction_energy", "qc")}, indent=1)[:2000])
 print("\nsmoke test passed: every stage of the simulation ran")
 sys.exit(0)

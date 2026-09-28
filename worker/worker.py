@@ -98,7 +98,7 @@ def settings_for(job: dict) -> simulate.Settings:
     """This machine's defaults, with the run length the API chose for the job."""
     s = simulate.Settings.from_env()
     s.platform = s.platform or PLATFORM
-    for k in ("production_ns", "equilibration_ns"):
+    for k in ("production_ns", "equilibration_ns", "stress_ns"):
         if k in (job.get("settings") or {}):
             setattr(s, k, float(job["settings"][k]))
     s.preview = (job.get("settings") or {}).get("tier") == "cpu"
