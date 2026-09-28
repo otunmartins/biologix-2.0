@@ -12,6 +12,10 @@ services:
     restart: unless-stopped
 
   web:
+    # The deploy pulls this image, built by GitHub Actions for the commit being
+    # deployed (IMAGE_TAG), so the server never compiles anything. `build` is
+    # for running the stack locally: `docker compose up --build`.
+    image: ghcr.io/otunmartins/biologix-web:${IMAGE_TAG:-latest}
     build:
       context: ./web
       args:
@@ -38,6 +42,7 @@ services:
     restart: unless-stopped
 
   api:
+    image: ghcr.io/otunmartins/biologix-api:${IMAGE_TAG:-latest}
     build: ./api
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
