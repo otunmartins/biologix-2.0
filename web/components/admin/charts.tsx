@@ -12,6 +12,10 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 export const fmt = (n: number) =>
   n >= 1e6 ? `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1)}M` : n >= 1e4 ? `${(n / 1e3).toFixed(n >= 1e5 ? 0 : 1)}k` : n.toLocaleString();
 
+// Gridlines at 0, half and the top. Deduplicated: with a top of 1 the half
+// rounds up to 1 too, and two lines at one value would share a React key.
+const axisTicks = (max: number) => Array.from(new Set([0, Math.ceil(max / 2), max]));
+
 const shortDate = (iso: string) =>
   new Date(`${iso}T00:00:00`).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
 
@@ -231,7 +235,7 @@ export function DailyBars({
   const step = plotW / Math.max(1, values.length);
   const gap = step > 6 ? 2 : step > 3 ? 1 : 0;
   const bw = Math.max(1, step - gap);
-  const ticks = [0, Math.ceil(max / 2), max];
+  const ticks = axisTicks(max);
   const labelEvery = Math.ceil(values.length / Math.max(2, Math.floor(plotW / 70)));
   const show = (i: number, x: number, y: number) => {
     setHover(i);
@@ -341,7 +345,7 @@ export function LineChart({
     >
       {w > 0 && (
         <svg width={w} height={height} role="img" aria-label={label}>
-          {[0, Math.ceil(max / 2), max].map((t) => (
+          {axisTicks(max).map((t) => (
             <g key={t}>
               <line x1={padL} x2={w} y1={Y(t)} y2={Y(t)} stroke="var(--grid)" />
               <text x={padL - 6} y={Y(t) + 3} textAnchor="end" fontSize={10} fill="var(--ink-muted)">
@@ -500,7 +504,7 @@ export function Columns({
             const show = (px: number, py: number) =>
               setTip({ x: px, y: py, title: `${b.tip ?? b.label}${unit}`, rows: [{ color: colors[k], label: 'count', value: b.value.toLocaleString() }] });
             return (
-              <g key={b.label}>
+              <g key={k}>
                 {b.value > 0 && (
                   <path
                     d={`M${x},${base}V${base - h + r}Q${x},${base - h} ${x + r},${base - h}H${x + bw - r}Q${x + bw},${base - h} ${x + bw},${base - h + r}V${base}Z`}

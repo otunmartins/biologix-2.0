@@ -293,6 +293,7 @@ function QueueControl({
   queueing: boolean;
 }) {
   const [sid, setSid] = useState('');
+  const [needsId, setNeedsId] = useState(false);
   const canQueue = status === 'benchmarked' || status === 'failed';
   if (!canQueue) {
     return (
@@ -314,22 +315,34 @@ function QueueControl({
       className="flex w-full flex-wrap items-end gap-2 sm:w-auto"
       onSubmit={(e) => {
         e.preventDefault();
+        // Never a silently greyed-out button: say what is missing.
         if (sid.trim()) onQueue(sid.trim());
+        else setNeedsId(true);
       }}
     >
       <label className="block text-xs font-medium text-slate-600">
         Your biologic&rsquo;s PDB ID or UniProt accession
         <input
           value={sid}
-          onChange={(e) => setSid(e.target.value)}
+          onChange={(e) => {
+            setSid(e.target.value);
+            setNeedsId(false);
+          }}
+          aria-invalid={needsId}
           placeholder="1IGT or P01857"
           maxLength={40}
           className="mt-1 block w-40 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-sm text-slate-900 placeholder:text-slate-400 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
         />
       </label>
-      <button type="submit" className="btn-ghost" disabled={queueing || !sid.trim()}>
+      <button type="submit" className="btn-ghost" disabled={queueing}>
         {label}
       </button>
+      {needsId && (
+        <p className="w-full text-xs text-alert" role="alert">
+          A simulation runs the polymer against your protein, so it needs the protein&rsquo;s structure: type its PDB ID
+          (e.g. 1IGT) or UniProt accession (e.g. P01857), then queue.
+        </p>
+      )}
     </form>
   );
 }
