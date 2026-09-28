@@ -131,84 +131,78 @@ what was screened. That endpoint is public: a drawing reveals nothing about any 
 check per thumbnail would cost a database round trip. It is size-limited, cached, and rate-limited
 per address instead.
 
-## Deploy to AWS
+## Deploy
 
-Defaults to a `t3.large` (8 GB RAM) on the current Ubuntu 22.04 AMI: no AMI to look up, and no
-GPU quota request to wait on. It runs the whole app. Simulations need a GPU and run elsewhere
-(see "OpenMM simulations" below).
+Production is one small Ubuntu server running Docker Compose: Caddy (HTTPS), the web app and the
+API. Today that is a DigitalOcean droplet (2 vCPU, 2 GB, New York, next to the Neon database in
+AWS us-east-2) at **https://studio.biologix.app**. Any Ubuntu 24.04 box with SSH works the same.
+Simulations need a GPU and run elsewhere (see "OpenMM simulations" below).
 
-**1. Credentials and a key pair** (one time):
+The server never compiles anything. On every merge to `main`, GitHub Actions runs the tests,
+builds the API and web images for that commit, pushes them to GHCR
+(`ghcr.io/otunmartins/biologix-api` and `-web`, tagged with the commit), then SSHes in, checks out
+that commit, pulls those two images and restarts. It checks the result and rolls back to the
+previous commit's images if the new ones fail.
 
-```bash
-aws configure                 # access key, secret, default region
-aws ec2 create-key-pair --key-name excipient-screen \
-  --query KeyMaterial --output text > excipient-screen.pem
-```
+**1. The server** (one time). Ubuntu 24.04, your SSH key and the deploy key added at creation. As
+root: updates, 2 GB of swap, `ufw` allowing only OpenSSH, 80 and 443, Docker from Docker's own apt
+repository with log rotation (`/etc/docker/daemon.json`: json-file, 10 MB × 3), and a `deploy` user
+in the `docker` group (no sudo) holding the same `authorized_keys`. Deploys log in as `deploy`.
 
-**2. Apply:**
+**2. DNS.** An A record for the site's name (`studio` under `biologix.app`) pointing at the server.
+`.app` domains are HTTPS-only in every browser; Caddy gets the certificate on its own.
 
-```bash
-cd terraform
-terraform init
-terraform apply -var="key_name=excipient-screen"
-```
-
-Leave `ssh_cidr` at its default. Deploys SSH in from GitHub's runners, whose addresses change,
-so restricting it to your own IP blocks every deploy. Login is key-only.
-
-This prints a public IP. It's an Elastic IP, so it survives a stop/start of the instance.
-
-**3. Point your domain at it.** At your DNS provider, add an A record for the domain (or a
-subdomain) with the IP from step 2. Google sign-in needs a real domain: it won't redirect to a
-bare IP.
-
-**4. Get the code on the box and bring it up:**
+**3. The code and `.env` on the box**, as `deploy`:
 
 ```bash
-ssh -i excipient-screen.pem ubuntu@<the-ip>
-git clone https://github.com/otunmartins/biologix-2.0.git && cd biologix-2.0
-cp .env.example .env    # then fill it in, below
-docker compose up -d --build    # first build is slow: RDKit + a Next.js build
-docker compose exec api python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/health').read().decode())"
+git clone https://github.com/otunmartins/biologix-2.0.git ~/biologix-2.0
+cd ~/biologix-2.0 && cp .env.example .env   # then fill it in, below
 ```
 
-In `.env`: `ANTHROPIC_API_KEY`, Neon's **pooled** `DATABASE_URL`, the three sign-in values
-(`AUTH_SECRET`, `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`), and your domain in the last three:
-`SITE_ADDRESS=<your-domain>`, `WEB_ORIGIN=https://<your-domain>`,
-`NEXT_PUBLIC_API_URL=https://<your-domain>/_api` (the API lives under `/_api`, because the app's
-pages `/screen`, `/design` and `/history` share names with API routes; the deploy refuses a value
-without it). Caddy gets the HTTPS certificate on its own once
-DNS points at the box. The health check should show `model_configured`, `database.reachable`
-and `tg_model` all true.
+In `.env`: `ANTHROPIC_API_KEY`, Neon's **pooled** production `DATABASE_URL`, the sign-in values
+(`AUTH_SECRET` — its own, not your laptop's — `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`),
+`ADMIN_EMAILS`, `WORKER_TOKEN`, `RUNPOD_API_KEY`, `RUNPOD_POD_ID`, and the address:
+`SITE_ADDRESS=studio.biologix.app`, `WEB_ORIGIN=https://studio.biologix.app`. In the Google Cloud
+console, add `https://studio.biologix.app/api/auth/callback/google` to the OAuth client's
+authorised redirect URIs.
 
-Clone it to exactly `/home/ubuntu/biologix-2.0` (what the commands above do): that's where the deploy
-workflow looks, unless you set an `EC2_APP_DIR` secret.
-
-**5. Turn on deploys from `main`:**
+**4. Turn on deploys from `main`:**
 
 ```bash
 gh secret set EC2_HOST --body <the-ip>
-gh secret set EC2_USER --body ubuntu
-gh secret set EC2_SSH_KEY < excipient-screen.pem
+gh secret set EC2_USER --body deploy
+gh secret set EC2_APP_DIR --body /home/deploy/biologix-2.0
+gh secret set EC2_SSH_KEY < ~/.ssh/excipient-screen
 gh secret set EC2_HOST_KEY --body "$(ssh-keyscan <the-ip> 2>/dev/null)"
-gh variable set SITE_URL --body https://<your-domain>
+gh variable set PUBLIC_API_URL --body https://studio.biologix.app/_api
+gh variable set SITE_URL --body https://studio.biologix.app
 gh variable set DEPLOY_ENABLED --body true
 ```
 
-From then on every merge to `main` runs the tests, deploys, and checks the result: the API's
-`/health` on the box, then `SITE_URL` from outside, including that Google will call back to that
-address. If the new build fails any of it, the box rolls back to the previous one.
+(The secrets keep their `EC2_` names from when the box was on AWS; they mean any server.)
 
-Two things that bite here:
+From then on every merge to `main` runs the tests, builds, deploys, and checks the result: the
+API's `/health` on the box, then `SITE_URL` from outside, including that Google will call back to
+that address. If the new build fails any of it, the box rolls back to the previous one.
 
-- `NEXT_PUBLIC_API_URL` is baked into the frontend bundle at **build** time, so changing it in
-  `.env` needs a rebuild (`--build`), not just a restart.
-- The frontend, API, and Caddy's reverse proxy all share one origin in the deployed stack, so
-  there's no CORS issue in production. The CORS middleware in `api/main.py` is there for local dev.
+Things that bite here:
+
+- The API lives under **`/_api`** in production (Caddyfile): the app's pages `/screen`, `/design`
+  and `/history` share names with API routes. `PUBLIC_API_URL` must end in `/_api`; the image
+  build refuses anything else. `/health` and `/worker*` stay at the root for the deploy check and
+  the GPU worker.
+- `PUBLIC_API_URL` is baked into the web image at build time: changing it needs a new build (re-run
+  the Deploy workflow), not a restart.
+- The frontend, API and Caddy share one origin in production, so there's no CORS there. The CORS
+  middleware in `api/main.py` is for local dev.
+- By hand on the box, `docker compose up -d` runs the `latest` images; the deploy pins the exact
+  commit with `IMAGE_TAG`. `docker compose up --build` still builds locally if you ever need to.
+
+**AWS instead.** `terraform/` creates an EC2 box for the same setup. This account's EC2 and
+Lightsail quotas were too small, which is why production is on DigitalOcean.
 
 **No GPU here.** This box never runs simulations: the OpenMM worker runs on a RunPod GPU pod and
-pulls its work from this box over HTTPS (see "OpenMM simulations" below). The account has no AWS
-G-instance quota, so don't point `instance_type` at a GPU type.
+pulls its work from this box over HTTPS (see "OpenMM simulations" below).
 
 ## What's real vs. simplified right now
 

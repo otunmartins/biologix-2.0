@@ -7,7 +7,7 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# One deploy at a time. Two overlapping `docker compose up --build` runs on the
+# One deploy at a time. Two overlapping `docker compose up` runs on the
 # same box will fight over the image names and the port bindings.
 concurrency:
   group: deploy-production
@@ -19,14 +19,71 @@ jobs:
   tests:
     uses: ./.github/workflows/tests.yml
 
-  deploy:
+  # The API and web images for this commit, built here rather than on the box:
+  # a small server has no memory to spare for a Next.js build next to the live
+  # site, and a build that fails here never touches it. Tagged with the commit,
+  # so a rollback is a pull of the previous one.
+  images:
     needs: tests
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the public API address
+        # Baked into the web bundle, so it is set here, as a repository
+        # variable, not in the box's .env. It must end in /_api (Caddyfile).
+        env:
+          PUBLIC_API_URL: ${{ vars.PUBLIC_API_URL }}
+        run: |
+          echo "$PUBLIC_API_URL" | grep -qE '^https://.+/_api/?$' \
+            || { echo "::error::set the repository variable PUBLIC_API_URL to https://<domain>/_api"; exit 1; }
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./api
+          push: true
+          tags: |
+            ghcr.io/otunmartins/biologix-api:${{ github.sha }}
+            ghcr.io/otunmartins/biologix-api:latest
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./web
+          push: true
+          build-args: NEXT_PUBLIC_API_URL=${{ vars.PUBLIC_API_URL }}
+          tags: |
+            ghcr.io/otunmartins/biologix-web:${{ github.sha }}
+            ghcr.io/otunmartins/biologix-web:latest
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,scope=web,mode=max
+
+  deploy:
+    needs: [tests, images]
     # Off until the box exists. Set the repository variable DEPLOY_ENABLED=true
     # once it does (gh variable set DEPLOY_ENABLED --body true); until then a
     # merge shows this job as skipped rather than as a failed SSH login. A
     # variable, not a secret, because a job-level `if` cannot read secrets.
     if: vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
+    # packages: read lets this job's token log the box in to GHCR for the pull;
+    # it expires with the job, so no registry credential is left on the box.
+    permissions:
+      contents: read
+      packages: read
     env:
       APP_DIR: ${{ secrets.EC2_APP_DIR || '/home/ubuntu/biologix-2.0' }}
     steps:
@@ -64,7 +121,11 @@ jobs:
         # The commit to roll back to if the new build comes up unhealthy.
         run: echo "sha=$(ssh target "cd '$APP_DIR' && git rev-parse HEAD")" >> "$GITHUB_OUTPUT"
 
-      - name: Pull and rebuild
+      - name: Pull the new images and restart
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           ssh target bash -euo pipefail <<EOF
@@ -86,24 +147,23 @@ jobs:
                 || { echo "::error::\$var missing from .env on the instance; deploy aborted"; exit 1; }
             done
 
-            # The web reaches the API under /_api (Caddyfile): the bare domain
-            # would send the app's own fetches to its pages. Built into the
-            # bundle, so a wrong value is a broken site, not a warning.
-            grep -qE '^NEXT_PUBLIC_API_URL=.+/_api/?$' .env \
-              || { echo "::error::NEXT_PUBLIC_API_URL in .env must end in /_api (e.g. https://<domain>/_api); deploy aborted"; exit 1; }
-
+            # Exactly the commit whose images were just built: the compose file
+            # and Caddyfile come from here, the code from the images.
             git fetch --prune origin
-            git reset --hard origin/main
+            git reset --hard "$SHA"
 
-            # --build because NEXT_PUBLIC_API_URL is baked into the frontend
-            # bundle at build time; a restart alone would not pick up a change.
-            # APP_VERSION stamps every history record with this commit. Escaped
-            # so it is read on the box, after the reset, not on the runner.
-            APP_VERSION=\$(git rev-parse --short HEAD) docker compose up -d --build
+            # This job's token, good only until the job ends: pull, then log out.
+            echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin >/dev/null
+            IMAGE_TAG="$SHA" docker compose pull api web
+            docker logout ghcr.io >/dev/null
 
-            # The box has a small root volume and every build leaves the old
-            # image behind. Without this it fills up after a dozen deploys.
-            docker image prune -f
+            # APP_VERSION stamps every history record with this commit.
+            # --no-build: the images are GitHub's, never compiled here.
+            IMAGE_TAG="$SHA" APP_VERSION="${SHA:0:7}" docker compose up -d --no-build --remove-orphans
+
+            # Every deploy leaves the previous images behind; the rollback
+            # below pulls again if it needs them.
+            docker image prune -af --filter "until=72h" >/dev/null
           EOF
 
       - name: Verify the API answers
@@ -175,13 +235,19 @@ jobs:
         if: failure() && steps.verify.conclusion == 'failure' && steps.previous.outputs.sha != ''
         env:
           PREV: ${{ steps.previous.outputs.sha }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           echo "::warning::rolling back to $PREV"
+          # The previous deploy's images are still in GHCR under its commit.
           ssh target bash -euo pipefail <<EOF
             cd "$APP_DIR"
             git reset --hard "$PREV"
-            APP_VERSION=\$(git rev-parse --short HEAD) docker compose up -d --build
+            echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin >/dev/null
+            IMAGE_TAG="$PREV" docker compose pull api web
+            docker logout ghcr.io >/dev/null
+            IMAGE_TAG="$PREV" APP_VERSION="${PREV:0:7}" docker compose up -d --no-build --remove-orphans
           EOF
           for attempt in $(seq 1 30); do
             if ssh target "cd '$APP_DIR' && docker compose exec -T api python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\", timeout=10)'" >/dev/null 2>&1; then
