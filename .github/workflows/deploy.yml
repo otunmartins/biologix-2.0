@@ -161,6 +161,12 @@ jobs:
             # --no-build: the images are GitHub's, never compiled here.
             IMAGE_TAG="$SHA" APP_VERSION="${SHA:0:7}" docker compose up -d --no-build --remove-orphans
 
+            # Caddy's image never changes, so compose leaves it running with the
+            # Caddyfile it started with. Reload it, gracefully, so a Caddyfile
+            # change in this commit takes effect; a bad one fails the deploy
+            # here and the old config keeps serving.
+            docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+
             # Every deploy leaves the previous images behind; the rollback
             # below pulls again if it needs them.
             docker image prune -af --filter "until=72h" >/dev/null
@@ -248,6 +254,7 @@ jobs:
             IMAGE_TAG="$PREV" docker compose pull api web
             docker logout ghcr.io >/dev/null
             IMAGE_TAG="$PREV" APP_VERSION="${PREV:0:7}" docker compose up -d --no-build --remove-orphans
+            docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
           EOF
           for attempt in $(seq 1 30); do
             if ssh target "cd '$APP_DIR' && docker compose exec -T api python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\", timeout=10)'" >/dev/null 2>&1; then
