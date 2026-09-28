@@ -35,7 +35,7 @@ jobs:
 
       - name: Check the public API address
         # Baked into the web bundle, so it is set here, as a repository
-        # variable, not in the box's .env. It must end in /_api (Caddyfile).
+        # variable, not in the box's .env. It must end in /_api (caddy/Caddyfile).
         env:
           PUBLIC_API_URL: ${{ vars.PUBLIC_API_URL }}
         run: |

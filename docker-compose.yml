@@ -6,7 +6,10 @@ services:
       # ":80" for plain HTTP on a bare IP, or your domain for automatic HTTPS.
       - SITE_ADDRESS=${SITE_ADDRESS:-:80}
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
+      # The folder, not the file: a deploy's `git reset` replaces the Caddyfile
+      # with a new file, and a single-file mount keeps showing the old one, so
+      # the deploy's `caddy reload` would see no change.
+      - ./caddy:/etc/caddy:ro
       - caddy_data:/data
       - caddy_config:/config
     restart: unless-stopped
