@@ -51,6 +51,32 @@ def svg(smiles: str, width: int, height: int) -> str | None:
     return d.GetDrawingText()
 
 
+@lru_cache(maxsize=256)
+def conformer_molblock(smiles: str) -> str | None:
+    """One 3D conformer of a molecule, heavy atoms only, as an MDL molblock: the
+    candidate's chain in the 3D view before any simulation has placed it. ETKDG
+    from random coordinates, which embeds long flexible chains that the default
+    start fails on, then a short force-field clean-up. Seeded, so the same
+    chain always looks the same. None if RDKit cannot parse or embed it."""
+    from rdkit.Chem import AllChem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    mol = Chem.AddHs(mol)
+    params = AllChem.ETKDGv3()
+    params.randomSeed = 7
+    params.useRandomCoords = True
+    params.maxIterations = 200
+    if AllChem.EmbedMolecule(mol, params) != 0:
+        return None
+    try:
+        AllChem.MMFFOptimizeMolecule(mol, maxIters=200)
+    except Exception:  # noqa: BLE001 - no MMFF parameters: keep the embedded geometry
+        pass
+    return Chem.MolToMolBlock(Chem.RemoveHs(mol))
+
+
 class RenderBudget:
     """At most `limit` drawings per client per minute, cached or not. A page of
     history or a long campaign loads a few dozen; this is for a script hammering

@@ -59,6 +59,11 @@ CREATE TABLE IF NOT EXISTS screen_run (
     app_version   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS screen_run_by_owner ON screen_run(owner_id, created_at DESC, id DESC);
+-- Where the screen came from: 'excipient' (the Screen tab) or 'design' (a
+-- designed candidate handed over with "Screen this candidate"), and that
+-- candidate. The two are reported apart: different questions, different scopes.
+ALTER TABLE screen_run ADD COLUMN IF NOT EXISTS origin TEXT;
+ALTER TABLE screen_run ADD COLUMN IF NOT EXISTS candidate_id TEXT;
 
 CREATE TABLE IF NOT EXISTS event (
     id           BIGSERIAL PRIMARY KEY,
@@ -74,6 +79,23 @@ CREATE INDEX IF NOT EXISTS event_by_owner ON event(owner_id, at DESC);
 CREATE INDEX IF NOT EXISTS event_by_subject ON event(subject_id, at);
 """
 
+# Screens saved before origin existed. A designed candidate is handed to the
+# screen under its own generated name ("Poly(...) bearing ..."), so a screen
+# whose excipient is exactly the name of one of its owner's candidates came from
+# the designer; everything else is an excipient screen. Once only: rows it has
+# decided are no longer NULL, and new rows always carry an origin.
+BACKFILL_ORIGIN = """
+UPDATE screen_run s SET
+  candidate_id = m.id,
+  origin = CASE WHEN m.id IS NULL THEN 'excipient' ELSE 'design' END
+FROM screen_run s2
+LEFT JOIN LATERAL (
+  SELECT c.id FROM candidate c JOIN campaign cp ON cp.id = c.campaign_id
+  WHERE cp.owner_id = s2.owner_id AND c.payload::jsonb->>'name' = s2.excipient
+  ORDER BY c.created_at DESC LIMIT 1) m ON true
+WHERE s.id = s2.id AND s.origin IS NULL;
+"""
+
 # Most serious first: a history row shows the worst verdict its dossier reached.
 VERDICT_ORDER = ["Alert: avoid", "Data gap: test", "Supported without precedent", "Precedented"]
 
@@ -83,6 +105,7 @@ def connect(url: str | None = None) -> psycopg.Connection:
     campaigns, and both need users first (candidates.connect sees to that)."""
     conn = candidates.connect(url)
     db.init_schema(conn, SCHEMA)
+    db.init_schema(conn, BACKFILL_ORIGIN)
     return conn
 
 
@@ -117,24 +140,35 @@ def worst_verdict(dossier: dict | None) -> str | None:
 
 def record_screen(conn: psycopg.Connection, owner_id: int, *, request: dict,
                   dossier: dict | None, error: str | None, provenance: dict,
-                  started_at: datetime, finished_at: datetime) -> str:
+                  started_at: datetime, finished_at: datetime,
+                  candidate_id: str | None = None) -> str:
     """Store one screen, success or failure, and log it. One transaction: a run
-    is never in the history without its event, or the other way round."""
+    is never in the history without its event, or the other way round.
+
+    candidate_id marks a screen of a designed candidate. It is taken only if the
+    candidate is this user's; otherwise the screen is an ordinary excipient one."""
     sid = str(uuid.uuid4())
     status = "ok" if dossier is not None else "failed"
     d = dossier or {}
+    if candidate_id and not conn.execute(
+            "SELECT 1 FROM candidate c JOIN campaign cp ON cp.id=c.campaign_id "
+            "WHERE c.id=%s AND cp.owner_id=%s", (candidate_id, owner_id)).fetchone():
+        candidate_id = None
+    origin = "design" if candidate_id else "excipient"
     with db.tx(conn):
         conn.execute(
             "INSERT INTO screen_run (id, owner_id, created_at, finished_at, status, request, "
             "dossier, error, provenance, excipient, protein, route, worst_verdict, "
-            "needs_testing, smiles, app_version) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "needs_testing, smiles, app_version, origin, candidate_id) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (sid, owner_id, started_at, finished_at, status, Jsonb(request),
              Jsonb(dossier) if dossier is not None else None, error, Jsonb(provenance),
              d.get("excipient"), d.get("protein"), d.get("route"), worst_verdict(dossier),
-             d.get("needs_testing"), d.get("structure_smiles") or None, APP_VERSION))
+             d.get("needs_testing"), d.get("structure_smiles") or None, APP_VERSION,
+             origin, candidate_id))
         log_event(conn, owner_id, "screen.completed" if status == "ok" else "screen.failed",
-                  "screen", sid, {"excipient": d.get("excipient"), "error": error})
+                  "screen", sid, {"excipient": d.get("excipient"), "error": error,
+                                  "origin": origin, "candidate_id": candidate_id})
     return sid
 
 
@@ -181,7 +215,8 @@ def _screen_summaries(conn: psycopg.Connection, ids: list[str], owner_id: int) -
         return {}
     rows = conn.execute(
         "SELECT id, created_at, finished_at, status, excipient, protein, route, worst_verdict, "
-        "needs_testing, smiles, error, request->>'prompt' AS prompt, app_version "
+        "needs_testing, smiles, error, request->>'prompt' AS prompt, app_version, "
+        "COALESCE(origin, 'excipient') AS origin, candidate_id "
         "FROM screen_run WHERE id = ANY(%s) AND owner_id=%s", (ids, owner_id)).fetchall()
     return {r["id"]: {
         "kind": "screen", "id": r["id"], "at": r["created_at"].isoformat(),
@@ -189,6 +224,7 @@ def _screen_summaries(conn: psycopg.Connection, ids: list[str], owner_id: int) -
         "route": r["route"], "worst_verdict": r["worst_verdict"],
         "needs_testing": r["needs_testing"], "smiles": r["smiles"], "error": r["error"],
         "prompt": r["prompt"], "app_version": r["app_version"],
+        "origin": r["origin"], "candidate_id": r["candidate_id"],
         "duration_s": round((r["finished_at"] - r["created_at"]).total_seconds(), 1),
     } for r in rows}
 

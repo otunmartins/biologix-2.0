@@ -205,7 +205,14 @@ export default function HistoryList({
                         )}
                         <span className="min-w-0 flex-1">
                           <span className="flex items-baseline justify-between gap-2">
-                            <span className="eyebrow text-[10px]">{item.kind === 'screen' ? 'Screen' : 'Design'}</span>
+                            <span className="eyebrow text-[10px]">
+                              {/* A designed candidate's screen is design work: say so where it is listed. */}
+                              {item.kind === 'screen'
+                                ? item.origin === 'design'
+                                  ? 'Screen · designed candidate'
+                                  : 'Screen'
+                                : 'Design'}
+                            </span>
                             <span className="shrink-0 text-xs tabular-nums text-slate-400">{timeOfDay(item.at)}</span>
                           </span>
                           <span className="mt-0.5 block truncate text-sm font-semibold text-slate-900">

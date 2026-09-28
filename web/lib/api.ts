@@ -180,6 +180,10 @@ export interface SimulationResult {
   n_atoms: number;
   wall_seconds: number;
   smoke: boolean;
+  // A short CPU run: not converged, never recorded as a measurement.
+  preview?: boolean;
+  // The worker saved the last frame for the 3D view (absent on older runs).
+  has_snapshot?: boolean;
   notes: string[];
 }
 
@@ -195,7 +199,11 @@ export interface SimulationJob {
   error: string | null;
   // Set once an admin has released the run to the worker; until then it waits.
   approved_at: string | null;
+  // What it was approved as: the full GPU run, or a short CPU preview.
+  tier: SimTier | null;
 }
+
+export type SimTier = 'gpu' | 'cpu';
 
 export interface StoredCandidate extends Candidate {
   id: string;
@@ -380,6 +388,9 @@ export async function runScreen(
   // The form as filled in, kept in the user's history so it can be reopened.
   form: SavedForm | null,
   signal?: AbortSignal,
+  // A designed candidate handed over with "Screen this candidate": the screen is
+  // then reported with the designer's work, not as an excipient screen.
+  candidateId?: string,
 ): Promise<Dossier> {
   const res = await call('/screen', {
     method: 'POST',
@@ -389,6 +400,7 @@ export async function runScreen(
       ...(polymer ? { polymer } : {}),
       ...(exposure ? { exposure } : {}),
       ...(form ? { form } : {}),
+      ...(candidateId ? { candidate_id: candidateId } : {}),
     }),
     signal,
   });
@@ -419,6 +431,9 @@ export type SavedForm =
 
 export interface ScreenSummary {
   kind: 'screen';
+  // 'design' when it screened a designed candidate ("Screen this candidate").
+  origin?: 'excipient' | 'design';
+  candidate_id?: string | null;
   id: string;
   at: string;
   status: 'ok' | 'failed';
@@ -456,6 +471,22 @@ export type HistoryItem = ScreenSummary | CampaignSummary;
 export interface AdminJob extends StoredCandidate {
   campaign_id: string;
   owner_email: string | null;
+  updated_at?: string;
+}
+
+export interface WorkerSeen {
+  name: string;
+  platform: string;
+  tier?: SimTier;
+  last_seen: string;
+}
+
+export interface AdminSimulations {
+  jobs: AdminJob[];
+  recent: AdminJob[];
+  workers: WorkerSeen[];
+  pod_autostart: boolean;
+  cpu_preview_ns: number;
 }
 
 async function detailOf(res: Response): Promise<string> {
@@ -463,35 +494,243 @@ async function detailOf(res: Response): Promise<string> {
   return typeof body?.detail === 'string' ? body.detail : `Server returned ${res.status}`;
 }
 
-// Whether the signed-in user approves simulations. False on any error: the
-// approvals tab is simply not shown.
-export async function getIsAdmin(signal?: AbortSignal): Promise<boolean> {
-  const res = await call('/design/queue?limit=1', { signal });
-  return res.ok ? Boolean((await res.json()).admin) : false;
-}
-
-export async function getSimulations(
-  signal?: AbortSignal,
-): Promise<{ jobs: AdminJob[]; pod_autostart: boolean }> {
+export async function getSimulations(signal?: AbortSignal): Promise<AdminSimulations> {
   const res = await call('/design/simulations', { signal });
   if (!res.ok) throw new Error(await detailOf(res));
   return res.json();
 }
 
-// Returns what RunPod said about starting the worker's pod.
-export async function approveSimulation(id: string): Promise<string> {
-  const res = await call(`/design/simulations/${encodeURIComponent(id)}/approve`, { method: 'POST' });
+// Returns what happened to the worker: RunPod starting the GPU pod, or that a
+// CPU preview needs none.
+export async function approveSimulation(id: string, tier: SimTier): Promise<string> {
+  const res = await call(`/design/simulations/${encodeURIComponent(id)}/approve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tier }),
+  });
   if (!res.ok) throw new Error(await detailOf(res));
   return (await res.json()).pod;
 }
 
-export async function declineSimulation(id: string, reason: string): Promise<void> {
+// ---- the signed-in user's own simulations (the Simulations tab) ----
+
+export interface MySimulation extends StoredCandidate {
+  campaign_id: string;
+  updated_at: string;
+  campaign: { protein: string; format: string; target_temp_c: number | null };
+}
+
+export async function getMySimulations(
+  signal?: AbortSignal,
+): Promise<{ simulations: MySimulation[]; cpu_preview_ns: number }> {
+  const res = await call('/design/my-simulations', { signal });
+  if (!res.ok) throw new Error(await detailOf(res));
+  return res.json();
+}
+
+export async function getMySimulation(
+  id: string,
+  signal?: AbortSignal,
+): Promise<{ simulation: MySimulation; events: HistoryEvent[]; cpu_preview_ns: number }> {
+  const res = await call(`/design/my-simulations/${encodeURIComponent(id)}`, { signal });
+  if (!res.ok) throw new Error(await detailOf(res));
+  return res.json();
+}
+
+// ---- the Results tab: screens, candidates and simulations, with their metrics ----
+// Shapes are api/results.py's; what each score means is written there.
+
+export type GammaCall = 'excluded' | 'accumulated' | 'unclear';
+
+export interface ExcipientResult {
+  excipient: string;
+  latest_id: string;
+  latest_at: string;
+  protein: string;
+  route: string;
+  n_screens: number;
+  // Share of endpoints Precedented or Supported: how much is known, not safety.
+  coverage: number | null;
+  worst_verdict: string | null;
+  n_endpoints: number;
+  n_gaps: number;
+  n_alerts: number;
+  n_high_liabilities: number;
+}
+
+export interface CampaignResult {
+  id: string;
+  created_at: string;
+  ended_at: string | null;
+  prompt: string;
+  protein: string;
+  format: string;
+  target_temp_c: number | null;
+  n_candidates: number;
+  n_iterations: number;
+  best_score: number | null;
+  median_score: number | null;
+  alert_free: number | null;
+  n_sent: number;
+  n_screened: number;
+  n_simulated: number;
+  best_by_iteration: number[];
+  // screen: the worst verdict of its full excipient screen, when it has had one.
+  top: { id: string; name: string; score: number; status: CandidateStatus; screen: string | null } | null;
+}
+
+export interface SimulationRun {
+  id: string;
+  campaign_id: string;
+  name: string;
+  protein: string;
+  triage_score: number;
+  gamma23: number;
+  gamma23_se: number | null;
+  call: GammaCall;
+  preview: boolean;
+  production_ns: number | null;
+  finished_at: string | null;
+}
+
+export interface MyResults {
+  screens: {
+    total: number;
+    ok: number;
+    failed: number;
+    needs_testing: number;
+    coverage_mean: number | null;
+    worst_verdict: Record<string, number>;
+    endpoint_verdicts: Record<string, number>;
+    grades: Record<string, number>;
+    liabilities: Record<'high' | 'moderate' | 'low', number>;
+    excipients: ExcipientResult[];
+  };
+  design: {
+    campaigns: number;
+    candidates: number;
+    iterations: number;
+    by_status: Record<CandidateStatus, number>;
+    alert_free: number | null;
+    tg_in_domain: number | null;
+    // Candidates given the full excipient screen ("Screen this candidate").
+    screened: { total: number; worst_verdict: Record<string, number>; needs_testing: number };
+    per_campaign: CampaignResult[];
+  };
+  simulations: {
+    by_state: Record<'waiting' | 'running' | 'done' | 'failed', number>;
+    calls: Record<GammaCall, number>;
+    runs: SimulationRun[];
+  };
+  cpu_preview_ns: number;
+}
+
+// The 3D view (MolViewer): a run's last frame as PDB text, or the biologic's
+// structure as mmCIF, both through the API so the session cookie travels.
+async function getText(path: string, signal?: AbortSignal): Promise<string> {
+  const res = await call(path, { signal });
+  if (!res.ok) throw new Error(await detailOf(res));
+  return res.text();
+}
+
+export function getSimulationSnapshot(id: string, signal?: AbortSignal): Promise<string> {
+  return getText(`/design/my-simulations/${encodeURIComponent(id)}/snapshot.pdb`, signal);
+}
+
+export function getStructureModel(structureId: string, signal?: AbortSignal): Promise<string> {
+  return getText(`/structure/model/${encodeURIComponent(structureId)}`, signal);
+}
+
+export function getConformer(smiles: string, signal?: AbortSignal): Promise<string> {
+  return getText(`/structure/conformer?${new URLSearchParams({ smiles })}`, signal);
+}
+
+export function getMyResults(signal?: AbortSignal): Promise<MyResults> {
+  return getJson('/design/my-results', signal);
+}
+
+// Denies a waiting or approved job, or stops a running one. True when it stopped a run.
+export async function declineSimulation(id: string, reason: string): Promise<boolean> {
   const res = await call(`/design/simulations/${encodeURIComponent(id)}/decline`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ reason }),
   });
   if (!res.ok) throw new Error(await detailOf(res));
+  return Boolean((await res.json()).stopped);
+}
+
+// ---- the admin dashboard: platform-wide counts, never anyone's content ----
+
+export interface Bin {
+  lo: number | null;
+  hi: number | null;
+  n: number;
+}
+
+export interface AdminStats {
+  generated_at: string;
+  window_days: number;
+  totals: Record<
+    | 'users' | 'active_users_7d' | 'active_users_30d' | 'screens' | 'screens_ok' | 'screens_failed'
+    | 'campaigns' | 'iterations' | 'polymers' | 'simulations_requested' | 'simulations_done'
+    | 'simulations_running' | 'simulations_waiting' | 'simulations_approved' | 'measurements'
+    | 'tokens_in' | 'tokens_out' | 'model_requests',
+    number
+  >;
+  previous: Record<'screens' | 'polymers' | 'campaigns' | 'simulations', number>;
+  series: {
+    dates: string[];
+    screens: number[];
+    polymers: number[];
+    campaigns: number[];
+    simulations: number[];
+    active_users: number[];
+    users_cumulative: number[];
+    events: number[];
+  };
+  screens: {
+    // Share of each screen's endpoints that are Precedented or Supported.
+    coverage_mean: number | null;
+    coverage: Bin[];
+    liabilities: Record<'high' | 'moderate' | 'low', number>;
+    worst_verdict: Record<string, number>;
+    endpoint_verdicts: Record<string, number>;
+    grades: Record<string, number>;
+    routes: Record<string, number>;
+    needs_testing: number;
+    duration_median_s: number | null;
+    duration_p90_s: number | null;
+  };
+  polymers: {
+    // Designed candidates put through the full excipient screen, by worst verdict.
+    screened_in_full: Record<string, number>;
+    candidates_per_campaign: Bin[];
+    iterations_per_campaign: Bin[];
+    alert_free: number | null;
+    by_backbone: Record<string, number>;
+    by_status: Record<string, number>;
+    by_format: Record<string, number>;
+    target_temp_c: Bin[];
+    score_quartiles: number[];
+  };
+  simulations: {
+    by_status: Record<'waiting' | 'approved' | 'running' | 'done' | 'failed', number>;
+    by_tier: Record<string, number>;
+    gamma23: Bin[];
+    gamma23_excluded: number;
+    gamma23_accumulated: number;
+    calls: Record<GammaCall, number>;
+    previews: number;
+  };
+  // Event kinds in the period: what kind of thing happened, never what.
+  events: Record<HistoryEvent['kind'], number>;
+}
+
+export async function getAdminStats(days: number, signal?: AbortSignal): Promise<AdminStats> {
+  const res = await call(`/design/admin/stats?days=${days}`, { signal });
+  if (!res.ok) throw new Error(await detailOf(res));
+  return res.json();
 }
 
 export interface HistoryEvent {
@@ -508,6 +747,7 @@ export interface HistoryEvent {
     | 'candidate.requeued'
     | 'candidate.approved'
     | 'candidate.declined'
+    | 'candidate.stopped'
     | 'campaign.ended'
     | 'campaign.reopened';
   data: Record<string, any>;
@@ -541,6 +781,7 @@ export interface ScreenRecord {
     polymer: PolymerSpec | null;
     exposure: ExposureInputs | null;
     form: SavedForm | null;
+    candidate_id?: string | null;
   };
   dossier: Dossier | null;
   error: string | null;

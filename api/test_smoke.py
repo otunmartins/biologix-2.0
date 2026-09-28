@@ -11,6 +11,7 @@ must be accepted once the precedent tool has actually returned a route match.
 
 import asyncio
 import json
+from datetime import datetime, timezone
 import os
 
 # The Anthropic provider wants a key at construction time. Nothing is ever sent —
@@ -48,6 +49,10 @@ def fresh_store(module):
     conn.close()
     return module.connect(TEST_DB)
 
+
+# A two-atom stand-in for a run's last frame (worker/snapshot.py writes the real one).
+SNAP = ("ATOM      1  CA  LYS A  45       0.000   0.000   0.000  1.00  0.00           C\n"
+        "HETATM    2  C1  POL P   1       4.000   0.000   0.000  1.00  0.00           C\nEND\n")
 
 PS80 = "Polysorbate 80"
 PS80_SMILES = "CCCCCCCCC=CCCCCCCCC(=O)OCCOCCOCCO"  # the surrogate resolve_identity returns
@@ -1478,11 +1483,23 @@ def main_test():
                                headers=as_("tok-alice")).status_code == 409, "approving twice is refused"
             j = client.post("/worker/claim", json={"worker": "w7"}, headers=W).json()
             assert j["job_id"] == b0
-            assert client.post(f"/design/simulations/{b0}/decline", json={"reason": "x"},
-                               headers=as_("tok-alice")).status_code == 409, "a running job cannot be declined"
             assert client.post("/design/queue", headers=as_("tok-bob"),
                                json={"candidate_ids": [b1]}).status_code == 409, "a running job counts"
-            CS.finish(conn, b0, "w7", error="drained by the test")
+            assert client.post(f"/design/simulations/{b0}/approve", json={"tier": "cpu"},
+                               headers=as_("tok-alice")).status_code == 409, "a running job cannot be re-tiered"
+            # An admin can stop a running job: the worker learns at its next heartbeat.
+            r = client.post(f"/design/simulations/{b0}/decline", json={"reason": "out of budget"},
+                            headers=as_("tok-alice"))
+            assert r.status_code == 200 and r.json()["stopped"] is True, r.text
+            assert client.post(f"/worker/jobs/{b0}/heartbeat", json={"worker": "w7"},
+                               headers=W).status_code == 409, "the worker must learn it was stopped"
+            assert client.post(f"/worker/jobs/{b0}/result", json={"worker": "w7", "result": result},
+                               headers=W).status_code == 409, "a stopped job's late result is refused"
+            stopped = {c["id"]: c for c in CS.candidates_for(conn, cid3)}[b0]
+            assert stopped["status"] == "failed" and \
+                stopped["simulation"]["error"] == "Stopped by an admin: out of budget"
+            assert client.post(f"/design/simulations/{b0}/decline", json={"reason": "x"},
+                               headers=as_("tok-alice")).status_code == 409, "a finished job cannot be denied"
             assert client.post("/design/queue", headers=as_("tok-bob"),
                                json={"candidate_ids": [b1]}).json()["queued"] == 1
             r = client.post(f"/design/simulations/{b1}/decline", json={"reason": "use a Fab entry"},
@@ -1491,9 +1508,193 @@ def main_test():
             gone = {c["id"]: c for c in CS.candidates_for(conn, cid3)}[b1]
             assert gone["status"] == "failed" and gone["simulation"]["error"] == "Not approved: use a Fab entry"
             evs = [e["kind"] for e in main.history.events_for(conn, cid3, owner_id=bob)]
-            assert "candidate.approved" in evs and "candidate.declined" in evs, evs
-            print("ok  approval: only an admin sees every job and approves or declines; approving "
-                  "releases it to the worker; a declined job tells the user why")
+            assert {"candidate.approved", "candidate.declined", "candidate.stopped"} <= set(evs), evs
+            admin = client.get("/design/simulations", headers=as_("tok-alice")).json()
+            assert {b0, b1} <= {x["id"] for x in admin["recent"]}, "denied and stopped jobs are listed"
+            assert any(w["name"] == "w7" and w["tier"] == "gpu" for w in admin["workers"]), admin["workers"]
+            print("ok  approval: only an admin sees every job and approves or denies any active one; "
+                  "a running job is stopped and its worker told; a denied job tells the user why")
+
+            # --- CPU fallback: a short preview when no GPU is available ------------
+            spare = next(c for c in CS.candidates_for(conn, cid2) + CS.candidates_for(conn, cid)
+                         if c["status"] == "benchmarked")
+            assert client.post("/design/queue", headers=as_("tok-alice"),
+                               json={"candidate_ids": [spare["id"]], "structure_id": "1L2Y"}).json()["queued"] == 1
+            r = client.post(f"/design/simulations/{spare['id']}/approve", json={"tier": "tpu"},
+                            headers=as_("tok-alice"))
+            assert r.status_code == 422, "only gpu or cpu"
+            r = client.post(f"/design/simulations/{spare['id']}/approve", json={"tier": "cpu"},
+                            headers=as_("tok-alice"))
+            assert r.status_code == 200 and r.json()["tier"] == "cpu", r.text
+            assert r.json()["pod"].startswith("not needed"), "a CPU preview must not start the GPU pod"
+            assert client.post(f"/design/simulations/{spare['id']}/approve", json={"tier": "cpu"},
+                               headers=as_("tok-alice")).status_code == 409, "approving twice alike is refused"
+            for t in ("gpu", "cpu"):  # an approved job no worker has taken can switch tier
+                r = client.post(f"/design/simulations/{spare['id']}/approve", json={"tier": t},
+                                headers=as_("tok-alice"))
+                assert r.status_code == 200 and r.json()["tier"] == t, r.text
+            assert client.post("/worker/claim", json={"worker": "gpu1", "platform": "CUDA"},
+                               headers=W).status_code == 204, "a GPU worker must not take a CPU preview"
+            assert client.post("/worker/claim", json={"worker": "gpu0"},
+                               headers=W).status_code == 204, "nor an old worker that names no platform"
+            j = client.post("/worker/claim", json={"worker": "cpu1", "platform": "CPU"}, headers=W).json()
+            assert j["job_id"] == spare["id"]
+            assert j["settings"] == {"tier": "cpu", "production_ns": main.CPU_PREVIEW_NS,
+                                     "equilibration_ns": main.CPU_PREVIEW_EQUIL_NS}, j["settings"]
+            before = conn.execute("SELECT COUNT(*) AS n FROM measurement").fetchone()["n"]
+            r = client.post(f"/worker/jobs/{spare['id']}/result", headers=W,
+                            json={"worker": "cpu1", "result": {**result, "production_ns": 1.0,
+                                                               "snapshot_pdb": SNAP}})
+            assert r.status_code == 200 and r.json()["measurement_id"] is None, \
+                "a CPU preview is never a measurement, even if the worker forgets to say so"
+            assert conn.execute("SELECT COUNT(*) AS n FROM measurement").fetchone()["n"] == before
+            print("ok  cpu fallback: an admin approves a run for CPU or GPU; each goes only to that "
+                  "kind of worker; a CPU run is a short preview and never a measurement")
+
+            # The Simulations tab: your own runs, each with its own slice of history.
+            mine = client.get("/design/my-simulations", headers=as_("tok-alice")).json()["simulations"]
+            done = next(m for m in mine if m["id"] == spare["id"])
+            assert done["status"] == "simulated" and done["simulation"]["tier"] == "cpu"
+            goal_of = {cid: goal_lyo.protein, cid2: "Trp-cage"}
+            assert done["campaign"]["protein"] == goal_of[done["campaign_id"]], done["campaign"]
+            rank = [{"simulating": 0, "queued": 1}.get(m["status"], 2) for m in mine]
+            assert rank == sorted(rank) and 1 in rank, ("active runs list first", rank)
+            assert all(m["id"] not in (b0, b1) for m in mine), "bob's runs are not alice's"
+            d = client.get(f"/design/my-simulations/{spare['id']}", headers=as_("tok-alice")).json()
+            kinds = [e["kind"] for e in d["events"]]
+            assert kinds[0] == "candidate.queued" and "candidate.approved" in kinds and \
+                kinds[-1] == "candidate.simulated", kinds
+            assert next(e for e in d["events"] if e["kind"] == "candidate.approved")["data"]["tier"] == "cpu"
+            assert next(e for e in d["events"] if e["kind"] == "candidate.simulated")["data"]["preview"] is True
+            assert client.get(f"/design/my-simulations/{spare['id']}", headers=as_("tok-bob")).status_code == 404
+            assert client.get("/design/my-simulations").status_code == 401
+            print("ok  simulations tab: lists only your runs, active first; each opens with its "
+                  "own history; someone else's is a 404")
+
+            # The Results tab: screens, candidates and simulations, each with its metrics.
+            assert client.get("/design/my-results").status_code == 401
+            res = client.get("/design/my-results", headers=as_("tok-alice")).json()
+            n = lambda sql, *a: conn.execute(sql, a).fetchone()["n"]
+            assert res["screens"]["total"] == n("SELECT COUNT(*) AS n FROM screen_run WHERE owner_id=%s "
+                                                "AND origin IS DISTINCT FROM 'design'", alice)
+            assert res["design"]["candidates"] == n(
+                "SELECT COUNT(*) AS n FROM candidate c JOIN campaign cp ON cp.id=c.campaign_id "
+                "WHERE cp.owner_id=%s", alice) > 0
+            assert sum(res["design"]["by_status"].values()) == res["design"]["candidates"]
+            assert {c["id"] for c in res["design"]["per_campaign"]} >= {cid, cid2}
+            assert all(c["best_score"] is None or c["best_score"] >= c["median_score"]
+                       for c in res["design"]["per_campaign"])
+            runs = {x["id"]: x for x in res["simulations"]["runs"]}
+            assert spare["id"] in runs and runs[spare["id"]]["preview"] is True
+            assert all(not json.loads(r["sim_result"]).get("smoke") for r in conn.execute(
+                "SELECT sim_result FROM candidate WHERE id = ANY(%s)", (list(runs),))), \
+                "smoke tests are not results"
+            assert sum(res["simulations"]["calls"].values()) == len(runs)
+            g = [x["gamma23"] for x in res["simulations"]["runs"]]
+            assert g == sorted(g), "most excluded first"
+            R = main.results
+            assert R.gamma_call(-2.4, 0.3) == "excluded" and R.gamma_call(2.4, 0.3) == "accumulated"
+            assert R.gamma_call(-0.4, 0.3) == "unclear" and R.gamma_call(-5.0, None) == "unclear"
+            bobs_view = client.get("/design/my-results", headers=as_("tok-bob")).json()
+            assert cid not in {c["id"] for c in bobs_view["design"]["per_campaign"]}
+            assert spare["id"] not in {x["id"] for x in bobs_view["simulations"]["runs"]}
+            print("ok  results tab: your screens, candidates and simulations with their metrics; "
+                  "smoke tests left out; nobody else's work")
+
+            # Where a screen came from: a designed candidate's screen is design work, reported
+            # with its campaign and never among excipient screens -- in Results or for the admin.
+            H, now_ = main.history, datetime.now(timezone.utc)
+            cand = next(c for c in CS.candidates_for(conn, cid) if c["status"] == "benchmarked")
+            dossier = {**_dossier("D", "Data gap: test"), "excipient": cand["name"]}
+            before = client.get("/design/my-results", headers=as_("tok-alice")).json()
+            admin0 = client.get("/design/admin/stats", headers=as_("tok-alice")).json()
+            sid_design = H.record_screen(conn, alice, request={"prompt": "x", "candidate_id": cand["id"]},
+                                         dossier=dossier, error=None, provenance={}, started_at=now_,
+                                         finished_at=now_, candidate_id=cand["id"])
+            sid_forged = H.record_screen(conn, bob, request={"prompt": "x"}, dossier=dossier, error=None,
+                                         provenance={}, started_at=now_, finished_at=now_,
+                                         candidate_id=cand["id"])
+            row = lambda s: conn.execute("SELECT origin, candidate_id FROM screen_run WHERE id=%s", (s,)).fetchone()
+            assert dict(row(sid_design)) == {"origin": "design", "candidate_id": cand["id"]}
+            assert dict(row(sid_forged)) == {"origin": "excipient", "candidate_id": None}, \
+                "someone else's candidate is not taken"
+            after = client.get("/design/my-results", headers=as_("tok-alice")).json()
+            assert after["screens"]["total"] == before["screens"]["total"], "not an excipient screen"
+            assert after["design"]["screened"]["total"] == before["design"]["screened"]["total"] + 1
+            assert next(c for c in after["design"]["per_campaign"] if c["id"] == cid)["n_screened"] >= 1
+            admin1 = client.get("/design/admin/stats", headers=as_("tok-alice")).json()
+            assert admin1["totals"]["screens"] == admin0["totals"]["screens"] + 1, "only bob's counts"
+            assert sum(admin1["polymers"]["screened_in_full"].values()) == \
+                sum(admin0["polymers"]["screened_in_full"].values()) + 1
+            hist = client.get("/history", params={"kind": "screen"}, headers=as_("tok-alice")).json()["items"]
+            assert next(i for i in hist if i["id"] == sid_design)["origin"] == "design"
+            # A screen saved before origin existed is sorted out by its name, once.
+            conn.execute("UPDATE screen_run SET origin=NULL, candidate_id=NULL WHERE id=%s", (sid_design,))
+            main.db.init_schema(conn, H.BACKFILL_ORIGIN, force=True)
+            back = dict(row(sid_design))
+            linked = conn.execute("SELECT payload FROM candidate WHERE id=%s", (back["candidate_id"],)).fetchone()
+            # Names can repeat across campaigns; a name match links the newest candidate by that name.
+            assert back["origin"] == "design" and json.loads(linked["payload"])["name"] == cand["name"], back
+            print("ok  scopes: a designed candidate's screen is reported with the design, never as an "
+                  "excipient screen; a forged candidate is ignored; old screens are sorted by name")
+
+            # The 3D view: the run's last frame, kept apart from its result, only for its owner.
+            stored = conn.execute("SELECT sim_result FROM candidate WHERE id=%s", (spare["id"],)).fetchone()
+            assert "snapshot_pdb" not in stored["sim_result"] and json.loads(stored["sim_result"])["has_snapshot"]
+            r = client.get(f"/design/my-simulations/{spare['id']}/snapshot.pdb", headers=as_("tok-alice"))
+            assert r.status_code == 200 and r.text == SNAP, r.text[:200]
+            assert client.get(f"/design/my-simulations/{spare['id']}/snapshot.pdb",
+                              headers=as_("tok-bob")).status_code == 404, "someone else's run"
+            assert client.get(f"/design/my-simulations/{spare['id']}/snapshot.pdb").status_code == 401
+            assert "HETATM" not in client.get("/design/my-simulations", headers=as_("tok-alice")).text, \
+                "the lists do not carry the snapshot"
+            assert client.get("/structure/model/1L2Y").status_code == 401, "not an open proxy"
+            r = client.get("/structure/model/1l2y", headers=as_("tok-alice"))
+            assert r.status_code == 200 and r.text.startswith("data_1L2Y"), r.text[:100]
+            assert client.get("/structure/model/..%2Fetc", headers=as_("tok-alice")).status_code in (404, 422)
+            assert client.get("/structure/conformer", params={"smiles": "OCCO"}).status_code == 401
+            r = client.get("/structure/conformer", params={"smiles": "OCC(O)CO"}, headers=as_("tok-alice"))
+            assert r.status_code == 200 and "V2000" in r.text and " H " not in r.text, r.text[:200]
+            assert client.get("/structure/conformer", params={"smiles": "not(a)smiles"},
+                              headers=as_("tok-alice")).status_code == 422
+            print("ok  3d view: the last frame is stored apart from the result and served only to "
+                  "its owner; structures come through the API behind sign-in")
+
+            # The admin dashboard: counts across every user, and none of their content.
+            assert client.get("/design/admin/stats", headers=as_("tok-bob")).status_code == 403
+            assert client.get("/design/admin/stats").status_code == 401
+            r = client.get("/design/admin/stats", params={"days": 30}, headers=as_("tok-alice"))
+            assert r.status_code == 200, r.text
+            st = r.json()
+            n = lambda sql: conn.execute(sql).fetchone()["n"]
+            assert st["totals"]["polymers"] == n("SELECT COUNT(*) AS n FROM candidate")
+            assert st["totals"]["screens"] == n("SELECT COUNT(*) AS n FROM screen_run "
+                                                "WHERE origin IS DISTINCT FROM 'design'") > 0,                 "excipient screens only: a designed candidate's screen is design work"
+            assert st["totals"]["users"] == n("SELECT COUNT(*) AS n FROM users") >= 2
+            assert len(st["series"]["dates"]) == len(st["series"]["screens"]) == 30
+            assert sum(st["series"]["screens"]) == st["totals"]["screens"], "every test screen is today"
+            assert sum(st["screens"]["grades"].values()) > 0 and set(st["screens"]["grades"]) == set("ABCDE")
+            assert sum(b["n"] for b in st["simulations"]["gamma23"]) >= 1, "the -2.4 result is binned"
+            assert st["simulations"]["by_tier"].get("cpu", 0) >= 1
+            assert sum(st["simulations"]["calls"].values()) == sum(b["n"] for b in st["simulations"]["gamma23"])
+            assert st["simulations"]["previews"] >= 1, "the CPU preview is counted"
+            assert sum(b["n"] for b in st["screens"]["coverage"]) == n(
+                "SELECT COUNT(DISTINCT id) AS n FROM screen_run, jsonb_array_elements(dossier->'endpoints') e "
+                "WHERE dossier IS NOT NULL AND origin IS DISTINCT FROM 'design'")
+            assert st["screens"]["coverage_mean"] is not None and 0 <= st["screens"]["coverage_mean"] <= 1
+            assert set(st["screens"]["liabilities"]) == {"high", "moderate", "low"}
+            assert sum(b["n"] for b in st["polymers"]["candidates_per_campaign"]) == n(
+                "SELECT COUNT(DISTINCT campaign_id) AS n FROM candidate")
+            assert 0 <= st["polymers"]["alert_free"] <= 1
+            assert set(st["events"]) == set(main.stats.EVENT_KINDS), "only the app's own event kinds"
+            assert sum(st["events"].values()) == sum(st["series"]["events"]) == n(
+                "SELECT COUNT(*) AS n FROM event"), "every test event is today and has a known kind"
+            text = r.text
+            for secret in (PS80, SEQ, "IgG1 mAb", "keep my mAb stable", "Trp-cage", "1L2Y", "1IGT",
+                           "alice@example.org", "bob@example.org"):
+                assert secret not in text, f"the dashboard leaked user content: {secret[:30]}"
+            print("ok  admin dashboard: platform-wide counts, trends and distributions for admins only, "
+                  "with no excipient, structure, protein, prompt or email in it")
         finally:
             main.accessibility._fetch = real_fetch
             os.environ.pop("WORKER_TOKEN", None)

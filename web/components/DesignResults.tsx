@@ -4,6 +4,7 @@ import { useState } from 'react';
 import type { CandidateStatus, DesignGoal, SimulationJob, StoredCandidate } from '@/lib/api';
 import { GradeBox } from './badges';
 import { CheckCircle, Chevron, Flask, Info, Triangle } from './icons';
+import MolViewer from '@/components/MolViewer';
 import Structure, { Smiles } from './Structure';
 
 interface Props {
@@ -75,10 +76,25 @@ function repeatUnits(c: StoredCandidate): { smiles: string; label: string | null
   return c.repeat_unit_smiles.split(' ; ').map((smiles) => ({ smiles, label: null }));
 }
 
-function CandidateStructures({ c }: { c: StoredCandidate }) {
+function CandidateStructures({ c, structureId }: { c: StoredCandidate; structureId?: string }) {
   const units = repeatUnits(c);
+  const [show3d, setShow3d] = useState(false);
+  // Once a run has left its last frame, the simulation panel shows the real thing.
+  const simulated = c.status === 'simulated' && c.simulation?.result?.has_snapshot;
   return (
     <div className="space-y-3">
+      {c.screened_oligomer_smiles && !simulated && (
+        <div>
+          <button type="button" className="btn-ghost" onClick={() => setShow3d(!show3d)} aria-expanded={show3d}>
+            {show3d ? 'Hide 3D view' : structureId ? `View the polymer and ${structureId} in 3D` : 'View the polymer in 3D'}
+          </button>
+          {show3d && (
+            <div className="mt-3">
+              <MolViewer structureId={structureId || undefined} polymerSmiles={c.screened_oligomer_smiles} />
+            </div>
+          )}
+        </div>
+      )}
       <div>
         <div className="eyebrow mb-2">{units.length > 1 ? 'Repeat units' : 'Repeat unit'}</div>
         <div className="flex flex-wrap gap-3">
@@ -92,8 +108,12 @@ function CandidateStructures({ c }: { c: StoredCandidate }) {
         </div>
       </div>
       {c.screened_oligomer_smiles && (
-        <div>
-          <div className="eyebrow mb-2">Screened as</div>
+        <details className="group">
+          <summary className="eyebrow cursor-pointer select-none list-none">
+            <span className="group-open:hidden">Show the full {c.screened_units}-unit chain it was screened as ▸</span>
+            <span className="hidden group-open:inline">Screened as ▾</span>
+          </summary>
+          <div className="mt-2">
           <Structure
             smiles={c.screened_oligomer_smiles}
             width={560}
@@ -106,7 +126,8 @@ function CandidateStructures({ c }: { c: StoredCandidate }) {
           <p className="mt-1.5 text-xs leading-relaxed text-slate-500">
             The {c.screened_units}-unit chain the structural alerts were actually run on, end groups included.
           </p>
-        </div>
+          </div>
+        </details>
       )}
     </div>
   );
@@ -136,17 +157,33 @@ function readGamma(g: number, se: number | null): { label: string; body: string;
   };
 }
 
-function SimulationPanel({ sim, status }: { sim: SimulationJob; status: CandidateStatus }) {
+const TIER_LABEL = { gpu: 'GPU run', cpu: 'CPU preview' } as const;
+
+export function SimulationPanel({
+  sim,
+  status,
+  candidateId,
+}: {
+  sim: SimulationJob;
+  status: CandidateStatus;
+  candidateId?: string;
+}) {
   const r = sim.result;
+  const [show3d, setShow3d] = useState(false);
   return (
     <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
-      <div className="eyebrow mb-1.5">OpenMM simulation · against {sim.structure_id || 'no structure yet'}</div>
+      <div className="eyebrow mb-1.5">
+        OpenMM simulation · against {sim.structure_id || 'no structure yet'}
+        {sim.tier && ` · ${TIER_LABEL[sim.tier]}`}
+      </div>
       {status === 'queued' && (
         <p className="text-sm leading-relaxed text-slate-600">
           {sim.structure_id && !sim.approved_at
-            ? 'Waiting for approval. Each simulation takes hours of GPU time, so an admin approves it before it runs.'
+            ? 'Waiting for approval. Each simulation takes hours of compute, so an admin approves it, as a full GPU run or a short CPU preview, before it runs.'
+            : sim.structure_id && sim.tier === 'cpu'
+            ? 'Approved as a CPU preview. Waiting for a CPU worker; approved runs go highest triage score first.'
             : sim.structure_id
-            ? 'Approved. Waiting for the simulation worker; approved runs go highest triage score first.'
+            ? 'Approved as a GPU run. Waiting for the GPU worker; approved runs go highest triage score first.'
             : 'Queued before structures were asked for. Queue it again with the biologic’s PDB ID or UniProt accession to run it.'}
           {sim.error && <span className="mt-1 block text-slate-500">{sim.error}</span>}
         </p>
@@ -175,6 +212,11 @@ function SimulationPanel({ sim, status }: { sim: SimulationJob; status: Candidat
               {r.smoke && (
                 <span className="rounded-full border border-gap-line bg-gap-soft px-2 py-0.5 text-[11px] font-semibold text-gap">
                   smoke test, not a measurement
+                </span>
+              )}
+              {(r.preview || sim.tier === 'cpu') && !r.smoke && (
+                <span className="rounded-full border border-gap-line bg-gap-soft px-2 py-0.5 text-[11px] font-semibold text-gap">
+                  CPU preview, not converged
                 </span>
               )}
             </div>
@@ -206,6 +248,33 @@ function SimulationPanel({ sim, status }: { sim: SimulationJob; status: Candidat
           </div>
         );
       })()}
+      {sim.structure_id && (
+        <div className="mt-3 border-t border-slate-200 pt-3">
+          <button type="button" className="btn-ghost" onClick={() => setShow3d(!show3d)} aria-expanded={show3d}>
+            {show3d
+              ? 'Hide 3D view'
+              : r?.has_snapshot
+                ? 'View the polymer around the protein in 3D'
+                : `View ${sim.structure_id} in 3D`}
+          </button>
+          {show3d && (
+            <div className="mt-3">
+              <MolViewer
+                structureId={sim.structure_id}
+                candidateId={candidateId}
+                hasSnapshot={status === 'simulated' && Boolean(r?.has_snapshot)}
+                contacts={status === 'simulated' ? r?.contacts : []}
+              />
+              {status === 'simulated' && r && !r.has_snapshot && (
+                <p className="mt-2 text-xs text-slate-500">
+                  This run finished before the worker saved its last frame, so the polymer is not drawn; the residues it
+                  touched most are.
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -224,6 +293,7 @@ function QueueControl({
   queueing: boolean;
 }) {
   const [sid, setSid] = useState('');
+  const [needsId, setNeedsId] = useState(false);
   const canQueue = status === 'benchmarked' || status === 'failed';
   if (!canQueue) {
     return (
@@ -245,22 +315,34 @@ function QueueControl({
       className="flex w-full flex-wrap items-end gap-2 sm:w-auto"
       onSubmit={(e) => {
         e.preventDefault();
+        // Never a silently greyed-out button: say what is missing.
         if (sid.trim()) onQueue(sid.trim());
+        else setNeedsId(true);
       }}
     >
       <label className="block text-xs font-medium text-slate-600">
         Your biologic&rsquo;s PDB ID or UniProt accession
         <input
           value={sid}
-          onChange={(e) => setSid(e.target.value)}
+          onChange={(e) => {
+            setSid(e.target.value);
+            setNeedsId(false);
+          }}
+          aria-invalid={needsId}
           placeholder="1IGT or P01857"
           maxLength={40}
           className="mt-1 block w-40 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-sm text-slate-900 placeholder:text-slate-400 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
         />
       </label>
-      <button type="submit" className="btn-ghost" disabled={queueing || !sid.trim()}>
+      <button type="submit" className="btn-ghost" disabled={queueing}>
         {label}
       </button>
+      {needsId && (
+        <p className="w-full text-xs text-alert" role="alert">
+          A simulation runs the polymer against your protein, so it needs the protein&rsquo;s structure: type its PDB ID
+          (e.g. 1IGT) or UniProt accession (e.g. P01857), then queue.
+        </p>
+      )}
     </form>
   );
 }
@@ -273,10 +355,13 @@ function CandidateCard({
   onQueue,
   queueing,
   readOnly,
+  structureId,
 }: {
   c: StoredCandidate;
   defaultOpen: boolean;
   needsStructure: boolean;
+  // The campaign's biologic, for the 3D view; a queued job's own structure wins.
+  structureId?: string;
   onScreen: () => void;
   onQueue: (structureId: string) => void;
   queueing: boolean;
@@ -335,7 +420,7 @@ function CandidateCard({
         <div className="space-y-4 border-t border-slate-200 px-5 py-4 md:pl-[3.25rem]">
           <p className="text-[15px] leading-relaxed text-slate-700">{c.mechanism}</p>
 
-          <CandidateStructures c={c} />
+          <CandidateStructures c={c} structureId={c.simulation?.structure_id || structureId} />
 
           {c.supports.length > 0 && (
             <ul className="space-y-1.5">
@@ -380,7 +465,7 @@ function CandidateCard({
             </ul>
           </div>
 
-          {c.simulation && c.status !== 'benchmarked' && <SimulationPanel sim={c.simulation} status={c.status} />}
+          {c.simulation && c.status !== 'benchmarked' && <SimulationPanel sim={c.simulation} status={c.status} candidateId={c.id} />}
 
           {!readOnly && (
             <div className="flex flex-wrap items-end gap-2">
@@ -460,6 +545,7 @@ export default function DesignResults({
                   c={c}
                   defaultOpen={c.id === topId}
                   needsStructure={!goal.structure_id}
+                  structureId={goal.structure_id}
                   onScreen={() => onScreen?.(c)}
                   onQueue={(sid) => onQueue?.(c, sid)}
                   queueing={queueing === c.id}
