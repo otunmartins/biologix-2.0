@@ -1669,6 +1669,30 @@ def main_test():
             assert client.get(f"/design/my-simulations/{spare['id']}/snapshot.pdb").status_code == 401
             assert "HETATM" not in client.get("/design/my-simulations", headers=as_("tok-alice")).text, \
                 "the lists do not carry the snapshot"
+
+            # An admin opens ANY user's finished run in full, snapshot included,
+            # so a result is never out of reach because another account queued
+            # it. Here the run is handed to bob for the check, then handed back.
+            camp = conn.execute("SELECT campaign_id FROM candidate WHERE id=%s", (spare["id"],)).fetchone()["campaign_id"]
+            with main.db.tx(conn):
+                conn.execute("UPDATE campaign SET owner_id=%s WHERE id=%s", (bob, camp))
+            try:
+                assert client.get(f"/design/my-simulations/{spare['id']}", headers=as_("tok-alice")).status_code == 404
+                r = client.get(f"/design/simulations/{spare['id']}", headers=as_("tok-alice"))
+                assert r.status_code == 200, r.text[:200]
+                d = r.json()
+                assert d["simulation"]["owner_email"] == "bob@example.org" and d["simulation"]["status"] == "simulated"
+                assert d["simulation"]["simulation"]["result"]["has_snapshot"] and "snapshot_pdb" not in r.text
+                r = client.get(f"/design/simulations/{spare['id']}/snapshot.pdb", headers=as_("tok-alice"))
+                assert r.status_code == 200 and r.text == SNAP
+                for path in (f"/design/simulations/{spare['id']}", f"/design/simulations/{spare['id']}/snapshot.pdb"):
+                    assert client.get(path, headers=as_("tok-bob")).status_code == 403, f"a non-admin read {path}"
+                    assert client.get(path).status_code == 401
+                assert client.get("/design/simulations/no-such-run", headers=as_("tok-alice")).status_code == 404
+            finally:
+                with main.db.tx(conn):
+                    conn.execute("UPDATE campaign SET owner_id=%s WHERE id=%s", (alice, camp))
+            print("ok  admin: opens any user's finished run in full, snapshot included; nobody else can")
             assert client.get("/structure/model/1L2Y").status_code == 401, "not an open proxy"
             r = client.get("/structure/model/1l2y", headers=as_("tok-alice"))
             assert r.status_code == 200 and r.text.startswith("data_1L2Y"), r.text[:100]

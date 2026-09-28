@@ -152,7 +152,7 @@ function CandidateStructures({ c, structureId }: { c: StoredCandidate; structure
 
 // What a Gamma23 means, in words. Within two standard errors of zero is no
 // preference either way: the run cannot tell the polymer from water.
-function readGamma(g: number, se: number | null): { label: string; body: string; tone: string } {
+export function readGamma(g: number, se: number | null): { label: string; body: string; tone: string } {
   if (se !== null && Math.abs(g) < 2 * se) {
     return {
       label: 'No clear preference',
@@ -174,7 +174,7 @@ function readGamma(g: number, se: number | null): { label: string; body: string;
   };
 }
 
-const TIER_LABEL = { gpu: 'GPU run', cpu: 'CPU preview' } as const;
+export const TIER_LABEL = { gpu: 'GPU run', cpu: 'CPU preview' } as const;
 
 export function SimulationPanel({
   sim,

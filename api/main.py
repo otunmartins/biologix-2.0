@@ -1598,18 +1598,52 @@ def my_simulation(job_id: str, user_id: int = Depends(users.current_user)):
         sim = candidates.simulation(conn, job_id, owner_id=user_id)
         if sim is None:
             raise HTTPException(status_code=404, detail="no such simulation")
-
-        def about(e: dict) -> bool:
-            d = e.get("data") or {}
-            if isinstance(d, str):
-                d = json.loads(d)
-            return (d.get("candidate") or {}).get("id") == job_id or \
-                any(c.get("id") == job_id for c in d.get("candidates") or [])
-        events = [e for e in history.events_for(conn, sim["campaign_id"], owner_id=user_id)
-                  if e["kind"].startswith("candidate.") and about(e)]
-        return {"simulation": sim, "events": events, "cpu_preview_ns": CPU_PREVIEW_NS}
+        return _simulation_view(conn, sim, owner_id=user_id)
     finally:
         conn.close()
+
+
+def _simulation_view(conn, sim: dict, *, owner_id: int) -> dict:
+    """A simulation with its own slice of its campaign's history."""
+    job_id = sim["id"]
+
+    def about(e: dict) -> bool:
+        d = e.get("data") or {}
+        if isinstance(d, str):
+            d = json.loads(d)
+        return (d.get("candidate") or {}).get("id") == job_id or \
+            any(c.get("id") == job_id for c in d.get("candidates") or [])
+    events = [e for e in history.events_for(conn, sim["campaign_id"], owner_id=owner_id)
+              if e["kind"].startswith("candidate.") and about(e)]
+    return {"simulation": sim, "events": events, "cpu_preview_ns": CPU_PREVIEW_NS}
+
+
+@app.get("/design/simulations/{job_id}")
+def simulation_admin_view(job_id: str, admin_id: int = Depends(users.current_admin)):
+    """Any user's simulation, in full, for an admin: the same view its owner
+    gets, plus whose it is. So a finished run is never out of the admin's
+    reach because it was queued from another account."""
+    conn = history.connect()
+    try:
+        sim = candidates.simulation_any(conn, job_id)
+        if sim is None:
+            raise HTTPException(status_code=404, detail="no such simulation")
+        return _simulation_view(conn, sim, owner_id=sim["owner_id"])
+    finally:
+        conn.close()
+
+
+@app.get("/design/simulations/{job_id}/snapshot.pdb")
+def simulation_admin_snapshot(job_id: str, admin_id: int = Depends(users.current_admin)):
+    """Any run's last frame, for an admin's 3D view."""
+    conn = candidates.connect()
+    try:
+        pdb = candidates.snapshot_any(conn, job_id)
+    finally:
+        conn.close()
+    if pdb is None:
+        raise HTTPException(status_code=404, detail="no snapshot for this simulation")
+    return Response(pdb, media_type="chemical/x-pdb", headers={"Cache-Control": "private, max-age=86400"})
 
 
 @app.get("/design/my-simulations/{job_id}/snapshot.pdb")

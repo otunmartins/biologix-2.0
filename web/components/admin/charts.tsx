@@ -392,23 +392,34 @@ export function HBars({
   items,
   color,
   colors,
+  format = (v) => v.toLocaleString(),
+  share = true,
+  max: fixedMax,
 }: {
   items: { label: string; value: number }[];
   color?: string;
   colors?: string[];
+  // How a value reads ("42%" for a fraction), and whether each bar also shows
+  // its share of the total -- meaningless when the values are not parts of one whole.
+  format?: (v: number) => string;
+  share?: boolean;
+  // A fixed full-width value (1 for fractions) instead of the largest item.
+  max?: number;
 }) {
-  const max = Math.max(1, ...items.map((i) => i.value));
+  const max = fixedMax ?? Math.max(1, ...items.map((i) => i.value));
   const total = items.reduce((a, i) => a + i.value, 0);
   if (!items.length) return <p className="text-sm text-[color:var(--ink-muted)]">Nothing recorded yet.</p>;
   return (
     <ul className="space-y-2.5">
       {items.map((it, k) => (
-        <li key={it.label} className="group" title={`${it.label}: ${it.value.toLocaleString()} (${total ? Math.round((it.value / total) * 100) : 0}%)`}>
+        <li key={it.label} className="group" title={`${it.label}: ${format(it.value)}${share ? ` (${total ? Math.round((it.value / total) * 100) : 0}%)` : ''}`}>
           <div className="mb-1 flex items-baseline justify-between gap-3 text-[13px]">
             <span className="truncate text-[color:var(--ink-2)]">{it.label}</span>
             <span className="shrink-0 tabular-nums text-[color:var(--ink-1)]">
-              <b className="font-semibold">{it.value.toLocaleString()}</b>
-              <span className="ml-1.5 text-xs text-[color:var(--ink-muted)]">{total ? Math.round((it.value / total) * 100) : 0}%</span>
+              <b className="font-semibold">{format(it.value)}</b>
+              {share && (
+                <span className="ml-1.5 text-xs text-[color:var(--ink-muted)]">{total ? Math.round((it.value / total) * 100) : 0}%</span>
+              )}
             </span>
           </div>
           <div className="h-2 rounded-full bg-slate-100">

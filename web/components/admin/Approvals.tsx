@@ -11,6 +11,8 @@ import {
   type SimTier,
 } from '@/lib/api';
 import { ago } from '@/lib/when';
+import { readGamma } from '@/components/DesignResults';
+import { SimulationDetail } from '@/components/SimulationsView';
 
 // Every user's simulations that are waiting, approved or running, and what the
 // owner can do to each: approve (as a full GPU run or a short CPU preview),
@@ -112,6 +114,7 @@ export default function Approvals({ onWaiting }: { onWaiting?: (n: number) => vo
   const [busy, setBusy] = useState<string | null>(null);
   const [choosing, setChoosing] = useState<AdminJob | null>(null);
   const [denying, setDenying] = useState<AdminJob | null>(null);
+  const [viewing, setViewing] = useState<string | null>(null);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -252,27 +255,43 @@ export default function Approvals({ onWaiting }: { onWaiting?: (n: number) => vo
           <h3 className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-slate-400">Recently finished or denied</h3>
           <ul className="divide-y divide-slate-100 rounded-xl border border-slate-200 bg-white">
             {data.recent.map((j) => (
-              <li key={j.id} className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 px-4 py-2.5 text-sm">
+              <li key={j.id}>
+                <button
+                  type="button"
+                  onClick={() => setViewing(j.id)}
+                  className="flex w-full flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 px-4 py-2.5 text-left text-sm transition hover:bg-slate-50 focus-visible:bg-slate-50 focus-visible:outline-none"
+                >
                 <span className="min-w-0 truncate">
                   <b className="font-medium text-slate-800">{j.name}</b>
                   <span className="text-slate-500"> · {j.owner_email ?? 'unknown user'}</span>
                 </span>
                 <span className="flex items-center gap-3 text-xs">
                   {j.status === 'simulated' && j.simulation?.result ? (
-                    <span className="font-medium text-precedented">
+                    // Neutral ink: a positive Gamma23 (binding) is not good news,
+                    // so the value is not coloured as if it were. The reading says which.
+                    <span className="font-medium text-slate-800">
                       Γ23 {j.simulation.result.gamma23 > 0 ? '+' : ''}{j.simulation.result.gamma23}
-                      {(j.simulation.result.preview || j.simulation.tier === 'cpu') && ' · preview'}
+                      <span className="font-normal text-slate-500">
+                        {' · '}{readGamma(j.simulation.result.gamma23, j.simulation.result.gamma23_se).label.toLowerCase()}
+                        {(j.simulation.result.preview || j.simulation.tier === 'cpu') && ' · preview'}
+                      </span>
                     </span>
                   ) : (
                     <span className="max-w-[18rem] truncate text-alert">{j.simulation?.error ?? 'failed'}</span>
                   )}
                   {j.updated_at && <span className="text-slate-400">{ago(j.updated_at)}</span>}
+                  <span className="text-slate-400" aria-hidden="true">›</span>
                 </span>
+                </button>
               </li>
             ))}
           </ul>
         </div>
       )}
+
+      {/* Any user's finished run in full: the admin can always see a result,
+          whichever account queued it. */}
+      {viewing && <SimulationDetail id={viewing} admin onClose={() => setViewing(null)} />}
     </div>
   );
 }
