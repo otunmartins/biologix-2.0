@@ -12,6 +12,10 @@ terraform/*.tfstate.backup
 terraform/*.tfvars
 *.pem
 *.tsbuildinfo
+# Written by `next dev` (Next 16) on every start, pointing AI coding tools at
+# Next's bundled docs. Regenerated each time, so not ours to version.
+web/AGENTS.md
+web/CLAUDE.md
 
 # The training data is 5.7 MB and recoverable: tg_model.fetch_data() pulls it
 # back from Zenodo. tg_model.pkl is NOT ignored, even though it is a build

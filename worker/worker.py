@@ -7,6 +7,11 @@ Talks to the API over HTTP only (api/main.py /worker/*), authenticated by
 WORKER_TOKEN, so it holds no database credentials and can run on any machine
 that can reach the API: the GPU box itself, or a rented GPU elsewhere.
 
+GPU OR CPU. On start it finds the fastest OpenMM platform present and tells the
+API with every claim. A GPU worker (CUDA, OpenCL) takes jobs an admin approved
+as full GPU runs; a CPU worker takes the ones approved as short CPU previews, for
+when no GPU is available. The API sends each job's length with it.
+
     API_URL        where the API is, e.g. http://api:8000 inside docker-compose
     WORKER_TOKEN   the same secret the API has
     WORKER_NAME    shown on each job; defaults to the hostname
@@ -75,9 +80,34 @@ class Job:
         log(f"  {msg}")
 
 
+def detect_platform() -> str:
+    """OPENMM_PLATFORM if set, else the fastest platform this machine has.
+    Reference is OpenMM's slow correctness platform, never chosen on its own."""
+    if os.environ.get("OPENMM_PLATFORM"):
+        return os.environ["OPENMM_PLATFORM"]
+    import openmm
+    platforms = [openmm.Platform.getPlatform(i) for i in range(openmm.Platform.getNumPlatforms())]
+    usable = [p for p in platforms if p.getName() != "Reference"]
+    return max(usable, key=lambda p: p.getSpeed()).getName() if usable else "Reference"
+
+
+PLATFORM = ""  # set in main()
+
+
+def settings_for(job: dict) -> simulate.Settings:
+    """This machine's defaults, with the run length the API chose for the job."""
+    s = simulate.Settings.from_env()
+    s.platform = s.platform or PLATFORM
+    for k in ("production_ns", "equilibration_ns"):
+        if k in (job.get("settings") or {}):
+            setattr(s, k, float(job["settings"][k]))
+    s.preview = (job.get("settings") or {}).get("tier") == "cpu"
+    return s
+
+
 def run_one(client: httpx.Client) -> bool:
     """Claim and run one job. False if the queue was empty."""
-    r = client.post("/worker/claim", json={"worker": NAME})
+    r = client.post("/worker/claim", json={"worker": NAME, "platform": PLATFORM})
     if r.status_code == 204:
         return False
     r.raise_for_status()
@@ -87,7 +117,7 @@ def run_one(client: httpx.Client) -> bool:
         f"at {j.job['temperature_c']} C (attempt {j.job.get('attempt')})")
     j.thread.start()
     try:
-        result = simulate.run(j.job, simulate.Settings.from_env(), j.set_progress, j.lost.is_set)
+        result = simulate.run(j.job, settings_for(j.job), j.set_progress, j.lost.is_set)
     except simulate.Abandoned:
         return True
     except Exception as e:
@@ -131,10 +161,14 @@ def main() -> None:
     if not TOKEN:
         sys.exit("WORKER_TOKEN is not set")
     once = "--once" in sys.argv
+    global PLATFORM
     import openmm
     platforms = [openmm.Platform.getPlatform(i).getName()
                  for i in range(openmm.Platform.getNumPlatforms())]
-    log(f"worker {NAME}: OpenMM {openmm.__version__}, platforms {platforms}, API {API_URL}")
+    PLATFORM = detect_platform()
+    kind = "CPU previews" if PLATFORM in ("CPU", "Reference") else "GPU runs"
+    log(f"worker {NAME}: OpenMM {openmm.__version__}, platforms {platforms}, running on "
+        f"{PLATFORM} (takes {kind}), API {API_URL}")
     headers = {"Authorization": f"Bearer {TOKEN}"}
     idle_since = time.monotonic()
     with httpx.Client(base_url=API_URL, headers=headers, timeout=120) as client:

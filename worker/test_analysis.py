@@ -70,4 +70,21 @@ acc.add(np.array([[0.1, 3.0, 3.0]]), np.array([[5.9, 3.0, 3.0]]), uniform(3000),
 assert acc.contact_frames[0] == 1, "minimum image not applied"
 print("ok  distances use the minimum image across the periodic box")
 
+# The 3D snapshot: a chain wrapped across the box is drawn beside the protein, not a box away.
+import snapshot  # noqa: E402
+
+xyz = np.array([[0.2, 3.0, 3.0], [0.4, 3.0, 3.0],     # protein, against the -x face
+                [5.7, 3.0, 3.0], [5.9, 3.0, 3.0]])    # a chain across the boundary from it
+text = snapshot.pdb(xyz=xyz, box=BOX,
+                    protein=[(0, "CA", "LYS", "A", 45, "C"), (1, "CB", "LYS", "A", 45, "C")],
+                    polymer_chains=[[(2, "C1", "C"), (3, "O2", "O")]])
+rows = [l for l in text.splitlines() if l.startswith(("ATOM", "HETATM"))]
+coords = np.array([[float(l[30:38]), float(l[38:46]), float(l[46:54])] for l in rows])
+assert len(rows) == 4 and rows[0][17:20] == "LYS" and rows[2][17:20] == snapshot.POLYMER_RESNAME
+assert abs(coords[:2, 0].mean()) < 1e-6, "centred on the protein"
+assert np.linalg.norm(coords[2:, 0].mean() - coords[:2, 0].mean()) < 10, \
+    "the chain is moved to its image beside the protein (within 1 nm, not 5)"
+assert rows[0][76:78].strip() == "C" and rows[3][76:78].strip() == "O", "element columns"
+print("ok  snapshot: heavy atoms only, centred on the protein, chains at their nearest image")
+
 print("\nall analysis checks passed")

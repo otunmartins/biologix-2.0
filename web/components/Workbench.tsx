@@ -10,13 +10,13 @@ import { Info, Molecule, Spinner, Triangle } from '@/components/icons';
 import BenchmarkPanel from '@/components/BenchmarkPanel';
 import UserMenu, { type SessionUser } from '@/components/UserMenu';
 import HistoryView from '@/components/history/HistoryView';
-import Approvals from '@/components/Approvals';
+import ResultsView from '@/components/ResultsView';
 import {
   API_URL,
   endCampaign,
   getCampaign,
   getHealth,
-  getIsAdmin,
+  getScreenRecord,
   iterateDesign,
   queueCandidates,
   runScreen,
@@ -215,7 +215,7 @@ function LoadingState({ elapsed }: { elapsed: number }) {
   );
 }
 
-type Workflow = 'screen' | 'design' | 'history' | 'approvals';
+type Workflow = 'screen' | 'design' | 'results' | 'history';
 
 interface CampaignView {
   campaignId: string;
@@ -253,7 +253,7 @@ function campaignFromState(s: CampaignState): CampaignView {
 }
 
 // The signed-in app. app/page.tsx renders it only once there is a session.
-export default function Workbench({ user }: { user: SessionUser }) {
+export default function Workbench({ user, isAdmin = false }: { user: SessionUser; isAdmin?: boolean }) {
   const [workflow, setWorkflow] = useState<Workflow>('screen');
   const [mode, setMode] = useState<Mode>('form');
   const [designPrompt, setDesignPrompt] = useState('');
@@ -265,7 +265,6 @@ export default function Workbench({ user }: { user: SessionUser }) {
   );
 
   const [api, setApi] = useState<ApiState>({ kind: 'checking' });
-  const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -273,6 +272,10 @@ export default function Workbench({ user }: { user: SessionUser }) {
   const [context, setContext] = useState<string[] | null>(null);
   // The last screen came back but could not be written to history.
   const [unsaved, setUnsaved] = useState(false);
+  // A designed candidate handed over with "Screen this candidate". The screen is
+  // tagged with it only while the form still describes that candidate: change the
+  // excipient or its repeat unit and it is an excipient screen of your own.
+  const [handoff, setHandoff] = useState<{ candidateId: string; excipient: string; repeatUnit: string } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   // "Run again" from history refills the form, then runs once it has rendered.
   const rerunPending = useRef(false);
@@ -285,9 +288,6 @@ export default function Workbench({ user }: { user: SessionUser }) {
       .catch((e) => {
         if (e.name !== 'AbortError') setApi({ kind: 'down' });
       });
-    getIsAdmin(ctrl.signal)
-      .then(setIsAdmin)
-      .catch(() => {});
     return () => ctrl.abort();
   }, []);
 
@@ -321,12 +321,17 @@ export default function Workbench({ user }: { user: SessionUser }) {
       // Kept with the run in history, so it can be reopened exactly as filled in.
       const saved: SavedForm =
         mode === 'form' ? { mode: 'form', values: { ...form } } : { mode: 'text', text: freeText };
+      const fromDesign =
+        handoff && mode === 'form' && form.excipient === handoff.excipient && form.polymer.repeatUnit === handoff.repeatUnit
+          ? handoff.candidateId
+          : undefined;
       const result = await runScreen(
         prompt,
         polymer,
         mode === 'form' ? toExposureInputs(form) : null,
         saved,
         ctrl.signal,
+        fromDesign,
       );
       setDossier(result);
       setUnsaved(!result.history_id);
@@ -347,7 +352,7 @@ export default function Workbench({ user }: { user: SessionUser }) {
     } finally {
       if (abortRef.current === ctrl) setLoading(false);
     }
-  }, [mode, form, freeText]);
+  }, [mode, form, freeText, handoff]);
 
   // Start a campaign: iteration 1 from the goal in the user's words.
   const design = useCallback(async () => {
@@ -433,6 +438,13 @@ export default function Workbench({ user }: { user: SessionUser }) {
   const openScreen = useCallback((r: ScreenRecord) => {
     abortRef.current?.abort();
     const saved = r.request.form;
+    // Reopening a designed candidate's screen keeps it one, so a rerun is too.
+    const sv = saved?.mode === 'form' ? (saved.values as Partial<Form>) : null;
+    setHandoff(
+      r.request.candidate_id && sv?.excipient && sv.polymer?.repeatUnit
+        ? { candidateId: r.request.candidate_id, excipient: sv.excipient, repeatUnit: sv.polymer.repeatUnit }
+        : null,
+    );
     if (saved?.mode === 'form') {
       setMode('form');
       // Defaults first, so a record saved by an older form still opens.
@@ -486,6 +498,7 @@ export default function Workbench({ user }: { user: SessionUser }) {
                   simulation: {
                     structure_id: sid, attempts: 0, started_at: null, heartbeat_at: null,
                     finished_at: null, progress: null, result: null, error: null, approved_at: null,
+                    tier: null,
                   },
                 }
               : x,
@@ -549,6 +562,7 @@ export default function Workbench({ user }: { user: SessionUser }) {
   // A candidate is only a hypothesis until the screen judges it, so handing it
   // over switches workflow and fills the polymer description in place.
   const screenCandidate = useCallback((c: StoredCandidate) => {
+    setHandoff({ candidateId: c.id, excipient: c.name, repeatUnit: c.screen_as.repeat_unit });
     setForm((f) => ({
       ...f,
       excipient: c.name,
@@ -613,8 +627,8 @@ export default function Workbench({ user }: { user: SessionUser }) {
             [
               ['screen', 'Screen'],
               ['design', 'Design'],
+              ['results', 'Results'],
               ['history', 'History'],
-              ...(isAdmin ? ([['approvals', 'Approvals']] as const) : []),
             ] as const
           ).map(([w, label]) => (
             <button
@@ -635,12 +649,15 @@ export default function Workbench({ user }: { user: SessionUser }) {
         </nav>
         <div className="flex items-center gap-3">
           <ApiBadge api={api} />
-          <UserMenu user={user} />
+          <UserMenu user={user} isAdmin={isAdmin} />
         </div>
       </header>
 
-      {workflow === 'approvals' ? (
-        <Approvals />
+      {workflow === 'results' ? (
+        <ResultsView
+          onOpenCampaign={(id) => getCampaign(id).then(openCampaign).catch((e) => setError((e as Error).message))}
+          onOpenScreen={(id) => getScreenRecord(id).then(openScreen).catch((e) => setError((e as Error).message))}
+        />
       ) : workflow === 'history' ? (
         <HistoryView onOpenScreen={openScreen} onRerunScreen={rerunScreen} onOpenCampaign={openCampaign} />
       ) : (

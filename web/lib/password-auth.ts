@@ -146,5 +146,5 @@ export async function startSession(userId: number): Promise<void> {
   ]);
   const { name, secure } = sessionCookie();
   // The same attributes Auth.js gives its own session cookie.
-  cookies().set(name, token, { httpOnly: true, sameSite: 'lax', path: '/', secure, expires });
+  (await cookies()).set(name, token, { httpOnly: true, sameSite: 'lax', path: '/', secure, expires });
 }
