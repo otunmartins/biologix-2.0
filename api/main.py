@@ -1513,6 +1513,9 @@ class Approve(BaseModel):
 # enough to see where the polymer sits, not to converge Gamma23.
 CPU_PREVIEW_NS = float(os.environ.get("SIM_CPU_PREVIEW_NS", "1.0"))
 CPU_PREVIEW_EQUIL_NS = float(os.environ.get("SIM_CPU_PREVIEW_EQUIL_NS", "0.1"))
+# The unrestrained stress stage (Tier 2) of a CPU preview; a GPU run uses the
+# worker's own default (simulate.Settings.stress_ns).
+CPU_PREVIEW_STRESS_NS = float(os.environ.get("SIM_CPU_PREVIEW_STRESS_NS", "0.2"))
 
 
 # Which workers have asked for work lately, and on what. In memory: it answers
@@ -1807,6 +1810,28 @@ class SimulationResult(BaseModel):
     # The last frame, protein and polymer heavy atoms only, as PDB text
     # (worker/snapshot.py): the 3D view. Stored apart from the result.
     snapshot_pdb: str | None = Field(default=None, max_length=8_000_000)
+    # Tier 1, from the same frames (worker/metrics.py Interactions and QC):
+    # polymer-protein interaction energy (never a binding free energy), hydrogen
+    # bonds, contact residence times, liability-residue coverage, chain
+    # self-association, and whether the run held its temperature and density.
+    interaction_energy: dict | None = None
+    hbonds: dict | None = None
+    residence: dict | None = None
+    liability_coverage: list[dict] = Field(default_factory=list, max_length=20)
+    self_association: dict | None = None
+    qc: dict | None = None
+    # Tier 2: the unrestrained stage at a stress temperature (metrics.Stability):
+    # RMSD, RMSF, native contacts, surface, secondary structure.
+    stability: dict | None = None
+
+    @model_validator(mode="after")
+    def metrics_fit(self):
+        # These are stored with the candidate; a runaway worker must not be able
+        # to write megabytes into a JSON column. The snapshot is stored apart.
+        size = len(json.dumps(self.model_dump(exclude={"snapshot_pdb"})))
+        if size > 400_000:
+            raise ValueError(f"result is {size} bytes without the snapshot; the limit is 400000")
+        return self
 
 
 class WorkerReport(WorkerHello):
@@ -1906,7 +1931,7 @@ def worker_claim(hello: WorkerClaim, request: Request):
             # The API, not the worker, decides how long a run is: a CPU preview is
             # short whatever the worker's own defaults say.
             settings = ({"tier": "cpu", "production_ns": CPU_PREVIEW_NS,
-                         "equilibration_ns": CPU_PREVIEW_EQUIL_NS}
+                         "equilibration_ns": CPU_PREVIEW_EQUIL_NS, "stress_ns": CPU_PREVIEW_STRESS_NS}
                         if hello.tier == "cpu" else {"tier": "gpu"})
             cond = conditions.for_goal(goal)
             return {

@@ -99,8 +99,8 @@ jobs:
       - name: Build the worker image
         run: docker build -t biologix-worker ./worker
 
-      - name: Gamma23 analysis
-        run: docker run --rm biologix-worker python test_analysis.py
+      - name: Gamma23 analysis and the Tier 1/2 metrics
+        run: docker run --rm biologix-worker sh -c "python test_analysis.py && python test_metrics.py"
 
       - name: Simulation smoke test (CPU)
         run: docker run --rm -e OPENMM_PLATFORM=CPU biologix-worker python smoke.py
