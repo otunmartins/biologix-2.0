@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   plainError,
   resolveStructure,
@@ -27,6 +27,11 @@ interface Props {
   // Sends the candidate to the OpenMM simulation backlog, against the given
   // structure ('' when the campaign's goal already names one).
   onQueue?: (c: StoredCandidate, structureId: string) => void;
+  // Sends every candidate that can be queued, in one request against one
+  // structure. Each is still its own simulation.
+  onQueueAll?: (ids: string[], structureId: string) => void;
+  queueingAll?: boolean;
+  queueAllError?: string | null;
   queueing?: string | null;
   // What the user asked, for finding the biologic when the goal names none.
   prompt?: string;
@@ -303,38 +308,63 @@ export function SimulationPanel({
   );
 }
 
-// The structure for the biologic the campaign names, looked up by the API
-// (api/structures.py) once per name and remembered for the page's life.
+// What the lookup knows about the biologic the campaign names. A lookup that
+// FAILED is not the same answer as one that found nothing: the first is a
+// database or network fault the user can retry, the second means they must give
+// an ID. Reporting both as "not found" sent people hunting for a PDB entry that
+// the app had never actually asked for.
+type Lookup =
+  | { state: 'looking' }
+  | { state: 'found'; hit: ResolvedStructure }
+  | { state: 'none' }
+  | { state: 'failed'; message: string };
+
+// Looked up once per name and remembered for the page's life. Only answers are
+// cached: a failure is dropped so the next render tries again.
 const resolved = new Map<string, Promise<ResolvedStructure | null>>();
 
-function useResolvedStructure(query: string): ResolvedStructure | null | undefined {
+function useResolvedStructure(query: string, attempt = 0): Lookup {
   const q = query.trim();
-  const [hit, setHit] = useState<{ q: string; value: ResolvedStructure | null } | null>(null);
+  const [got, setGot] = useState<{ q: string; at: number; value: Lookup } | null>(null);
   useEffect(() => {
     if (!q) return;
     let live = true;
-    if (!resolved.has(q)) resolved.set(q, resolveStructure(q).catch(() => null));
-    resolved.get(q)!.then((value) => live && setHit({ q, value }));
+    if (!resolved.has(q)) resolved.set(q, resolveStructure(q));
+    resolved
+      .get(q)!
+      .then((hit) => live && setGot({ q, at: attempt, value: hit ? { state: 'found', hit } : { state: 'none' } }))
+      .catch((e: unknown) => {
+        resolved.delete(q); // a fault is not an answer: let it be retried
+        if (live) {
+          setGot({
+            q,
+            at: attempt,
+            value: { state: 'failed', message: e instanceof Error ? e.message : 'the lookup failed' },
+          });
+        }
+      });
     return () => {
       live = false;
     };
-  }, [q]);
-  if (!q) return null;
-  return hit?.q === q ? hit.value : undefined; // undefined: still looking
+  }, [q, attempt]);
+  if (!q) return { state: 'none' };
+  return got?.q === q && got.at === attempt ? got.value : { state: 'looking' };
 }
 
 // What is in the box, and why: the entry found for the named biologic, or that
 // nothing was found and an ID is needed.
 function StructureNote({
   protein,
-  suggested,
+  lookup,
   sid,
   onPick,
+  onRetry,
 }: {
   protein: string;
-  suggested: ResolvedStructure | null | undefined;
+  lookup: Lookup;
   sid: string;
   onPick: (id: string) => void;
+  onRetry: () => void;
 }) {
   const name = protein.trim().slice(0, 80);
   if (!name) {
@@ -344,10 +374,22 @@ function StructureNote({
       </p>
     );
   }
-  if (suggested === undefined) {
+  if (lookup.state === 'looking') {
     return <p className="w-full text-xs text-slate-500">Looking up the structure of {name}…</p>;
   }
-  if (suggested === null) {
+  if (lookup.state === 'failed') {
+    return (
+      <p className="w-full text-xs text-alert" role="alert">
+        The structure lookup did not answer ({lookup.message}). This is not the same as finding nothing — the
+        databases were not reached.{' '}
+        <button type="button" className="underline underline-offset-2" onClick={onRetry}>
+          Try again
+        </button>
+        , or type the ID yourself.
+      </p>
+    );
+  }
+  if (lookup.state === 'none') {
     return (
       <p className="w-full text-xs text-slate-500">
         No structure of &ldquo;{name}&rdquo; alone was found in the PDB or UniProt. Type its PDB ID or UniProt
@@ -355,9 +397,16 @@ function StructureNote({
       </p>
     );
   }
+  const suggested = lookup.hit;
   if (sid.trim().toUpperCase() !== suggested.structure_id.toUpperCase()) return null;
   return (
     <div className="w-full space-y-1 text-xs leading-relaxed text-slate-500">
+      {suggested.read_as && (
+        <p className="text-slate-700">
+          Read &ldquo;{suggested.as_written}&rdquo; as <b className="font-semibold">{suggested.read_as}</b>, which is
+          what was searched for. If that is not your biologic, type its ID instead.
+        </p>
+      )}
       <p>
         <b className="font-semibold text-slate-700">{suggested.structure_id}</b>
         {suggested.title && <> &middot; {suggested.title}</>} &middot; {suggested.source}. Found for &ldquo;{name}
@@ -433,10 +482,13 @@ function QueueControl({
   queueing: boolean;
   error?: string;
 }) {
-  const suggested = useResolvedStructure(needsStructure ? protein : '');
+  const [attempt, setAttempt] = useState(0);
+  const lookup = useResolvedStructure(needsStructure ? protein : '', attempt);
+  const suggested = lookup.state === 'found' ? lookup.hit : null;
   const [sid, setSid] = useState('');
   const [edited, setEdited] = useState(false);
   const [needsId, setNeedsId] = useState(false);
+  const box = useRef<HTMLInputElement>(null);
   // Fill the box with what was found, unless the user has typed their own.
   useEffect(() => {
     if (suggested && !edited) setSid(suggested.structure_id);
@@ -473,14 +525,20 @@ function QueueControl({
       className="flex w-full flex-wrap items-end gap-2 sm:w-auto"
       onSubmit={(e) => {
         e.preventDefault();
-        // Never a silently greyed-out button: say what is missing.
+        // Never a silently greyed-out button: say what is missing, and put the
+        // cursor where it has to be typed -- a button that only prints a
+        // sentence underneath itself reads as a button that does nothing.
         if (sid.trim()) onQueue(sid.trim());
-        else setNeedsId(true);
+        else {
+          setNeedsId(true);
+          box.current?.focus();
+        }
       }}
     >
       <label className="block text-xs font-medium text-slate-600">
         Your biologic&rsquo;s PDB ID or UniProt accession
         <input
+          ref={box}
           value={sid}
           onChange={(e) => {
             setSid(e.target.value);
@@ -496,7 +554,13 @@ function QueueControl({
       <button type="submit" className="btn-ghost" disabled={queueing}>
         {label}
       </button>
-      <StructureNote protein={protein} suggested={suggested} sid={sid} onPick={(id) => { setSid(id); setEdited(true); }} />
+      <StructureNote
+        protein={protein}
+        lookup={lookup}
+        sid={sid}
+        onPick={(id) => { setSid(id); setEdited(true); }}
+        onRetry={() => setAttempt((n) => n + 1)}
+      />
       {needsId && (
         <p className="w-full text-xs text-alert" role="alert">
           A simulation runs the polymer against your protein, so it needs the protein&rsquo;s structure: type its PDB ID
@@ -661,6 +725,95 @@ function CandidateCard({
   );
 }
 
+// Queue the whole batch at once. Every candidate is a separate simulation
+// against the same protein, so a batch of eight used to be eight identical
+// clicks, each asking for the same structure.
+function QueueAllControl({
+  ids,
+  needsStructure,
+  protein,
+  onQueueAll,
+  busy,
+  error,
+}: {
+  ids: string[];
+  needsStructure: boolean;
+  protein: string;
+  onQueueAll: (ids: string[], structureId: string) => void;
+  busy: boolean;
+  error?: string;
+}) {
+  const [attempt, setAttempt] = useState(0);
+  const lookup = useResolvedStructure(needsStructure ? protein : '', attempt);
+  const suggested = lookup.state === 'found' ? lookup.hit : null;
+  const [sid, setSid] = useState('');
+  const [edited, setEdited] = useState(false);
+  const [needsId, setNeedsId] = useState(false);
+  const box = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (suggested && !edited) setSid(suggested.structure_id);
+  }, [suggested, edited]);
+
+  if (ids.length === 0) return null;
+  const label = busy ? 'Queuing…' : `Queue all ${ids.length} for simulation`;
+  return (
+    <form
+      className="flex flex-wrap items-end gap-2"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (!needsStructure) return onQueueAll(ids, '');
+        if (sid.trim()) onQueueAll(ids, sid.trim());
+        else {
+          setNeedsId(true);
+          box.current?.focus();
+        }
+      }}
+    >
+      {needsStructure && (
+        <label className="block text-xs font-medium text-slate-600">
+          Your biologic&rsquo;s PDB ID or UniProt accession
+          <input
+            ref={box}
+            value={sid}
+            onChange={(e) => {
+              setSid(e.target.value);
+              setEdited(true);
+              setNeedsId(false);
+            }}
+            aria-invalid={needsId}
+            placeholder="1IGT or P01857"
+            maxLength={40}
+            className="mt-1 block w-40 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-sm text-slate-900 placeholder:text-slate-400 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-200"
+          />
+        </label>
+      )}
+      <button type="submit" className="btn-ghost" disabled={busy}>
+        {label}
+      </button>
+      {needsStructure && (
+        <StructureNote
+          protein={protein}
+          lookup={lookup}
+          sid={sid}
+          onPick={(id) => { setSid(id); setEdited(true); }}
+          onRetry={() => setAttempt((n) => n + 1)}
+        />
+      )}
+      {needsId && (
+        <p className="w-full text-xs text-alert" role="alert">
+          A simulation runs the polymer against your protein, so it needs the protein&rsquo;s structure: type its PDB ID
+          (e.g. 1IGT) or UniProt accession (e.g. P01857), then queue.
+        </p>
+      )}
+      {error && (
+        <p className="w-full text-xs text-alert" role="alert">
+          {error}
+        </p>
+      )}
+    </form>
+  );
+}
+
 export default function DesignResults({
   goal,
   candidates,
@@ -668,6 +821,9 @@ export default function DesignResults({
   verdict,
   onScreen,
   onQueue,
+  onQueueAll,
+  queueingAll = false,
+  queueAllError = null,
   queueing = null,
   queueError = null,
   readOnly = false,
@@ -693,6 +849,20 @@ export default function DesignResults({
           <div className="mt-3">
             <GoalChips goal={goal} />
           </div>
+          {onQueueAll && (
+            <div className="mt-4">
+              <QueueAllControl
+                ids={candidates
+                  .filter((c) => c.status === 'benchmarked' || c.status === 'failed')
+                  .map((c) => c.id)}
+                needsStructure={!goal.structure_id}
+                protein={goal.protein || prompt}
+                onQueueAll={onQueueAll}
+                busy={queueingAll}
+                error={queueAllError ?? undefined}
+              />
+            </div>
+          )}
         </header>
       )}
 

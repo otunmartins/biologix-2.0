@@ -976,6 +976,10 @@ export interface ResolvedStructure {
   source: string;
   residues: number | null;
   why: string;
+  // Set when the biologic was named with a typo: the spelling that was searched
+  // for, and the one the user wrote. See corrected_terms() in api/structures.py.
+  read_as?: string;
+  as_written?: string;
   alternatives: Omit<ResolvedStructure, 'alternatives'>[];
 }
 

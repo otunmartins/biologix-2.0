@@ -282,6 +282,8 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
   // Shown on the candidate's own card: the page-level notice is scrolled far
   // out of view by then, which made a refused queue look like a dead button.
   const [queueError, setQueueError] = useState<{ id: string; message: string } | null>(null);
+  const [queueingAll, setQueueingAll] = useState(false);
+  const [queueAllError, setQueueAllError] = useState<string | null>(null);
   const [form, setForm] = useState<Form>(DEFAULT_FORM);
   const [freeText, setFreeText] = useState(
     'Is polysorbate 80 a concern for my antibody given subcutaneously, stored at room temperature?',
@@ -552,6 +554,33 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
     }
   }, [campaignId]);
 
+  // The whole batch against one structure. Each candidate is still its own
+  // simulation; this only saves asking for the same structure once per card.
+  const queueAll = useCallback(async (ids: string[], structureId: string) => {
+    setQueueingAll(true);
+    setQueueAllError(null);
+    try {
+      const r = await queueCandidates(ids, structureId);
+      if (r.queued === 0) {
+        setQueueAllError('Nothing was queued: these candidates are already waiting, running or finished.');
+      } else if (r.queued < ids.length) {
+        setQueueAllError(`Queued ${r.queued} of ${ids.length}; the rest were already waiting, running or finished.`);
+      }
+      // Whatever the count, the server is now the truth: re-read the campaign
+      // rather than guessing which rows moved.
+      const s = await getCampaign(campaignId ?? '');
+      setCampaign((prev) =>
+        prev && prev.campaignId === s.campaign_id
+          ? { ...prev, goal: s.goal, candidates: Object.values(s.candidates_by_iteration).flat() }
+          : prev,
+      );
+    } catch (e) {
+      setQueueAllError((e as Error).message);
+    } finally {
+      setQueueingAll(false);
+    }
+  }, [campaignId]);
+
   // While any candidate is waiting on or running a simulation, refresh the
   // campaign now and then so progress and results appear without a reload.
   const activeSims = campaign?.candidates.some((c) => c.status === 'queued' || c.status === 'simulating');
@@ -772,6 +801,9 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
                     verdict={campaign.verdict}
                     onScreen={screenCandidate}
                     onQueue={queueCandidate}
+                    onQueueAll={queueAll}
+                    queueingAll={queueingAll}
+                    queueAllError={queueAllError}
                     queueing={queueingId}
                     queueError={queueError}
                     prompt={campaign.prompt}

@@ -84,6 +84,39 @@ def main():
            entry("6O17", "Recombinant Human Insulin", ["Insulin A chain", "Insulin B chain"], 51)]
     assert S._rank(ins, "insulin", "human insulin")[0]["structure_id"] == "6O17"
     print("ok  human insulin: the entry titled as such first")
+
+    # A misspelt name is read as the biologic it is a near-miss for. Neither the
+    # PDB nor UniProt tolerates a typo, so without this one wrong letter ends the
+    # simulation with "no structure found".
+    assert S.corrected_terms("adamalimumab") == [("adalimumab", "adamalimumab")]
+    assert S.corrected_terms("stabilize adamalimumab at 40 degree celcius") == \
+        [("adalimumab", "adamalimumab")]
+    assert S.corrected_terms("insulan") == [("insulin", "insulan")]
+    assert S.corrected_terms("lysozime") == [("lysozyme", "lysozime")]
+    # A name spelt correctly is left alone, and so is a word that is not a drug.
+    assert S.corrected_terms("adalimumab") == []
+    assert S.corrected_terms("my IgG1 antibody") == []
+    assert S.corrected_terms("somethingelse entirely") == []
+    print("ok  a misspelt biologic is read as the name it is a near-miss for")
+
+    # The one thing worse than not correcting: correcting to a DIFFERENT drug.
+    # Antibody names differ by a syllable, so every single-slip typo of every
+    # name must land on its own drug or on nothing at all.
+    def slips(name):
+        out = set()
+        for i in range(1, len(name) - 1):
+            out.add(name[:i] + name[i + 1:])
+            out.add(name[:i] + name[i] + name[i:])
+            out.add(name[:i] + name[i + 1] + name[i] + name[i + 2:])
+        return {t for t in out if t and t != name}
+
+    same = {"hemoglobin", "haemoglobin"}   # one molecule, two spellings
+    for name in S.KNOWN_BIOLOGICS:
+        for typo in slips(name):
+            got = S.corrected_terms(typo)
+            if got and got[0][0] != name:
+                assert {got[0][0], name} == same, f"{name} -> {typo} -> {got[0][0]}"
+    print(f"ok  no typo of any of the {len(S.KNOWN_BIOLOGICS)} names reads as a different drug")
     print("\nall checks passed")
 
 

@@ -127,6 +127,89 @@ def search_terms(text: str) -> list[str]:
     return out[:4]
 
 
+# ---------------------------------------------------------------------------
+# A misspelt name
+# ---------------------------------------------------------------------------
+# Neither the PDB nor UniProt tolerates a typo: searching either for
+# "adamalimumab" returns nothing at all, so one wrong letter used to dead-end
+# the whole simulation with "no structure found". These are the biologics a
+# formulation user is likely to name, and they are used ONLY to propose a
+# spelling when the text as written found nothing.
+#
+# A correction is a hypothesis, never an answer: it is searched for like any
+# other term, so it only reaches the user if a real PDB or UniProt entry backs
+# it, and resolve() then says which spelling it read. The cutoff is set so that
+# no name below turns into a DIFFERENT name below -- mistaking one antibody for
+# another would simulate the wrong drug (test_structures.py checks this).
+KNOWN_BIOLOGICS = (
+    # Monoclonal antibodies and fragments.
+    "adalimumab", "infliximab", "rituximab", "trastuzumab", "bevacizumab", "cetuximab",
+    "pembrolizumab", "nivolumab", "atezolizumab", "durvalumab", "avelumab", "ipilimumab",
+    "ustekinumab", "secukinumab", "ixekizumab", "brodalumab", "guselkumab", "risankizumab",
+    "omalizumab", "denosumab", "eculizumab", "ravulizumab", "natalizumab", "tocilizumab",
+    "sarilumab", "golimumab", "certolizumab", "vedolizumab", "dupilumab", "tralokinumab",
+    "evolocumab", "alirocumab", "ocrelizumab", "daratumumab", "isatuximab", "elotuzumab",
+    "ramucirumab", "panitumumab", "obinutuzumab", "ofatumumab", "palivizumab", "nirsevimab",
+    "basiliximab", "abciximab", "belimumab", "canakinumab", "mepolizumab", "benralizumab",
+    "reslizumab", "emicizumab", "caplacizumab", "erenumab", "fremanezumab", "galcanezumab",
+    "romosozumab", "burosumab", "teprotumumab", "tezepelumab", "bimekizumab", "dostarlimab",
+    "cemiplimab", "polatuzumab", "enfortumab", "sacituzumab", "margetuximab", "tafasitamab",
+    "lecanemab", "aducanumab", "donanemab", "teplizumab", "inebilizumab", "satralizumab",
+    # Other therapeutic proteins and peptides.
+    "insulin", "glargine", "lispro", "aspart", "detemir", "degludec", "somatropin",
+    "erythropoietin", "epoetin", "darbepoetin", "filgrastim", "pegfilgrastim", "interferon",
+    "etanercept", "abatacept", "aflibercept", "romiplostim", "rilonacept", "albumin",
+    "lysozyme", "hemoglobin", "haemoglobin", "myoglobin", "ubiquitin", "chymotrypsin",
+    "trypsin", "asparaginase", "alteplase", "tenecteplase", "dornase", "agalsidase",
+    "imiglucerase", "laronidase", "idursulfase", "rasburicase", "pegloticase", "follitropin",
+    "teriparatide", "liraglutide", "semaglutide", "dulaglutide", "exenatide", "calcitonin",
+    "glucagon", "oxytocin", "vasopressin", "desmopressin", "lactoferrin", "papain",
+)
+
+# Calibrated against the names above: the typos in test_structures.py are all
+# caught, and ordinary English words are not mistaken for a drug.
+_TYPO_CUTOFF = 0.85
+
+# How far ahead the best match must be before it is trusted over the runner-up.
+# Below this the word is left alone rather than resolved to one of two drugs.
+_TYPO_MARGIN = 0.04
+
+
+def corrected_terms(text: str) -> list[tuple[str, str]]:
+    """[(spelling we know, word the user wrote)] for naming words that look like
+    a near-miss for a biologic in KNOWN_BIOLOGICS. A word spelt correctly, or
+    nothing like any of them, yields nothing."""
+    import difflib
+
+    out: list[tuple[str, str]] = []
+    for w in re.findall(r"[A-Za-z][A-Za-z0-9\-]+", text):
+        low = w.lower()
+        if len(low) < 5 or low in _GENERIC or _NOT_A_NAME.search(low):
+            continue
+        if low in KNOWN_BIOLOGICS:      # spelt right: nothing to correct
+            continue
+        near = difflib.get_close_matches(low, KNOWN_BIOLOGICS, n=2, cutoff=_TYPO_CUTOFF)
+        if not near:
+            continue
+        # Antibody names differ by a syllable -- satralizumab and natalizumab
+        # are 0.87 alike -- so a typo can sit between two real drugs. Correcting
+        # to the wrong one would silently simulate a different molecule, which is
+        # worse than not correcting at all: when the best match is not clearly
+        # ahead, say nothing and let the user give the ID.
+        if len(near) > 1:
+            best, second = (_ratio(low, near[0]), _ratio(low, near[1]))
+            if best - second < _TYPO_MARGIN:
+                continue
+        if not any(near[0] == c for c, _ in out):
+            out.append((near[0], w))
+    return out[:2]
+
+
+def _ratio(a: str, b: str) -> float:
+    import difflib
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
 def naming_phrase(text: str) -> str:
     """The words that name the biologic, in order, keeping "human" and the like."""
     keep = {"human", "bovine", "hen", "egg", "white", "serum"}
@@ -274,6 +357,18 @@ def resolve(text: str) -> dict | None:
             hit = _uniprot(term, client)
             if hit:
                 return {**hit, "alternatives": []}
+        # Nothing matched the words as written. One wrong letter is enough for
+        # that -- neither database tolerates a typo -- so try the spelling we
+        # know, and say which one was read. See corrected_terms().
+        for fixed, typed in corrected_terms(text):
+            ids = _pdb_hits(fixed, client)
+            picks = _rank(_entries(ids, client), fixed, fixed) if ids else []
+            hit = picks[0] if picks else _uniprot(fixed, client)
+            if hit:
+                return {**hit, "read_as": fixed, "as_written": typed,
+                        "why": f"read as “{fixed}”, since “{typed}” matched "
+                               f"nothing in either database; {hit['why']}",
+                        "alternatives": picks[1:4] if picks else []}
     return None
 
 
