@@ -5,7 +5,7 @@ import { SimulationPanel } from '@/components/DesignResults';
 import SimulationReport from '@/components/SimulationReport';
 import { EventTimeline } from '@/components/history/HistoryDetail';
 import { Spinner, Triangle } from '@/components/icons';
-import { getMySimulation, getMySimulations, type HistoryEvent, type MySimulation } from '@/lib/api';
+import { getMySimulation, getMySimulations, plainError, type HistoryEvent, type MySimulation } from '@/lib/api';
 import { ago, fullStamp } from '@/lib/when';
 
 // Every simulation the signed-in user has sent off, across all their campaigns,
@@ -30,7 +30,7 @@ function stateOf(s: MySimulation): { label: string; dot: string } {
     const g = `Γ23 ${r.gamma23 > 0 ? '+' : ''}${r.gamma23}${r.gamma23_se !== null ? ` ± ${r.gamma23_se}` : ''}`;
     return { label: r.preview || sim.tier === 'cpu' ? `${g} (CPU preview)` : g, dot: 'bg-precedented' };
   }
-  return { label: sim?.error ? `Failed: ${sim.error}` : 'Failed', dot: 'bg-alert' };
+  return { label: sim?.error ? `Failed: ${plainError(sim.error)}` : 'Failed', dot: 'bg-alert' };
 }
 
 function TierChip({ tier }: { tier: 'gpu' | 'cpu' | null | undefined }) {

@@ -5,6 +5,7 @@ import {
   getCampaign,
   getScreenRecord,
   queueCandidates,
+  plainError,
   type CampaignState,
   type HistoryEvent,
   type HistoryItem,
@@ -127,7 +128,7 @@ function ScreenDetail({
           <Triangle className="mt-0.5 h-5 w-5 shrink-0 text-alert" />
           <p>
             <b className="font-semibold">This run failed</b> after {duration(record.provenance.duration_s ?? 0)}.{' '}
-            {record.error}
+            {plainError(record.error)}
           </p>
         </div>
       )}

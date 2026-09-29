@@ -16,6 +16,7 @@ import HistoryView from '@/components/history/HistoryView';
 import ResultsView from '@/components/ResultsView';
 import {
   API_URL,
+  IS_DEV,
   endCampaign,
   getCampaign,
   getHealth,
@@ -671,7 +672,8 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
           ))}
         </nav>
         <div className="flex items-center gap-3">
-          <ApiBadge api={api} />
+          {/* A developer's status light; users only hear about the API when it is down. */}
+          {IS_DEV && <ApiBadge api={api} />}
           <UserMenu user={user} isAdmin={isAdmin} />
         </div>
       </header>
@@ -719,16 +721,29 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
                 (unsaved && workflow === 'screen' && dossier)) && (
                 <div className="space-y-3 px-6 pt-6 lg:px-10">
                   {api.kind === 'down' && (
-                    <Notice tone="alert" title={`API unreachable at ${API_URL}`}>
-                      Start it with <code className="font-mono">uvicorn main:app --port 8000</code> in{' '}
-                      <code className="font-mono">api/</code>.
-                    </Notice>
+                    IS_DEV ? (
+                      <Notice tone="alert" title={`API unreachable at ${API_URL}`}>
+                        Start it with <code className="font-mono">uvicorn main:app --port 8000</code> in{' '}
+                        <code className="font-mono">api/</code>.
+                      </Notice>
+                    ) : (
+                      <Notice tone="alert" title="Biologix is temporarily unavailable">
+                        We could not reach the service. Try again in a minute; your saved work is safe.
+                      </Notice>
+                    )
                   )}
                   {api.kind === 'up' && !api.health.model_configured && (
-                    <Notice tone="gap" title="API is up, but no model key is configured">
-                      Set <code className="font-mono">ANTHROPIC_API_KEY</code> in the API environment — screens
-                      fail with 503 until you do.
-                    </Notice>
+                    IS_DEV ? (
+                      <Notice tone="gap" title="API is up, but no model key is configured">
+                        Set <code className="font-mono">ANTHROPIC_API_KEY</code> in the API environment — screens
+                        fail with 503 until you do.
+                      </Notice>
+                    ) : (
+                      <Notice tone="gap" title="Screening is temporarily unavailable">
+                        The assistant that writes screens and reads design goals is offline. Your history and results
+                        are still here; try again later.
+                      </Notice>
+                    )
                   )}
                   {error && (
                     <Notice tone="alert" title={workflow === 'design' ? 'Design failed' : 'Screen failed'}>

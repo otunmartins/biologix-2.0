@@ -281,12 +281,60 @@ export interface Health {
 // container). Falls back to localhost:8000 for local dev.
 export const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
+// Local development (next dev). Setup hints and raw status codes are shown only
+// here; production users get plain words.
+export const IS_DEV = process.env.NODE_ENV !== 'production';
+
+// A stored failure (a screen's or a simulation's) as a user should read it. The
+// messages this app writes itself are kept; a raw exception from a library
+// ("KeyError: 'x'", a traceback) becomes a plain sentence, and the full text
+// stays on the record for an admin. Unchanged in local development.
+export function plainError(text: string | null | undefined): string {
+  if (!text) return '';
+  if (IS_DEV) return text;
+  const t = text.replace(/^agent run failed: /, '').trim();
+  const fetchFail = t.match(/^(could not fetch structure \S+?):/);
+  if (fetchFail) return `${fetchFail[1]}. Check the PDB ID or UniProt accession, or try again later.`;
+  // ValueErrors are the worker's own checks, written for the user.
+  const own = t.match(/^ValueError: ([\s\S]+)/);
+  if (own) return own[1];
+  if (/Traceback|^[A-Za-z_.]*(Error|Exception|Exit|Interrupt)\b/.test(t)) {
+    return 'It stopped on a technical problem on our side. Try again; if it keeps failing, contact support.';
+  }
+  return t;
+}
+
+// What to say when a request fails with no message of its own (an unhandled
+// server error, a proxy's 502 page, a timeout).
+export function serverError(status: number): string {
+  const said =
+    status === 429
+      ? 'Too many requests. Wait a minute and try again.'
+      : status === 403
+        ? 'You do not have access to this.'
+        : status === 404
+          ? 'Not found. It may have been removed.'
+          : status >= 500
+            ? 'Biologix hit a problem on its side. Try again in a minute.'
+            : 'The request could not be completed. Try again.';
+  return IS_DEV ? `${said} (HTTP ${status})` : said;
+}
+
 // Every call goes through here so the session cookie always travels with it:
 // the API knows who is asking only from that cookie (api/users.py). 'include'
 // rather than the default 'same-origin' because in local dev the API is on
 // another port; in production it is the same origin and either would do.
 async function call(path: string, init: RequestInit = {}): Promise<Response> {
-  const res = await fetch(`${API_URL}${path}`, { ...init, credentials: 'include' });
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}${path}`, { ...init, credentials: 'include' });
+  } catch (e) {
+    // A cancelled request stays a cancellation; anything else here is the
+    // network or the server being down, which the browser reports as a bare
+    // "Failed to fetch".
+    if ((e as Error).name === 'AbortError') throw e;
+    throw new Error(IS_DEV ? `API unreachable at ${API_URL}` : 'Biologix cannot be reached right now. Check your connection and try again in a minute.');
+  }
   if (res.status === 401) {
     // Signed out in another tab, or the session expired. Reloading lets the
     // server render the sign-in screen instead of a run that can never succeed.
@@ -298,7 +346,7 @@ async function call(path: string, init: RequestInit = {}): Promise<Response> {
 
 export async function getHealth(signal?: AbortSignal): Promise<Health> {
   const res = await call('/health', { signal });
-  if (!res.ok) throw new Error(`health returned ${res.status}`);
+  if (!res.ok) throw new Error(serverError(res.status));
   return res.json();
 }
 
@@ -326,7 +374,7 @@ export async function runDesign(
         : Array.isArray(body?.detail)
           ? (body.detail as ValidationIssue[]).map((d) => d.msg).join('; ')
           : '';
-    throw new Error(detail || `Server returned ${res.status}`);
+    throw new Error(detail || serverError(res.status));
   }
   return res.json();
 }
@@ -356,7 +404,7 @@ export async function iterateDesign(
         : Array.isArray(body?.detail)
           ? (body.detail as ValidationIssue[]).map((d) => d.msg).join('; ')
           : '';
-    throw new Error(detail || `Server returned ${res.status}`);
+    throw new Error(detail || serverError(res.status));
   }
   return res.json();
 }
@@ -384,7 +432,7 @@ export async function queueCandidates(
       : typeof body?.detail === 'string'
         ? body.detail
         : '';
-    throw new Error(detail || `Server returned ${res.status}`);
+    throw new Error(detail || serverError(res.status));
   }
   return res.json();
 }
@@ -423,7 +471,7 @@ export async function runScreen(
               .map((d) => `${d.loc.filter((l) => l !== 'body').join(' › ')}: ${d.msg.replace(/^Value error, /, '')}`)
               .join('\n')
           : '';
-    throw new Error(detail || `Server returned ${res.status}`);
+    throw new Error(detail || serverError(res.status));
   }
   return res.json();
 }
@@ -499,7 +547,7 @@ export interface AdminSimulations {
 
 async function detailOf(res: Response): Promise<string> {
   const body = await res.json().catch(() => null);
-  return typeof body?.detail === 'string' ? body.detail : `Server returned ${res.status}`;
+  return typeof body?.detail === 'string' ? body.detail : serverError(res.status);
 }
 
 export async function getSimulations(signal?: AbortSignal): Promise<AdminSimulations> {
@@ -825,7 +873,7 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const res = await call(path, { signal });
   if (!res.ok) {
     const body = await res.json().catch(() => null);
-    throw new Error(typeof body?.detail === 'string' ? body.detail : `Server returned ${res.status}`);
+    throw new Error(typeof body?.detail === 'string' ? body.detail : serverError(res.status));
   }
   return res.json();
 }
@@ -869,5 +917,5 @@ export async function resolveStructure(q: string, signal?: AbortSignal): Promise
 // "New experiment": closes the campaign. It stays in history and reopens if continued.
 export async function endCampaign(id: string): Promise<void> {
   const res = await call(`/design/campaign/${encodeURIComponent(id)}/end`, { method: 'POST' });
-  if (!res.ok) throw new Error(`Server returned ${res.status}`);
+  if (!res.ok) throw new Error(serverError(res.status));
 }

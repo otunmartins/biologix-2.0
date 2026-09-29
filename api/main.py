@@ -20,6 +20,7 @@ Run standalone:
 
 import functools
 import json
+import logging
 import os
 import re
 import time
@@ -63,6 +64,14 @@ import runpod
 import stats
 import structures
 import users
+
+# Uvicorn's logger, so these land in `docker compose logs api`. The detail of a
+# server-side failure goes here; the user is told what happened in plain words.
+log = logging.getLogger("uvicorn.error")
+
+UNAVAILABLE = "the assistant is not available right now; try again later"
+NO_GOAL = ("could not read a design goal from that description; try rephrasing it, "
+           "or fill in the form instead")
 
 # ---------------------------------------------------------------------------
 # Output schema
@@ -1214,12 +1223,13 @@ async def design_candidates(req: DesignRequest, user_id: int = Depends(users.cur
         try:
             agent = get_design_agent()
         except UserError as e:
-            raise HTTPException(status_code=503, detail=f"agent not configured: {e}") from e
+            log.error("design agent not configured: %s", e)
+            raise HTTPException(status_code=503, detail=UNAVAILABLE) from e
         try:
             goal = (await agent.run(req.prompt)).output
         except Exception as e:
-            raise HTTPException(
-                status_code=502, detail=f"could not read the goal from that prompt: {e}") from e
+            log.exception("design goal parse failed")
+            raise HTTPException(status_code=502, detail=NO_GOAL) from e
 
     result = design.design(goal, req.limit)
     # Said once here as well as in every candidate, because this is the claim
@@ -1240,12 +1250,13 @@ async def _resolve_goal(prompt: str, goal: DesignGoal | None) -> DesignGoal:
     try:
         agent = get_design_agent()
     except UserError as e:
-        raise HTTPException(status_code=503, detail=f"agent not configured: {e}") from e
+        log.error("design agent not configured: %s", e)
+        raise HTTPException(status_code=503, detail=UNAVAILABLE) from e
     try:
         return (await agent.run(prompt)).output
     except Exception as e:
-        raise HTTPException(
-            status_code=502, detail=f"could not read the goal from that prompt: {e}") from e
+        log.exception("design goal parse failed")
+        raise HTTPException(status_code=502, detail=NO_GOAL) from e
 
 
 @app.post("/design/iterate")
@@ -1670,7 +1681,7 @@ def structure_resolve(q: str = Query(..., min_length=1, max_length=300),
         hit = structures.resolve(q.strip())
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502,
-                            detail=f"the structure databases did not answer ({type(e).__name__})") from e
+                            detail="the structure databases did not answer; try again in a minute") from e
     return {"found": hit is not None, **(hit or {})}
 
 
@@ -1685,7 +1696,8 @@ def structure_model(structure_id: str, user_id: int = Depends(users.current_user
     try:
         cif, source, predicted = accessibility.fetch_cached(sid.upper())
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"could not fetch {sid}: {type(e).__name__}") from e
+        log.warning("structure fetch %s failed: %r", sid, e)
+        raise HTTPException(status_code=502, detail=f"could not fetch {sid}; try again in a minute") from e
     # The first model only, as PDB; the mmCIF itself when PDB cannot hold it.
     pdb = _first_model(sid.upper(), cif)
     return Response(pdb or cif, media_type="chemical/x-pdb" if pdb else "chemical/x-mmcif",
@@ -1980,7 +1992,8 @@ async def screen(req: ScreenRequest, user_id: int = Depends(users.current_user))
         agent = get_agent()
     except UserError as e:
         # Config problem, not a transient one — usually a missing ANTHROPIC_API_KEY.
-        raise HTTPException(status_code=503, detail=f"agent not configured: {e}") from e
+        log.error("screen agent not configured: %s", e)
+        raise HTTPException(status_code=503, detail=UNAVAILABLE) from e
 
     started = datetime.now(timezone.utc)
     t0 = time.perf_counter()
@@ -2006,7 +2019,10 @@ async def screen(req: ScreenRequest, user_id: int = Depends(users.current_user))
     if dossier is None:
         # The agent run is the only call here that leaves the box; surface the
         # failure as a 502 so the frontend can show something more useful than 500.
-        raise HTTPException(status_code=502, detail=error)
+        # The full error is on the history record and in the log; the user gets
+        # what they can act on.
+        log.error("screen failed: %s", error)
+        raise HTTPException(status_code=502, detail="the screen did not finish; please try again")
     dossier.history_id = history_id
     return dossier
 
