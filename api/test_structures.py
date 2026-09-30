@@ -99,9 +99,33 @@ def main():
     assert S.corrected_terms("somethingelse entirely") == []
     print("ok  a misspelt biologic is read as the name it is a near-miss for")
 
-    # The one thing worse than not correcting: correcting to a DIFFERENT drug.
-    # Antibody names differ by a syllable, so every single-slip typo of every
-    # name must land on its own drug or on nothing at all.
+    # A brand name is the same molecule under the name on the vial, and the
+    # databases only know the INN. The chain matters: Neupogen is filgrastim,
+    # and filgrastim is what the PDB calls granulocyte colony-stimulating factor.
+    assert S.OTHER_NAMES["humira"] == "adalimumab"
+    assert [t for t, _ in S.expand_terms(["Humira"])] == ["Humira", "adalimumab"]
+    assert [t for t, _ in S.expand_terms(["Neupogen"])] == \
+        ["Neupogen", "filgrastim", "granulocyte colony-stimulating factor"]
+    # What the user wrote is still tried first, in case the brand is in the PDB.
+    assert S.expand_terms(["Herceptin"])[0][0] == "Herceptin"
+    # A name that is nobody's synonym passes through untouched.
+    assert [t for t, _ in S.expand_terms(["lysozyme"])] == ["lysozyme"]
+    print("ok  a brand name is followed to the molecule the databases know")
+
+    # A UniProt hit has to BE the biologic, not merely contain the word. A yeast
+    # protein is called "Needs CLA4 to survive protein 3", and "survive" is a
+    # word people write about formulations -- that match once sent a request for
+    # an antibody to a sulfurtransferase from baker's yeast.
+    yeast = ["Adenylyltransferase and sulfurtransferase UBA4",
+             "Needs CLA4 to survive protein 3"]
+    assert S._names_it(yeast, "survive") is False
+    assert S._names_it(["Insulin", "Insulin A chain"], "insulin") is True
+    assert S._names_it(["Lysozyme C"], "lysozyme") is True
+    print("ok  a protein whose name merely contains the word is not the biologic")
+
+    # The one thing worse than not correcting: correcting to a DIFFERENT
+    # molecule. Antibody names differ by a syllable, so every single-slip typo
+    # of every name must land on its own molecule or on nothing at all.
     def slips(name):
         out = set()
         for i in range(1, len(name) - 1):
@@ -110,13 +134,24 @@ def main():
             out.add(name[:i] + name[i + 1] + name[i] + name[i + 2:])
         return {t for t in out if t and t != name}
 
-    same = {"hemoglobin", "haemoglobin"}   # one molecule, two spellings
-    for name in S.KNOWN_BIOLOGICS:
+    def same_molecule(a, b):
+        return (a == b or S.OTHER_NAMES.get(a) == b or S.OTHER_NAMES.get(b) == a
+                or {a, b} == {"hemoglobin", "haemoglobin"})
+
+    for name in S.TYPO_VOCABULARY:
         for typo in slips(name):
             got = S.corrected_terms(typo)
-            if got and got[0][0] != name:
-                assert {got[0][0], name} == same, f"{name} -> {typo} -> {got[0][0]}"
-    print(f"ok  no typo of any of the {len(S.KNOWN_BIOLOGICS)} names reads as a different drug")
+            if got:
+                assert same_molecule(got[0][0], name), f"{name} -> {typo} -> {got[0][0]}"
+    print(f"ok  no typo of any of the {len(S.TYPO_VOCABULARY)} names reads as a different molecule")
+
+    # ...and no word a formulator writes is mistaken for a drug. "albumen" is
+    # allowed to read as albumin: egg white and the protein, one intent.
+    for word in ("protect", "protects", "protein", "solution", "stable", "storage",
+                 "shipping", "buffer", "saline", "syringe", "potency", "insulate",
+                 "collagen", "gelatin", "heparin", "dextran", "chitosan", "mannitol"):
+        assert S.corrected_terms(word) == [], f"{word} -> {S.corrected_terms(word)}"
+    print("ok  formulation words are not mistaken for a drug")
     print("\nall checks passed")
 
 

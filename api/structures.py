@@ -1,31 +1,44 @@
 """Which structure is this biologic? From the name a user wrote to an ID.
 
     resolve(text) -> {"structure_id", "title", "source", "residues", "why",
-                      "alternatives"} or None
+                      "alternatives", and "read_as"/"as_written" when the name
+                      searched for was not the one typed} or None
 
 The user names a biologic in their own words -- "adalimumab", "Humira, a TNF
 antibody", "human insulin", or an ID outright -- and the simulation has to run
 against THAT protein, not a stand-in. So:
 
 1. An ID in the text wins: a PDB ID (1IGT) or a UniProt accession (P01857).
-2. Otherwise search the PDB for entries whose protein descriptions name it,
-   and rank them. An entry qualifies only if every protein in it IS the
-   biologic (a chain that names anything else is a binding partner, and would
-   be simulated too) and it fits the worker (MAX_RESIDUES, all chains counted,
-   as the worker counts them). Among those: not a mutant, complex or fusion;
-   human; any resolution to 2.5 A; then the smallest, since every residue is
-   simulation time and a crystal often holds several copies.
-3. Otherwise UniProt (reviewed entries, human first); the worker runs its
+2. Each naming word is followed to the name the databases use for the same
+   molecule (OTHER_NAMES): Humira is adalimumab, and Neupogen is filgrastim is
+   granulocyte colony-stimulating factor. What the user wrote is tried first.
+3. Search the PDB for entries whose protein descriptions name it, and rank
+   them. An entry qualifies only if every protein in it IS the biologic (a
+   chain that names anything else is a binding partner, and would be simulated
+   too) and it fits the worker (MAX_RESIDUES, all chains counted, as the worker
+   counts them). Among those: not a mutant, complex or fusion; human; any
+   resolution to 2.5 A; then the smallest, since every residue is simulation
+   time and a crystal often holds several copies.
+4. Otherwise UniProt (reviewed entries, human first), where the entry must BE
+   the biologic by the same test -- a yeast protein called "Needs CLA4 to
+   survive protein 3" is not what "survive" meant. The worker runs the
    accession as the AlphaFold model.
+5. Otherwise, if a naming word is a near-miss for a molecule or brand we know,
+   try that spelling and say which one was read (corrected_terms).
 
-Nothing is invented: when none of this finds anything the answer is None and
-the user is asked for an ID. Every answer says what the entry is and why it
-was picked, so a wrong guess is visible and can be changed.
+Nothing is invented. A substituted or corrected name is a hypothesis: it is
+searched for like any other, so it reaches the user only if a real entry backs
+it, and the answer carries read_as so the substitution is on screen. When none
+of this finds anything the answer is None and the user is asked for an ID --
+which is the right answer for a fusion protein like etanercept, and for a drug
+the PDB holds only bound to its receptor, since simulating the complex would
+measure the receptor too.
 """
 
 from __future__ import annotations
 
 import re
+import time
 from functools import lru_cache
 
 import httpx
@@ -166,9 +179,77 @@ KNOWN_BIOLOGICS = (
     "glucagon", "oxytocin", "vasopressin", "desmopressin", "lactoferrin", "papain",
 )
 
-# Calibrated against the names above: the typos in test_structures.py are all
-# caught, and ordinary English words are not mistaken for a drug.
-_TYPO_CUTOFF = 0.85
+# What a formulator actually says. The PDB and UniProt know molecules by their
+# INN ("adalimumab"), not by the name on the vial ("Humira"), so a brand name
+# used to find nothing at all -- and a brand name is what people type.
+#
+# Every entry here is the SAME molecule under another name, so substituting it
+# changes nothing about what gets simulated. Analogues are deliberately absent:
+# semaglutide is not GLP-1 and liraglutide is not GLP-1, and quietly simulating
+# the parent hormone would be the stand-in this module exists to refuse.
+OTHER_NAMES = {
+    "humira": "adalimumab", "remicade": "infliximab", "rituxan": "rituximab",
+    "mabthera": "rituximab", "herceptin": "trastuzumab", "avastin": "bevacizumab",
+    "erbitux": "cetuximab", "vectibix": "panitumumab", "keytruda": "pembrolizumab",
+    "opdivo": "nivolumab", "tecentriq": "atezolizumab", "imfinzi": "durvalumab",
+    "yervoy": "ipilimumab", "stelara": "ustekinumab", "cosentyx": "secukinumab",
+    "taltz": "ixekizumab", "siliq": "brodalumab", "tremfya": "guselkumab",
+    "skyrizi": "risankizumab", "xolair": "omalizumab", "prolia": "denosumab",
+    "xgeva": "denosumab", "soliris": "eculizumab", "ultomiris": "ravulizumab",
+    "tysabri": "natalizumab", "actemra": "tocilizumab", "roactemra": "tocilizumab",
+    "kevzara": "sarilumab", "simponi": "golimumab", "cimzia": "certolizumab",
+    "entyvio": "vedolizumab", "dupixent": "dupilumab", "adbry": "tralokinumab",
+    "repatha": "evolocumab", "praluent": "alirocumab", "ocrevus": "ocrelizumab",
+    "darzalex": "daratumumab", "sarclisa": "isatuximab", "empliciti": "elotuzumab",
+    "cyramza": "ramucirumab", "gazyva": "obinutuzumab", "arzerra": "ofatumumab",
+    "synagis": "palivizumab", "beyfortus": "nirsevimab", "simulect": "basiliximab",
+    "benlysta": "belimumab", "ilaris": "canakinumab", "nucala": "mepolizumab",
+    "fasenra": "benralizumab", "cinqair": "reslizumab", "hemlibra": "emicizumab",
+    "cablivi": "caplacizumab", "aimovig": "erenumab", "ajovy": "fremanezumab",
+    "emgality": "galcanezumab", "evenity": "romosozumab", "crysvita": "burosumab",
+    "tepezza": "teprotumumab", "tezspire": "tezepelumab", "bimzelx": "bimekizumab",
+    "jemperli": "dostarlimab", "libtayo": "cemiplimab", "bavencio": "avelumab",
+    "polivy": "polatuzumab", "padcev": "enfortumab", "trodelvy": "sacituzumab",
+    "margenza": "margetuximab", "monjuvi": "tafasitamab", "leqembi": "lecanemab",
+    "aduhelm": "aducanumab", "kisunla": "donanemab", "uplizna": "inebilizumab",
+    "enspryng": "satralizumab", "enbrel": "etanercept", "orencia": "abatacept",
+    "eylea": "aflibercept", "nplate": "romiplostim", "arcalyst": "rilonacept",
+    "neupogen": "filgrastim", "neulasta": "pegfilgrastim", "aranesp": "darbepoetin",
+    "forteo": "teriparatide", "genotropin": "somatropin", "humatrope": "somatropin",
+    "norditropin": "somatropin",
+    # Insulins. The app already answers "insulin glargine" with human insulin,
+    # since it searches the word "insulin"; these brands get the same answer
+    # rather than a dead end, and the note says which molecule was used.
+    "humulin": "insulin", "novolin": "insulin", "lantus": "insulin",
+    "humalog": "insulin", "novolog": "insulin", "novorapid": "insulin",
+    "levemir": "insulin", "tresiba": "insulin", "toujeo": "insulin",
+    "ozempic": "semaglutide", "victoza": "liraglutide", "trulicity": "dulaglutide",
+    "epogen": "epoetin", "procrit": "epoetin",
+    # A recombinant protein is often licensed under a name no structural
+    # database uses: filgrastim IS granulocyte colony-stimulating factor, with
+    # the same sequence, and searching for the INN alone finds nothing at all.
+    "somatropin": "somatotropin", "epoetin": "erythropoietin",
+    "filgrastim": "granulocyte colony-stimulating factor",
+    "pegfilgrastim": "granulocyte colony-stimulating factor",
+    "aldesleukin": "interleukin-2", "oprelvekin": "interleukin-11",
+    "dornase": "deoxyribonuclease", "rasburicase": "urate oxidase",
+    "alteplase": "tissue-type plasminogen activator",
+    "imiglucerase": "glucosylceramidase", "agalsidase": "alpha-galactosidase",
+    "laronidase": "alpha-L-iduronidase", "idursulfase": "iduronate 2-sulfatase",
+    "sebelipase": "lysosomal acid lipase", "glucarpidase": "carboxypeptidase G2",
+    "asfotase": "alkaline phosphatase", "pegademase": "adenosine deaminase",
+}
+
+# Every name a typo may be measured against: the molecules and the brands, since
+# "Humria" is as likely a slip as "adamalimumab".
+TYPO_VOCABULARY = tuple(sorted(set(KNOWN_BIOLOGICS) | set(OTHER_NAMES)))
+
+# Calibrated by sweeping every single-slip typo of every name above (4600-odd)
+# against every cutoff: none reads as a different molecule at any of them, so
+# the binding constraint is ordinary English, and no formulation word is
+# mistaken for a drug here either. Set low enough to catch a transposition in a
+# short name -- "Humria" for Humira scores 0.833 -- and no lower.
+_TYPO_CUTOFF = 0.82
 
 # How far ahead the best match must be before it is trusted over the runner-up.
 # Below this the word is left alone rather than resolved to one of two drugs.
@@ -186,9 +267,9 @@ def corrected_terms(text: str) -> list[tuple[str, str]]:
         low = w.lower()
         if len(low) < 5 or low in _GENERIC or _NOT_A_NAME.search(low):
             continue
-        if low in KNOWN_BIOLOGICS:      # spelt right: nothing to correct
+        if low in TYPO_VOCABULARY:      # spelt right: nothing to correct
             continue
-        near = difflib.get_close_matches(low, KNOWN_BIOLOGICS, n=2, cutoff=_TYPO_CUTOFF)
+        near = difflib.get_close_matches(low, TYPO_VOCABULARY, n=2, cutoff=_TYPO_CUTOFF)
         if not near:
             continue
         # Antibody names differ by a syllable -- satralizumab and natalizumab
@@ -210,6 +291,29 @@ def _ratio(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+def expand_terms(terms: list[str]) -> list[tuple[str, str]]:
+    """[(term to search, the word it came from)] -- each term as written, and,
+    right after it, the name the databases use for the same molecule. The order
+    matters: what the user wrote is still tried first, since a brand name that
+    IS in the PDB should win over the substitution."""
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for t in terms:
+        # A chain, not one step: Neupogen is filgrastim, and filgrastim is
+        # granulocyte colony-stimulating factor, which is the name the PDB uses.
+        candidate, hops = t, 0
+        while candidate and hops < 4:
+            key = candidate.strip().lower()
+            if key not in seen:
+                seen.add(key)
+                out.append((candidate, t))
+            nxt = OTHER_NAMES.get(key, "")
+            if not nxt or nxt.strip().lower() in seen:
+                break
+            candidate, hops = nxt, hops + 1
+    return out
+
+
 def naming_phrase(text: str) -> str:
     """The words that name the biologic, in order, keeping "human" and the like."""
     keep = {"human", "bovine", "hen", "egg", "white", "serum"}
@@ -218,10 +322,32 @@ def naming_phrase(text: str) -> str:
     return " ".join(words[:4]).lower()
 
 
+def _send(client: httpx.Client, method: str, url: str, **kw) -> httpx.Response:
+    """One request, retried through the faults that mean nothing about the
+    question asked: a dropped connection, a timeout, a 5xx or a rate limit.
+    The PDB drops a connection often enough that without this a lookup fails
+    outright perhaps one time in thirty -- and to the user that is
+    indistinguishable from their biologic not existing."""
+    last: Exception | None = None
+    for attempt in range(3):
+        try:
+            r = client.request(method, url, **kw)
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                time.sleep(0.4 * (attempt + 1))
+                continue
+            return r
+        except (httpx.TransportError, httpx.RemoteProtocolError) as e:
+            last = e
+            if attempt == 2:
+                break
+            time.sleep(0.4 * (attempt + 1))
+    raise last if last else httpx.HTTPError("request failed")
+
+
 def _query(node: dict, client: httpx.Client) -> list[str]:
     q = {"query": node, "return_type": "entry",
          "request_options": {"paginate": {"start": 0, "rows": 100}}}
-    r = client.post(_SEARCH, json=q)
+    r = _send(client, "POST", _SEARCH, json=q)
     if r.status_code == 204:
         return []
     r.raise_for_status()
@@ -241,9 +367,17 @@ def _pdb_hits(term: str, client: httpx.Client) -> list[str]:
 
 def _entries(ids: list[str], client: httpx.Client) -> list[dict]:
     q = "{ entries(entry_ids: %s) %s }" % (str(ids).replace("'", '"'), _ENTRY_FIELDS)
-    r = client.post(_GRAPHQL, json={"query": q})
+    r = _send(client, "POST", _GRAPHQL, json={"query": q})
     r.raise_for_status()
     return [e for e in (r.json().get("data") or {}).get("entries") or [] if e]
+
+
+def _names_it(names: list[str], term: str) -> bool:
+    """Is one of these names the term itself, rather than a name that merely
+    contains the word? A yeast protein is called "Needs CLA4 to survive protein
+    3", which carries "survive" without being it -- the same trap is_the_biologic
+    keeps the PDB side out of, so it is the same test."""
+    return any(is_the_biologic(n, term) for n in names)
 
 
 def is_the_biologic(desc: str, name: str) -> bool:
@@ -315,13 +449,40 @@ def _rank(entries: list[dict], term: str, phrase: str = "") -> list[dict]:
     return picks
 
 
+def _uniprot_names(hit: dict) -> list[str]:
+    """Every name UniProt gives the protein: recommended, short and alternative."""
+    pd = hit.get("proteinDescription") or {}
+    out: list[str] = []
+
+    def take(block: dict) -> None:
+        v = ((block.get("fullName") or {}).get("value") or "").strip()
+        if v:
+            out.append(v)
+        for s in block.get("shortNames") or []:
+            if (s.get("value") or "").strip():
+                out.append(s["value"].strip())
+
+    take(pd.get("recommendedName") or {})
+    for alt in pd.get("alternativeNames") or []:
+        take(alt)
+    for sub in pd.get("submissionNames") or []:
+        take(sub)
+    return out
+
+
 def _uniprot(term: str, client: httpx.Client) -> dict | None:
-    r = client.get(_UNIPROT_SEARCH, params={
+    r = _send(client, "GET", _UNIPROT_SEARCH, params={
         "query": f'protein_name:"{term}" AND reviewed:true',
         "fields": "accession,protein_name,organism_name,length", "size": 10, "format": "json"})
     r.raise_for_status()
     hits = r.json().get("results") or []
     hits = [h for h in hits if (h.get("sequence") or {}).get("length", 0) <= MAX_RESIDUES]
+    # UniProt's protein_name search matches loosely: "survive", pulled out of
+    # "polymers that survive 6 months", returned a yeast sulfurtransferase, and
+    # the simulation would have run against THAT. The PDB side has
+    # is_the_biologic() for exactly this; UniProt had nothing. So keep only an
+    # entry that actually carries the term as one of its own names.
+    hits = [h for h in hits if _names_it(_uniprot_names(h), term)]
     if not hits:
         return None
     hits.sort(key=lambda h: "sapiens" not in ((h.get("organism") or {}).get("scientificName") or "").lower())
@@ -337,6 +498,13 @@ def _uniprot(term: str, client: httpx.Client) -> dict | None:
                    + ", run as its predicted AlphaFold model"}
 
 
+def _as_known(term: str, wrote: str) -> dict:
+    """The "Humira is adalimumab" line, when the search used the other name."""
+    if term.strip().lower() == wrote.strip().lower():
+        return {}
+    return {"read_as": term, "as_written": wrote}
+
+
 @lru_cache(maxsize=256)
 def resolve(text: str) -> dict | None:
     text = (text or "").strip()
@@ -346,29 +514,32 @@ def resolve(text: str) -> dict | None:
     if sid:
         return {"structure_id": sid, "title": "", "source": "given in the text", "residues": None,
                 "why": "the ID was written in the text", "alternatives": []}
-    terms = search_terms(text)
+    terms = expand_terms(search_terms(text))
     with httpx.Client(timeout=20) as client:
-        for term in terms:
+        for term, wrote in terms:
             ids = _pdb_hits(term, client)
             picks = _rank(_entries(ids, client), term, naming_phrase(text)) if ids else []
             if picks:
-                return {**picks[0], "alternatives": picks[1:4]}
-        for term in terms:
+                return {**picks[0], **_as_known(term, wrote), "alternatives": picks[1:4]}
+        for term, wrote in terms:
             hit = _uniprot(term, client)
             if hit:
-                return {**hit, "alternatives": []}
+                return {**hit, **_as_known(term, wrote), "alternatives": []}
         # Nothing matched the words as written. One wrong letter is enough for
         # that -- neither database tolerates a typo -- so try the spelling we
         # know, and say which one was read. See corrected_terms().
         for fixed, typed in corrected_terms(text):
-            ids = _pdb_hits(fixed, client)
-            picks = _rank(_entries(ids, client), fixed, fixed) if ids else []
-            hit = picks[0] if picks else _uniprot(fixed, client)
-            if hit:
-                return {**hit, "read_as": fixed, "as_written": typed,
-                        "why": f"read as “{fixed}”, since “{typed}” matched "
-                               f"nothing in either database; {hit['why']}",
-                        "alternatives": picks[1:4] if picks else []}
+            # The correction may itself be a brand name, so it goes through the
+            # same substitution as anything else: "Humria" -> Humira -> adalimumab.
+            for term, _ in expand_terms([fixed]):
+                ids = _pdb_hits(term, client)
+                picks = _rank(_entries(ids, client), term, term) if ids else []
+                hit = picks[0] if picks else _uniprot(term, client)
+                if hit:
+                    return {**hit, "read_as": term, "as_written": typed,
+                            "why": f"read as “{term}”, since “{typed}” matched "
+                                   f"nothing in either database; {hit['why']}",
+                            "alternatives": picks[1:4] if picks else []}
     return None
 
 
