@@ -379,7 +379,16 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
           : null,
       );
     } catch (e) {
-      if ((e as Error).name !== 'AbortError') setError((e as Error).message);
+      if ((e as Error).name !== 'AbortError') {
+        setError((e as Error).message);
+        // The counterpart to screen_completed, and the more useful of the two:
+        // a user who waited and got nothing. An aborted run is not a failure,
+        // so it stays outside this branch. The message, never a stack trace.
+        posthog.capture('screen_failed', {
+          input_mode: mode,
+          reason: (e as Error).message.slice(0, 200),
+        });
+      }
     } finally {
       if (abortRef.current === ctrl) setLoading(false);
     }

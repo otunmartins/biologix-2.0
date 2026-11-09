@@ -64,7 +64,18 @@ jobs:
         with:
           context: ./web
           push: true
-          build-args: NEXT_PUBLIC_API_URL=${{ vars.PUBLIC_API_URL }}
+          # PostHog's project token: a repository secret, so it is masked in
+          # this log, though it is a write-only key that ships in the client
+          # bundle regardless. Unset, the site simply reports no analytics —
+          # which is what it did before this was wired through.
+          # The hosts default to EU cloud in next.config.ts, so those variables
+          # stay unset unless the project ever changes region.
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.PUBLIC_API_URL }}
+            NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN=${{ secrets.POSTHOG_PROJECT_TOKEN }}
+            NEXT_PUBLIC_POSTHOG_UI_HOST=${{ vars.POSTHOG_UI_HOST }}
+            POSTHOG_INGEST_HOST=${{ vars.POSTHOG_INGEST_HOST }}
+            POSTHOG_ASSETS_HOST=${{ vars.POSTHOG_ASSETS_HOST }}
           tags: |
             ghcr.io/otunmartins/biologix-web:${{ github.sha }}
             ghcr.io/otunmartins/biologix-web:latest
