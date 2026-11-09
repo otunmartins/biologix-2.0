@@ -36,6 +36,7 @@ import {
   type ScreenRecord,
   type StoredCandidate,
 } from '@/lib/api';
+import { track } from '@/lib/analytics';
 import {
   DEFAULT_FORM,
   GRADE_MEANING,
@@ -360,6 +361,21 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
       );
       setDossier(result);
       setUnsaved(!result.history_id);
+      // What was screened, not who: the excipient and route are the properties
+      // worth grouping runs by, and they say nothing about the person.
+      track('screen run', {
+        mode,
+        route: mode === 'form' ? form.route : null,
+        excipient: mode === 'form' ? form.excipient : null,
+        described_polymer: mode === 'form' && form.polymer.enabled,
+        with_structure: mode === 'form' && form.structureId.trim() !== '',
+        from_design: fromDesign !== undefined,
+        needs_testing: result.needs_testing,
+        liabilities: result.liabilities.length,
+        // A run that produced a dossier but could not be written to history:
+        // worth counting, because the user keeps nothing from it.
+        saved_to_history: Boolean(result.history_id),
+      });
       setContext(
         mode === 'form'
           ? [
@@ -373,7 +389,12 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
           : null,
       );
     } catch (e) {
-      if ((e as Error).name !== 'AbortError') setError((e as Error).message);
+      if ((e as Error).name !== 'AbortError') {
+        setError((e as Error).message);
+        // A failed run is the one event worth more than the successes: it is
+        // a user who waited and got nothing. The message, not a stack trace.
+        track('screen failed', { mode, reason: (e as Error).message.slice(0, 200) });
+      }
     } finally {
       if (abortRef.current === ctrl) setLoading(false);
     }
@@ -404,6 +425,7 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
         startedAt: new Date().toISOString(),
         endedAt: null,
       });
+      track('campaign started', { candidates: r.candidates.length, verdict: r.verdict ?? null });
     } catch (e) {
       if ((e as Error).name !== 'AbortError') setError((e as Error).message);
     } finally {
@@ -433,6 +455,9 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
           endedAt: null,
         },
       );
+      // How far people actually push a campaign: the iteration number is the
+      // whole point of the active-learning loop.
+      track('campaign iterated', { iteration: r.iteration, candidates: r.candidates.length });
     } catch (e) {
       if ((e as Error).name !== 'AbortError') setError((e as Error).message);
     } finally {
@@ -447,6 +472,7 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
     if (!campaign) return;
     abortRef.current?.abort();
     const id = campaign.campaignId;
+    track('campaign ended', { iteration: campaign.iteration, candidates: campaign.candidates.length });
     setCampaign(null);
     setDesignPrompt('');
     setError(null);
@@ -525,6 +551,7 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
         );
         return;
       }
+      track('candidates queued', { count: 1, with_structure: structureId.trim() !== '' });
       setCampaign((prev) => {
         if (!prev) return prev;
         const sid = structureId.toUpperCase() || prev.goal.structure_id || '';
@@ -565,6 +592,10 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
         setQueueAllError('Nothing was queued: these candidates are already waiting, running or finished.');
       } else if (r.queued < ids.length) {
         setQueueAllError(`Queued ${r.queued} of ${ids.length}; the rest were already waiting, running or finished.`);
+      }
+      // r.queued, not ids.length: the ones the server actually took.
+      if (r.queued > 0) {
+        track('candidates queued', { count: r.queued, with_structure: structureId.trim() !== '' });
       }
       // Whatever the count, the server is now the truth: re-read the campaign
       // rather than guessing which rows moved.

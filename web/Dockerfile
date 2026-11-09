@@ -6,9 +6,23 @@ COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
 # NEXT_PUBLIC_* vars are baked in at BUILD time, not read at container start —
-# so this has to be a build arg, not a docker-compose `environment:` entry.
+# so these have to be build args, not docker-compose `environment:` entries.
 ARG NEXT_PUBLIC_API_URL
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+# PostHog. Unset is a supported state: lib/analytics.ts then does nothing and
+# the bundle never starts posthog-js, which is how local builds and CI run.
+# The key is a write-only project token and ends up in the client bundle
+# anyway; it is passed as a secret only so it stays out of the Actions log.
+ARG NEXT_PUBLIC_POSTHOG_KEY
+ENV NEXT_PUBLIC_POSTHOG_KEY=$NEXT_PUBLIC_POSTHOG_KEY
+# The project is on EU cloud, which is the default in next.config.ts; these
+# are only for pointing a build at a US or self-hosted project instead.
+ARG NEXT_PUBLIC_POSTHOG_UI_HOST
+ENV NEXT_PUBLIC_POSTHOG_UI_HOST=$NEXT_PUBLIC_POSTHOG_UI_HOST
+ARG POSTHOG_INGEST_HOST
+ENV POSTHOG_INGEST_HOST=$POSTHOG_INGEST_HOST
+ARG POSTHOG_ASSETS_HOST
+ENV POSTHOG_ASSETS_HOST=$POSTHOG_ASSETS_HOST
 RUN npm run build
 
 FROM node:22-slim

@@ -1,5 +1,6 @@
 import { redirect } from 'next/navigation';
 import { auth } from '@/auth';
+import Analytics from '@/components/Analytics';
 import Workbench from '@/components/Workbench';
 import { isAdminEmail } from '@/lib/admin';
 
@@ -14,9 +15,13 @@ export const dynamic = 'force-dynamic';
 export default async function WorkspaceLayout({ children }: { children: React.ReactNode }) {
   const session = await auth();
   if (!session?.user) redirect('/');
-  const { name, email, image } = session.user;
+  const { id, name, email, image } = session.user;
   return (
     <>
+      {/* Analytics, here for the same reason as the Workbench: a layout stays
+          mounted across the tabs, so the account is named once per visit
+          rather than on every move between /screen and /history. */}
+      {id && <Analytics userId={id} email={email ?? null} name={name ?? null} />}
       <Workbench
         user={{ name: name ?? null, email: email ?? null, image: image ?? null }}
         isAdmin={isAdminEmail(email)}

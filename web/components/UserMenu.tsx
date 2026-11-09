@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { signOutAndReturn } from '@/app/actions';
+import { resetIdentity } from '@/lib/analytics';
 
 export interface SessionUser {
   name: string | null;
@@ -81,6 +82,10 @@ export default function UserMenu({ user, isAdmin = false }: { user: SessionUser;
             <button
               type="submit"
               role="menuitem"
+              // Forget who this browser belongs to before the session goes.
+              // Runs before the form submits, and is only local bookkeeping --
+              // if it somehow failed, the sign-out itself still happens.
+              onClick={resetIdentity}
               className="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-100"
             >
               Sign out
