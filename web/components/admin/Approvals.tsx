@@ -13,6 +13,7 @@ import {
 import { ago } from '@/lib/when';
 import { readGamma } from '@/components/DesignResults';
 import { SimulationDetail } from '@/components/SimulationsView';
+import posthog from 'posthog-js';
 
 // Every user's simulations that are waiting, approved or running, and what the
 // owner can do to each: approve (as a full GPU run or a short CPU preview),
@@ -137,12 +138,18 @@ export default function Approvals({ onWaiting }: { onWaiting?: (n: number) => vo
     };
   }, [load]);
 
-  const run = async (j: AdminJob, fn: () => Promise<string>) => {
+  const run = async (
+    j: AdminJob,
+    fn: () => Promise<string>,
+    event: string,
+    properties: Record<string, string | boolean>,
+  ) => {
     setBusy(j.id);
     setError(null);
     setNotice(null);
     try {
       setNotice(await fn());
+      posthog.capture(event, properties);
       await load();
       // A polling worker takes an approved job within seconds; look again soon so
       // the row shows it running rather than waiting out the 20 s refresh.
@@ -191,7 +198,12 @@ export default function Approvals({ onWaiting }: { onWaiting?: (n: number) => vo
           onPick={(tier) => {
             const j = choosing;
             setChoosing(null);
-            run(j, async () => `${j.name}: ${j.simulation?.approved_at ? 'switched to' : 'approved as'} a ${TIER[tier]}. Worker: ${await approveSimulation(j.id, tier)}.`);
+            run(
+              j,
+              async () => `${j.name}: ${j.simulation?.approved_at ? 'switched to' : 'approved as'} a ${TIER[tier]}. Worker: ${await approveSimulation(j.id, tier)}.`,
+              'simulation_approved',
+              { tier, was_previously_approved: Boolean(j.simulation?.approved_at) },
+            );
           }} />
       )}
       {denying && (
@@ -199,7 +211,12 @@ export default function Approvals({ onWaiting }: { onWaiting?: (n: number) => vo
           onSubmit={(reason) => {
             const j = denying;
             setDenying(null);
-            run(j, async () => `${j.name}: ${(await declineSimulation(j.id, reason)) ? 'stopped' : 'denied'}.`);
+            run(
+              j,
+              async () => `${j.name}: ${(await declineSimulation(j.id, reason)) ? 'stopped' : 'denied'}.`,
+              'simulation_declined',
+              { action: j.status === 'simulating' ? 'stopped' : 'denied' },
+            );
           }} />
       )}
 

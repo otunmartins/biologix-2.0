@@ -3,6 +3,7 @@
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 import { signIn, signOut } from '@/auth';
+import { posthogLogsLogger } from '@/instrumentation';
 import { checkPassword, register, startSession } from '@/lib/password-auth';
 
 export async function signInWithGoogle() {
@@ -31,11 +32,23 @@ function field(form: FormData, name: string): string {
   return typeof v === 'string' ? v : '';
 }
 
+function logPasswordAuth(flow: 'sign_in' | 'registration', outcome: 'succeeded' | 'rejected') {
+  posthogLogsLogger?.emit({
+    body: 'Password authentication completed',
+    severityText: outcome === 'succeeded' ? 'INFO' : 'WARN',
+    attributes: { event: 'password_authentication_completed', flow, outcome },
+  });
+}
+
 export async function signInWithPassword(_prev: PasswordState, form: FormData): Promise<PasswordState> {
   const email = field(form, 'email');
   const result = await checkPassword(email, field(form, 'password'), await clientIp());
-  if (!result.ok) return { error: result.error, email };
+  if (!result.ok) {
+    logPasswordAuth('sign_in', 'rejected');
+    return { error: result.error, email };
+  }
   await startSession(result.userId);
+  logPasswordAuth('sign_in', 'succeeded');
   // Outside any try/catch: redirect() works by throwing.
   redirect('/');
 }
@@ -43,7 +56,11 @@ export async function signInWithPassword(_prev: PasswordState, form: FormData): 
 export async function registerWithPassword(_prev: PasswordState, form: FormData): Promise<PasswordState> {
   const email = field(form, 'email');
   const result = await register(email, field(form, 'password'), field(form, 'name'), await clientIp());
-  if (!result.ok) return { error: result.error, email };
+  if (!result.ok) {
+    logPasswordAuth('registration', 'rejected');
+    return { error: result.error, email };
+  }
   await startSession(result.userId);
+  logPasswordAuth('registration', 'succeeded');
   redirect('/');
 }

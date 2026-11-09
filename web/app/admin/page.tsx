@@ -13,6 +13,6 @@ export default async function AdminPage() {
   const session = await auth();
   if (!session?.user) redirect('/');
   if (!isAdminEmail(session.user.email)) notFound();
-  const { name, email, image } = session.user;
-  return <AdminApp user={{ name: name ?? null, email: email ?? null, image: image ?? null }} />;
+  const { id, name, email, image } = session.user;
+  return <AdminApp user={{ id, name: name ?? null, email: email ?? null, image: image ?? null }} />;
 }

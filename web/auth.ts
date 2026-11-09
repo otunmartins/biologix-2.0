@@ -12,9 +12,17 @@
 // because the campaign store's foreign keys point at `users`. The API creates
 // them on startup, which is why docker-compose starts it first.
 import PostgresAdapter from '@auth/pg-adapter';
-import NextAuth from 'next-auth';
+import NextAuth, { type DefaultSession } from 'next-auth';
 import Google from 'next-auth/providers/google';
 import { pool } from '@/lib/db';
+
+declare module 'next-auth' {
+  interface Session {
+    user: {
+      id: string;
+    } & DefaultSession['user'];
+  }
+}
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   adapter: PostgresAdapter(pool),
@@ -29,6 +37,14 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     }),
   ],
   session: { strategy: 'database' },
+  callbacks: {
+    async session({ session, user }) {
+      // The database primary key is the stable analytics identity; expose it
+      // deliberately so the signed-in client never needs to fall back to email.
+      session.user.id = user.id;
+      return session;
+    },
+  },
   events: {
     // A password is set without proving the email (there is no verification
     // mail yet). Once Google has proved who owns the address, a password on it

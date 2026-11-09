@@ -3,8 +3,10 @@
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { signOutAndReturn } from '@/app/actions';
+import posthog from 'posthog-js';
 
 export interface SessionUser {
+  id: string;
   name: string | null;
   email: string | null;
   image: string | null;
@@ -77,7 +79,10 @@ export default function UserMenu({ user, isAdmin = false }: { user: SessionUser;
               <span className="text-xs text-slate-400">dashboard &amp; approvals</span>
             </Link>
           )}
-          <form action={signOutAndReturn}>
+          <form
+            action={signOutAndReturn}
+            onSubmit={() => posthog.reset()}
+          >
             <button
               type="submit"
               role="menuitem"

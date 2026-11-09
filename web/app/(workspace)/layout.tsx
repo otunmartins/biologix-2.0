@@ -14,11 +14,11 @@ export const dynamic = 'force-dynamic';
 export default async function WorkspaceLayout({ children }: { children: React.ReactNode }) {
   const session = await auth();
   if (!session?.user) redirect('/');
-  const { name, email, image } = session.user;
+  const { id, name, email, image } = session.user;
   return (
     <>
       <Workbench
-        user={{ name: name ?? null, email: email ?? null, image: image ?? null }}
+        user={{ id, name: name ?? null, email: email ?? null, image: image ?? null }}
         isAdmin={isAdminEmail(email)}
       />
       {children}

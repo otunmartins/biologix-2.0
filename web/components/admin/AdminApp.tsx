@@ -1,11 +1,12 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { BiologixLockup } from '@/components/brand';
 import UserMenu, { type SessionUser } from '@/components/UserMenu';
 import Approvals from './Approvals';
 import Dashboard from './Dashboard';
+import posthog from 'posthog-js';
 
 // The owner's own screen at /admin: platform numbers, and the simulation
 // approvals. Reached from the user menu; the page is refused on the server to
@@ -16,6 +17,15 @@ type Tab = 'dashboard' | 'approvals';
 export default function AdminApp({ user }: { user: SessionUser }) {
   const [tab, setTab] = useState<Tab>('dashboard');
   const [waiting, setWaiting] = useState<number | null>(null);
+
+  // /admin is outside the workspace layout, so establish the persisted client
+  // identity here as well when this standalone signed-in page loads.
+  useEffect(() => {
+    posthog.identify(user.id, {
+      ...(user.email ? { email: user.email } : {}),
+      ...(user.name ? { name: user.name } : {}),
+    });
+  }, [user.id, user.email, user.name]);
 
   return (
     <div className="min-h-screen bg-[#f9f9f7]">

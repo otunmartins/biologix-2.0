@@ -14,6 +14,7 @@ import { BiologixLockup } from '@/components/brand';
 import UserMenu, { type SessionUser } from '@/components/UserMenu';
 import HistoryView from '@/components/history/HistoryView';
 import ResultsView from '@/components/ResultsView';
+import posthog from 'posthog-js';
 import {
   API_URL,
   IS_DEV,
@@ -305,6 +306,15 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
   // "Run again" from history refills the form, then runs once it has rendered.
   const rerunPending = useRef(false);
 
+  // This is the signed-in client boundary. The SDK persists this identity so
+  // browser events and automatically captured exceptions inherit it.
+  useEffect(() => {
+    posthog.identify(user.id, {
+      ...(user.email ? { email: user.email } : {}),
+      ...(user.name ? { name: user.name } : {}),
+    });
+  }, [user.id, user.email, user.name]);
+
   // Say the API is unreachable or keyless before anyone waits on a run.
   useEffect(() => {
     const ctrl = new AbortController();
@@ -372,8 +382,18 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
             ]
           : null,
       );
+      posthog.capture('screen_completed', {
+        input_mode: mode,
+        has_structure: mode === 'form' && Boolean(form.structureId.trim()),
+        has_polymer_description: mode === 'form' && form.polymer.enabled,
+        from_design_candidate: Boolean(fromDesign),
+        saved_to_history: Boolean(result.history_id),
+      });
     } catch (e) {
-      if ((e as Error).name !== 'AbortError') setError((e as Error).message);
+      if ((e as Error).name !== 'AbortError') {
+        setError((e as Error).message);
+        posthog.capture('screen_failed', { input_mode: mode });
+      }
     } finally {
       if (abortRef.current === ctrl) setLoading(false);
     }
@@ -404,6 +424,10 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
         startedAt: new Date().toISOString(),
         endedAt: null,
       });
+      posthog.capture('design_campaign_started', {
+        iteration: r.iteration,
+        candidate_count: r.candidates.length,
+      });
     } catch (e) {
       if ((e as Error).name !== 'AbortError') setError((e as Error).message);
     } finally {
@@ -433,6 +457,10 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
           endedAt: null,
         },
       );
+      posthog.capture('design_iteration_generated', {
+        iteration: r.iteration,
+        candidate_count: r.candidates.length,
+      });
     } catch (e) {
       if ((e as Error).name !== 'AbortError') setError((e as Error).message);
     } finally {
@@ -453,6 +481,7 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
     setLoading(false);
     try {
       await endCampaign(id);
+      posthog.capture('design_campaign_ended', { iteration: campaign.iteration });
     } catch (e) {
       setError(`The workspace is clear, but the old campaign could not be marked as ended: ${(e as Error).message}`);
     }
@@ -525,6 +554,11 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
         );
         return;
       }
+      posthog.capture('simulation_queued', {
+        queue_mode: 'single',
+        candidate_count: r.queued,
+        has_structure: Boolean(structureId.trim()),
+      });
       setCampaign((prev) => {
         if (!prev) return prev;
         const sid = structureId.toUpperCase() || prev.goal.structure_id || '';
@@ -563,8 +597,16 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
       const r = await queueCandidates(ids, structureId);
       if (r.queued === 0) {
         setQueueAllError('Nothing was queued: these candidates are already waiting, running or finished.');
-      } else if (r.queued < ids.length) {
-        setQueueAllError(`Queued ${r.queued} of ${ids.length}; the rest were already waiting, running or finished.`);
+      } else {
+        posthog.capture('simulation_queued', {
+          queue_mode: 'batch',
+          candidate_count: r.queued,
+          requested_candidate_count: ids.length,
+          has_structure: Boolean(structureId.trim()),
+        });
+        if (r.queued < ids.length) {
+          setQueueAllError(`Queued ${r.queued} of ${ids.length}; the rest were already waiting, running or finished.`);
+        }
       }
       // Whatever the count, the server is now the truth: re-read the campaign
       // rather than guessing which rows moved.
