@@ -1,4 +1,4 @@
-# Biologix 2.0 — Next.js + FastAPI + Terraform
+# Biologix 2.0 — Next.js + FastAPI
 
 By [Algonix AI](#). Excipient triage, polymer design and molecular dynamics for biologic formulations.
 
@@ -14,8 +14,7 @@ web/         Next.js + TypeScript + Tailwind frontend — app/page.tsx, componen
 api/         FastAPI backend — wraps the PydanticAI agent behind /screen
              main.py the agent and tools, accessibility.py solvent accessibility,
              precedent.py the FDA precedent lookup
-terraform/   Provisions one EC2 instance to run it all
-docker-compose.yml, caddy/   The whole stack on that one instance (caddy/Caddyfile routes it)
+docker-compose.yml, caddy/   The whole stack on one server (caddy/Caddyfile routes it)
 ```
 
 ## Run it locally first (no Docker, no AWS)
@@ -198,8 +197,9 @@ Things that bite here:
 - By hand on the box, `docker compose up -d` runs the `latest` images; the deploy pins the exact
   commit with `IMAGE_TAG`. `docker compose up --build` still builds locally if you ever need to.
 
-**AWS instead.** `terraform/` creates an EC2 box for the same setup. This account's EC2 and
-Lightsail quotas were too small, which is why production is on DigitalOcean.
+**Why DigitalOcean.** AWS was tried first and abandoned: this account's EC2 and Lightsail quotas
+were too small, and the GPU quota request was refused outright. The Terraform that provisioned
+that EC2 box was removed once production settled here; it is in the history if it is ever wanted.
 
 **No GPU here.** This box never runs simulations: the OpenMM worker runs on a RunPod GPU pod and
 pulls its work from this box over HTTPS (see "OpenMM simulations" below).
