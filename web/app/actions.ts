@@ -4,6 +4,7 @@ import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 import { signIn, signOut } from '@/auth';
 import { checkPassword, register, startSession } from '@/lib/password-auth';
+import { posthogLogger, SeverityNumber } from '@/instrumentation';
 
 export async function signInWithGoogle() {
   await signIn('google', { redirectTo: '/' });
@@ -36,6 +37,11 @@ export async function signInWithPassword(_prev: PasswordState, form: FormData): 
   const result = await checkPassword(email, field(form, 'password'), await clientIp());
   if (!result.ok) return { error: result.error, email };
   await startSession(result.userId);
+  posthogLogger.emit({
+    body: 'Password sign-in completed',
+    severityNumber: SeverityNumber.INFO,
+    attributes: { auth_method: 'password' },
+  });
   // Outside any try/catch: redirect() works by throwing.
   redirect('/');
 }
@@ -45,5 +51,10 @@ export async function registerWithPassword(_prev: PasswordState, form: FormData)
   const result = await register(email, field(form, 'password'), field(form, 'name'), await clientIp());
   if (!result.ok) return { error: result.error, email };
   await startSession(result.userId);
+  posthogLogger.emit({
+    body: 'Password registration completed',
+    severityNumber: SeverityNumber.INFO,
+    attributes: { auth_method: 'password' },
+  });
   redirect('/');
 }

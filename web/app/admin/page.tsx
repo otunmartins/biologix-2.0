@@ -14,5 +14,6 @@ export default async function AdminPage() {
   if (!session?.user) redirect('/');
   if (!isAdminEmail(session.user.email)) notFound();
   const { name, email, image } = session.user;
-  return <AdminApp user={{ name: name ?? null, email: email ?? null, image: image ?? null }} />;
+  const id = (session.user as typeof session.user & { id: string }).id;
+  return <AdminApp user={{ id, name: name ?? null, email: email ?? null, image: image ?? null }} />;
 }

@@ -29,6 +29,12 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     }),
   ],
   session: { strategy: 'database' },
+  callbacks: {
+    async session({ session, user }) {
+      (session.user as typeof session.user & { id: string }).id = user.id;
+      return session;
+    },
+  },
   events: {
     // A password is set without proving the email (there is no verification
     // mail yet). Once Google has proved who owns the address, a password on it

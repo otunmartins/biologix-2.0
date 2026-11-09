@@ -15,10 +15,11 @@ export default async function WorkspaceLayout({ children }: { children: React.Re
   const session = await auth();
   if (!session?.user) redirect('/');
   const { name, email, image } = session.user;
+  const id = (session.user as typeof session.user & { id: string }).id;
   return (
     <>
       <Workbench
-        user={{ name: name ?? null, email: email ?? null, image: image ?? null }}
+        user={{ id, name: name ?? null, email: email ?? null, image: image ?? null }}
         isAdmin={isAdminEmail(email)}
       />
       {children}
