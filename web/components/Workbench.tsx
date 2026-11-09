@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
+import posthog from 'posthog-js';
 import DesignPanel, { type CurrentExperiment } from '@/components/DesignPanel';
 import DesignResults from '@/components/DesignResults';
 import Results from '@/components/Results';
@@ -360,6 +361,11 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
       );
       setDossier(result);
       setUnsaved(!result.history_id);
+      posthog.capture('screen_completed', {
+        input_mode: mode,
+        from_design_candidate: Boolean(fromDesign),
+        saved_to_history: Boolean(result.history_id),
+      });
       setContext(
         mode === 'form'
           ? [
@@ -391,6 +397,11 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
     setCampaign(null);
     try {
       const r = await iterateDesign({ prompt: designPrompt }, ctrl.signal);
+      posthog.capture('design_campaign_started', {
+        iteration: r.iteration,
+        candidate_count: r.candidates.length,
+        has_structure: Boolean(r.goal.structure_id),
+      });
       setCampaign({
         campaignId: r.campaign_id,
         iteration: r.iteration,
@@ -422,6 +433,10 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
     setError(null);
     try {
       const r = await iterateDesign({ campaignId: campaign.campaignId }, ctrl.signal);
+      posthog.capture('design_iteration_completed', {
+        iteration: r.iteration,
+        candidate_count: r.candidates.length,
+      });
       setCampaign((prev) =>
         prev && {
           ...prev,
@@ -453,6 +468,7 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
     setLoading(false);
     try {
       await endCampaign(id);
+      posthog.capture('design_campaign_ended');
     } catch (e) {
       setError(`The workspace is clear, but the old campaign could not be marked as ended: ${(e as Error).message}`);
     }
@@ -509,6 +525,9 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
     setQueueError(null);
     try {
       const r = await queueCandidates([c.id], structureId);
+      if (r.queued > 0) {
+        posthog.capture('simulation_queued', { candidate_count: r.queued, queue_mode: 'single' });
+      }
       if (r.queued === 0) {
         // The server changed nothing: the candidate is already queued, running or
         // done there. Say so and show what it holds, rather than a card that
@@ -561,6 +580,9 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
     setQueueAllError(null);
     try {
       const r = await queueCandidates(ids, structureId);
+      if (r.queued > 0) {
+        posthog.capture('simulation_queued', { candidate_count: r.queued, queue_mode: 'batch' });
+      }
       if (r.queued === 0) {
         setQueueAllError('Nothing was queued: these candidates are already waiting, running or finished.');
       } else if (r.queued < ids.length) {
@@ -630,6 +652,7 @@ export default function Workbench({ user, isAdmin = false }: { user: SessionUser
   // A candidate is only a hypothesis until the screen judges it, so handing it
   // over switches workflow and fills the polymer description in place.
   const screenCandidate = useCallback((c: StoredCandidate) => {
+    posthog.capture('candidate_screen_requested');
     setHandoff({ candidateId: c.id, excipient: c.name, repeatUnit: c.screen_as.repeat_unit });
     setForm((f) => ({
       ...f,

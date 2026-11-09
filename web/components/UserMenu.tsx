@@ -2,9 +2,15 @@
 
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
+import posthog from 'posthog-js';
 import { signOutAndReturn } from '@/app/actions';
 
+const posthogConfigured = Boolean(
+  process.env.NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN && process.env.NEXT_PUBLIC_POSTHOG_HOST,
+);
+
 export interface SessionUser {
+  id: string;
   name: string | null;
   email: string | null;
   image: string | null;
@@ -23,6 +29,14 @@ function initials(user: SessionUser) {
 export default function UserMenu({ user, isAdmin = false }: { user: SessionUser; isAdmin?: boolean }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!posthogConfigured) return;
+    posthog.identify(user.id, {
+      ...(user.email ? { email: user.email } : {}),
+      ...(user.name ? { name: user.name } : {}),
+    });
+  }, [user.email, user.id, user.name]);
 
   // Close on a click anywhere else, or on Escape.
   useEffect(() => {
@@ -77,7 +91,12 @@ export default function UserMenu({ user, isAdmin = false }: { user: SessionUser;
               <span className="text-xs text-slate-400">dashboard &amp; approvals</span>
             </Link>
           )}
-          <form action={signOutAndReturn}>
+          <form
+            action={signOutAndReturn}
+            onSubmit={() => {
+              if (posthogConfigured) posthog.reset();
+            }}
+          >
             <button
               type="submit"
               role="menuitem"

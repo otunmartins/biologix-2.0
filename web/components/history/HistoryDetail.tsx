@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import posthog from 'posthog-js';
 import {
   getCampaign,
   getScreenRecord,
@@ -258,6 +259,9 @@ function CampaignDetail({ state: initial, onOpen }: { state: CampaignState; onOp
       setQueueError(null);
       try {
         const r = await queueCandidates([c.id], structureId);
+        if (r.queued > 0) {
+          posthog.capture('simulation_queued', { candidate_count: r.queued, queue_mode: 'history' });
+        }
         if (r.queued === 0) {
           setQueueError({
             id: c.id,

@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import posthog from 'posthog-js';
 import { Spinner, Triangle } from '@/components/icons';
 import {
   approveSimulation,
@@ -191,7 +192,14 @@ export default function Approvals({ onWaiting }: { onWaiting?: (n: number) => vo
           onPick={(tier) => {
             const j = choosing;
             setChoosing(null);
-            run(j, async () => `${j.name}: ${j.simulation?.approved_at ? 'switched to' : 'approved as'} a ${TIER[tier]}. Worker: ${await approveSimulation(j.id, tier)}.`);
+            run(j, async () => {
+              const worker = await approveSimulation(j.id, tier);
+              posthog.capture('simulation_approved', {
+                tier,
+                approval_action: j.simulation?.approved_at ? 'switched' : 'approved',
+              });
+              return `${j.name}: ${j.simulation?.approved_at ? 'switched to' : 'approved as'} a ${TIER[tier]}. Worker: ${worker}.`;
+            });
           }} />
       )}
       {denying && (
@@ -199,7 +207,11 @@ export default function Approvals({ onWaiting }: { onWaiting?: (n: number) => vo
           onSubmit={(reason) => {
             const j = denying;
             setDenying(null);
-            run(j, async () => `${j.name}: ${(await declineSimulation(j.id, reason)) ? 'stopped' : 'denied'}.`);
+            run(j, async () => {
+              const stopped = await declineSimulation(j.id, reason);
+              posthog.capture('simulation_declined', { action: stopped ? 'stopped' : 'declined' });
+              return `${j.name}: ${stopped ? 'stopped' : 'denied'}.`;
+            });
           }} />
       )}
 
