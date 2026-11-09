@@ -5,9 +5,9 @@ import Link from 'next/link';
 import posthog from 'posthog-js';
 import { signOutAndReturn } from '@/app/actions';
 
-const posthogConfigured = Boolean(
-  process.env.NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN && process.env.NEXT_PUBLIC_POSTHOG_HOST,
-);
+// The token alone: the host has a default (instrumentation-client.ts), so
+// requiring it here would skip identify() on every build that relies on it.
+const posthogConfigured = Boolean(process.env.NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN);
 
 export interface SessionUser {
   id: string;

@@ -24,6 +24,12 @@ services:
       args:
         # Only for a local build; the deploy builds on GitHub with PUBLIC_API_URL.
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
+        # Analytics, likewise local-build only (the deploy uses the repository
+        # secret). Left empty, the bundle reports nothing anywhere.
+        NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN: ${NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN:-}
+        NEXT_PUBLIC_POSTHOG_UI_HOST: ${NEXT_PUBLIC_POSTHOG_UI_HOST:-}
+        POSTHOG_INGEST_HOST: ${POSTHOG_INGEST_HOST:-}
+        POSTHOG_ASSETS_HOST: ${POSTHOG_ASSETS_HOST:-}
     environment:
       # Sign-in (web/auth.ts). Read at runtime, unlike NEXT_PUBLIC_API_URL, so
       # changing these needs a restart, not a rebuild.
