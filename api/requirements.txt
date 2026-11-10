@@ -16,6 +16,9 @@ anthropic==1.8.0
 rdkit==2026.3.6
 biopython==1.88
 httpx==0.28.1
+# Reads the FDA Inactive Ingredient file, which FDA ships as .xlsx since
+# November 2026 (it was a CSV before; see api/precedent.py).
+openpyxl==3.1.5
 numpy==2.5.3
 scikit-learn==1.9.1
 psycopg[binary]==3.3.6
