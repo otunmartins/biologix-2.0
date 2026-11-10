@@ -49,6 +49,7 @@ import zipfile
 from urllib.parse import quote
 
 import httpx
+import openpyxl
 
 # The IID landing page lists the current file plus every quarterly archive. The
 # current one is the only link whose text has no month in it. Scraping that is
@@ -59,7 +60,6 @@ IID_PAGE = (
     "inactive-ingredients-database-download"
 )
 IID_PINNED_URL = "https://www.fda.gov/media/193784/download?attachment"
-IID_MEMBER = "IIR_OCOMM.csv"
 
 SUBSTANCE = "https://api.fda.gov/other/substance.json"
 LABELS = "https://api.fda.gov/drug/label.json"
@@ -276,9 +276,69 @@ def _download_iid() -> bytes:
     return payload
 
 
+def _cell(value) -> str:
+    """One spreadsheet cell as the CSV reader would have given it.
+
+    openpyxl types a cell by what Excel stored, so a potency of 11 arrives as
+    the number 11 and 11.0 prints as "11.0" unless an integral float is put
+    back to an int. Everything downstream calls .strip() on these.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _read_rows(payload: bytes) -> list[dict]:
+    """The ingredient table out of the FDA zip, whichever form it is in.
+
+    FDA replaced IIR_OCOMM.csv with IIR_OCOMM.xls and IIR_OCOMM.xlsx inside the
+    archive in November 2026 -- same ten columns, same names, different
+    container. The CSV is still read first because a cached zip downloaded
+    before the change is still a perfectly good copy of the data, and the cache
+    holds for 30 days.
+    """
+    archive = zipfile.ZipFile(io.BytesIO(payload))
+    names = set(archive.namelist())
+
+    if "IIR_OCOMM.csv" in names:
+        raw = archive.read("IIR_OCOMM.csv")
+        return list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig", "replace"))))
+
+    if "IIR_OCOMM.xlsx" in names:
+        # read_only streams the sheet instead of building a cell object per
+        # cell; data_only takes stored values rather than formulae.
+        book = openpyxl.load_workbook(
+            io.BytesIO(archive.read("IIR_OCOMM.xlsx")), read_only=True, data_only=True
+        )
+        try:
+            sheet = book[book.sheetnames[0]]
+            rows = sheet.iter_rows(values_only=True)
+            header = [_cell(c) for c in next(rows)]
+            # Trailing empty cells are simply absent from a row, so zip() --
+            # which stops at the shorter of the two -- would drop the last
+            # columns rather than leave them blank. Pad instead.
+            return [
+                {
+                    name: _cell(row[i]) if i < len(row) else ""
+                    for i, name in enumerate(header)
+                    if name
+                }
+                for row in rows
+                if any(c is not None for c in row)
+            ]
+        finally:
+            book.close()
+
+    raise RuntimeError(
+        "the FDA zip holds none of the expected ingredient files "
+        f"(IIR_OCOMM.csv or IIR_OCOMM.xlsx); it contains: {sorted(names)}"
+    )
+
+
 def _build_index() -> dict:
-    raw = zipfile.ZipFile(io.BytesIO(_download_iid())).read(IID_MEMBER)
-    rows = list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig", "replace"))))
+    rows = _read_rows(_download_iid())
 
     by_unii: dict[str, list[dict]] = {}
     by_name: dict[str, list[dict]] = {}
